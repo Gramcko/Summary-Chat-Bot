@@ -11,6 +11,13 @@ export const SummaryTime = z
 
 export const Group = z.object({
   id: Id,
+  /**
+   * WhatsApp chat identity (JID). Read-only API metadata; NOT part of
+   * UpdateGroupRequest. Natural key for idempotent group registration:
+   * it joins groups to captured messages (groups.chat_id = messages.chat_id).
+   * Null for groups not yet linked to a discovered chat.
+   */
+  chatId: z.string().min(1).max(300).nullable(),
   name: z.string().min(1).max(300),
   monitored: z.boolean(),
   timezone: IanaTimeZone,

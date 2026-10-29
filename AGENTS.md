@@ -11,10 +11,17 @@ These rules apply to all coding agents working in this repository. Read this fil
 ### Current commands (npm workspaces)
 
 - Install: `npm install`
-- Type-check: `npm run typecheck`
-- Tests: `npm test`
-- Build: `npm run build`
+- Type-check: `npm run typecheck` (contracts + backend + dashboard)
+- Tests: `npm test` (contracts + backend + dashboard)
+- Build: `npm run build` (contracts + backend + dashboard)
 - Dev backend: `npm run dev -w @summarly/backend`
+- Dev dashboard: `npm run dev -w @summarly/dashboard`
+- Build dashboard: `npm run build -w @summarly/dashboard`
+- Type-check dashboard: `npm run typecheck -w @summarly/dashboard`
+- Tests (dashboard): `npm test -w @summarly/dashboard`
+- End-to-end (starts real services): `npm run test:e2e`
+- Database migrations: `npm run migrate -w @summarly/backend up` (or `down`; requires `DATABASE_URL`, see `.env.example`)
+- CLI password reset (recovery option B): `npm run reset-password -w @summarly/backend`
 - Lint: not configured yet — `npm run lint` does not exist (follow-up in docs/decisions/0001)
 - Run the narrowest relevant checks first, then broader checks when the changed surface warrants them.
 - Report the exact commands run and whether each passed, failed, was skipped, or could not run.

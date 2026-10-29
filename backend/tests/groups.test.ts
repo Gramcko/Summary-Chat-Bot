@@ -5,7 +5,7 @@ import { GROUP_ID, login, makeApp, seedGroup, setupAdmin } from "./helpers.js";
 async function authedApp() {
   const ctx = await makeApp();
   await setupAdmin(ctx.app);
-  seedGroup(ctx.store);
+  await seedGroup(ctx.store);
   const session = await login(ctx.app);
   return { ...ctx, session };
 }

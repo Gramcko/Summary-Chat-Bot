@@ -67,8 +67,16 @@ Login and recovery share a per-IP guessing limit: 5 failed attempts →
 | GET | `/api/summary-runs/:id` | `SummaryRun` | |
 | POST | `/api/summary-runs/:id/retry` | `SummaryRun` | `failed → pending`; no-op for `pending`/`processing`; `409` for `completed` (regeneration is an open decision). |
 | GET | `/api/summaries/:id` | `Summary` | `404` until the summary-worker exists. |
+| GET | `/api/summary-runs/:id/summary` | `Summary` | `404` for an unknown run or a run without a summary yet. |
 | GET | `/api/settings/ai-provider` | `ProviderConfigPublic` | `404` when unconfigured. Never returns key material. |
 | PUT | `/api/settings/ai-provider` | `ProviderConfigPublic` | Upsert. `apiKey`: omit = keep, string = replace, `null` = clear. |
+
+Note: `GET /api/summary-runs/:id/summary` is the primary result lookup for
+a run — it returns the `Summary` schema and answers `404` (standard error
+envelope) both when the run is unknown and when it has no summary yet.
+With PostgreSQL persistence the backend now also requires `DATABASE_URL`
+and `ENCRYPTION_KEY` (see `.env.example`); saved provider keys are stored
+encrypted (AES-256-GCM) and never returned.
 
 ## Run state machine
 
@@ -84,6 +92,9 @@ pending → processing → completed
 | `PORT` | `3000` | Backend listen port |
 | `HOST` | `127.0.0.1` | Bind address. Set `0.0.0.0` inside containers. |
 | `COOKIE_SECURE` | `false` | Set `true` when serving over HTTPS |
+| `DATABASE_URL` | — (required) | PostgreSQL connection string |
+| `ENCRYPTION_KEY` | — (required) | Base64 for 32 random bytes; encrypts stored provider keys (AES-256-GCM) |
+| `TRUSTED_PROXIES` | `127.0.0.1,::1` | Comma-separated IPs/CIDRs whose `X-Forwarded-For` is trusted for client-IP derivation (rate limiting) |
 
 ## Security notes
 
@@ -91,6 +102,12 @@ pending → processing → completed
 - Recovery codes are single-use **128-bit** codes, shown once, and stored as
   SHA-256 hashes.
 - Login and recovery share the per-IP guessing limit above.
+- The client IP used for that limit honors `X-Forwarded-For` **only** when the
+  immediate peer is listed in `TRUSTED_PROXIES` (default: loopback, which
+  covers a local dashboard proxy). Never add an untrusted address: it would
+  let clients choose their own lockout bucket. With no trusted peer, the
+  header is ignored and all clients share the direct-connection bucket.
+  Rate-limited responses carry a `Retry-After` header.
 - Password change and recovery invalidate all existing sessions.
 - The backend binds to loopback by default; do not expose it to untrusted
   networks without HTTPS and a reviewed authentication model.

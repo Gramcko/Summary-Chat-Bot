@@ -37,9 +37,10 @@ export async function login(app: TestApp): Promise<string> {
   return `${SESSION_COOKIE}=${session.value}`;
 }
 
-export function seedGroup(store: InMemoryStore): void {
-  store.groups.set(GROUP_ID, {
+export async function seedGroup(store: InMemoryStore): Promise<void> {
+  await store.upsertGroup({
     id: GROUP_ID,
+    chatId: null,
     name: "Test Group",
     monitored: true,
     timezone: "Europe/Madrid",

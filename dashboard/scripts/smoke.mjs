@@ -1,0 +1,506 @@
+#!/usr/bin/env node
+/**
+ * Reproducible smoke check for the Summarly dashboard.
+ *
+ * `npm run smoke -w @summarly/dashboard`
+ *
+ * What it does:
+ *   1. starts an in-repo contract test double (`scripts/smoke-stub.mjs`) — no
+ *      PostgreSQL, Redis, WhatsApp, or AI provider needed;
+ *   2. builds the dashboard with `BACKEND_URL` pointing at that stub (Next bakes
+ *      the rewrite destination at build time), unless SMOKE_SKIP_BUILD=1;
+ *   3. starts the production server with `next start`;
+ *   4. drives the real HTTP surface: the `/api` proxy, the session cookie,
+ *      error-envelope passthrough, idempotent run creation, retry conflicts,
+ *      provider key handling, and every page's response;
+ *   5. asserts no backend origin and no session cookie value leak into the
+ *      served HTML / client bundles.
+ *
+ * Environment:
+ *   SMOKE_BACKEND_PORT  stub backend port           (default 3999)
+ *   SMOKE_APP_PORT      dashboard port              (default 3100)
+ *   SMOKE_SKIP_BUILD=1  reuse an existing `.next` build (must have been built
+ *                       with BACKEND_URL=http://127.0.0.1:<SMOKE_BACKEND_PORT>)
+ */
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { readdir, readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { SESSION_VALUE, startStubBackend } from "./smoke-stub.mjs";
+
+const require = createRequire(import.meta.url);
+const dashboardRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+const backendPort = Number(process.env.SMOKE_BACKEND_PORT ?? 3999);
+const appPort = Number(process.env.SMOKE_APP_PORT ?? 3100);
+const skipBuild = process.env.SMOKE_SKIP_BUILD === "1";
+
+const appUrl = `http://127.0.0.1:${appPort}`;
+const results = [];
+let cookie = "";
+
+// --- helpers -------------------------------------------------------------
+
+function delay(ms) {
+  return new Promise((done) => setTimeout(done, ms));
+}
+
+function resolveNextBin() {
+  const candidates = [
+    "next/dist/bin/next",
+    join(dirname(require.resolve("next/package.json")), "dist", "bin", "next"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      return require.resolve(candidate);
+    } catch {
+      // try the next candidate
+    }
+  }
+  throw new Error("Cannot locate the Next.js CLI. Run `npm install` first.");
+}
+
+function runToCompletion(command, args, options) {
+  return new Promise((done, fail) => {
+    const child = spawn(command, args, options);
+    child.once("error", fail);
+    child.once("exit", (code) => done(code ?? 1));
+  });
+}
+
+async function request(path, options = {}) {
+  const headers = { accept: "application/json", ...(options.headers ?? {}) };
+  if (options.body !== undefined) headers["content-type"] = "application/json";
+  if (cookie) headers.cookie = cookie;
+
+  const response = await fetch(`${appUrl}${path}`, {
+    method: options.method ?? "GET",
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    redirect: "manual",
+  });
+
+  for (const raw of response.headers.getSetCookie()) {
+    const pair = raw.split(";")[0];
+    if (pair.trim().startsWith("summarly_session=")) cookie = pair.trim();
+  }
+
+  return { status: response.status, text: await response.text() };
+}
+
+/** Runs one check; a thrown error marks it failed and keeps the run going. */
+async function check(name, fn) {
+  try {
+    await fn();
+    results.push({ name, ok: true, detail: "" });
+  } catch (error) {
+    results.push({
+      name,
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function parseList(text) {
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function report() {
+  const width = Math.max(...results.map((entry) => entry.name.length), 4);
+  for (const entry of results) {
+    const status = entry.ok ? "PASS" : "FAIL";
+    const detail = entry.ok ? "" : `  ${entry.detail.replace(/\s+/g, " ").slice(0, 300)}`;
+    console.log(`${status}  ${entry.name.padEnd(width)}${detail}`);
+  }
+  const failed = results.filter((entry) => !entry.ok).length;
+  console.log(
+    `\nTOTAL=${results.length} PASSED=${results.length - failed} FAILED=${failed}`,
+  );
+  return failed;
+}
+
+// --- orchestration -------------------------------------------------------
+
+let appProcess = null;
+let appLog = "";
+let stub = null;
+
+async function cleanup() {
+  if (appProcess !== null) {
+    const child = appProcess;
+    appProcess = null;
+    child.kill();
+    await Promise.race([
+      new Promise((done) => child.once("exit", done)),
+      delay(3000),
+    ]);
+  }
+  if (stub !== null) {
+    const current = stub;
+    stub = null;
+    await current.close();
+  }
+}
+
+async function waitForDashboard(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (appProcess !== null && appProcess.exitCode !== null) {
+      throw new Error(
+        `\`next start\` exited early (code ${appProcess.exitCode}).\n${appLog}`,
+      );
+    }
+    try {
+      const response = await fetch(`${appUrl}/login`);
+      if (response.status === 200) return;
+    } catch {
+      // not listening yet
+    }
+    await delay(250);
+  }
+  throw new Error(`The dashboard did not become ready at ${appUrl}.\n${appLog}`);
+}
+
+async function assertNoBackendOriginInClientBundles() {
+  const staticDir = join(dashboardRoot, ".next", "static");
+  const entries = await readdir(staticDir, { recursive: true });
+  const offenders = [];
+  for (const entry of entries) {
+    if (!entry.endsWith(".js")) continue;
+    const contents = await readFile(join(staticDir, entry), "utf8");
+    if (contents.includes(`127.0.0.1:${backendPort}`)) offenders.push(entry);
+  }
+  assert.deepEqual(offenders, [], "backend origin found in client bundles");
+}
+
+async function main() {
+  const nextBin = resolveNextBin();
+
+  console.log(`Summarly dashboard smoke check`);
+  console.log(`  app:    ${appUrl}`);
+  console.log(`  stub:   http://127.0.0.1:${backendPort}`);
+
+  stub = await startStubBackend({ port: backendPort });
+  const childEnv = {
+    ...process.env,
+    BACKEND_URL: stub.baseUrl,
+    NEXT_TELEMETRY_DISABLED: "1",
+  };
+
+  if (skipBuild) {
+    console.log(
+      "  build:  skipped (SMOKE_SKIP_BUILD=1; .next must target the stub URL)\n",
+    );
+  } else {
+    console.log("  build:  next build\n");
+    const buildExit = await runToCompletion(
+      process.execPath,
+      [nextBin, "build"],
+      { cwd: dashboardRoot, env: childEnv, stdio: "inherit" },
+    );
+    if (buildExit !== 0) {
+      throw new Error(`\`next build\` failed with exit code ${buildExit}.`);
+    }
+    console.log("");
+  }
+
+  appProcess = spawn(
+    process.execPath,
+    [nextBin, "start", "-p", String(appPort)],
+    { cwd: dashboardRoot, env: childEnv, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  appProcess.stdout?.on("data", (chunk) => {
+    appLog += String(chunk);
+  });
+  appProcess.stderr?.on("data", (chunk) => {
+    appLog += String(chunk);
+  });
+
+  await waitForDashboard(60_000);
+
+  // --- checks ----------------------------------------------------------
+  await check("dashboard reachable (GET /login)", async () => {
+    const response = await request("/login");
+    assert.equal(response.status, 200);
+  });
+
+  await check("proxy GET /api/setup/status", async () => {
+    const response = await request("/api/setup/status");
+    assert.equal(response.status, 200);
+    assert.match(response.text, /"needsSetup":true/);
+  });
+
+  await check("setup rejects a short password with a details envelope", async () => {
+    const response = await request("/api/setup", {
+      method: "POST",
+      body: { password: "short" },
+    });
+    assert.equal(response.status, 400, response.text);
+    assert.match(response.text, /"code":"validation_error"/);
+    assert.match(response.text, /"path":"password"/);
+  });
+
+  await check("setup returns 10 recovery codes", async () => {
+    const response = await request("/api/setup", {
+      method: "POST",
+      body: { password: "correct-horse-battery-123" },
+    });
+    assert.equal(response.status, 201, response.text);
+    const payload = JSON.parse(response.text);
+    assert.equal(payload.recoveryCodes.length, 10);
+  });
+
+  await check("setup status flips to false", async () => {
+    const response = await request("/api/setup/status");
+    assert.match(response.text, /"needsSetup":false/);
+  });
+
+  await check("protected route requires a session", async () => {
+    cookie = "";
+    const response = await request("/api/groups");
+    assert.equal(response.status, 401);
+    assert.match(response.text, /"code":"unauthorized"/);
+  });
+
+  await check("login rejects a wrong password", async () => {
+    const response = await request("/api/auth/login", {
+      method: "POST",
+      body: { password: "wrong-password" },
+    });
+    assert.equal(response.status, 401, response.text);
+  });
+
+  await check("login sets the session cookie through the proxy", async () => {
+    const response = await request("/api/auth/login", {
+      method: "POST",
+      body: { password: "correct-horse-battery-123" },
+    });
+    assert.equal(response.status, 200, response.text);
+    assert.ok(
+      cookie.startsWith("summarly_session="),
+      "expected a summarly_session cookie",
+    );
+  });
+
+  await check("authenticated GET /api/groups", async () => {
+    const response = await request("/api/groups");
+    assert.equal(response.status, 200, response.text);
+    assert.equal(parseList(response.text).length, 2);
+  });
+
+  const groupId = "4f9d2b6a-1c31-4a2f-9a3e-9c0a1b2c3d4e";
+
+  await check("group PATCH surfaces validation details", async () => {
+    const response = await request(`/api/groups/${groupId}`, {
+      method: "PATCH",
+      body: { timezone: "Not/AZone" },
+    });
+    assert.equal(response.status, 400, response.text);
+    assert.match(response.text, /"path":"timezone"/);
+  });
+
+  await check("group PATCH clears the cutoff with summaryTime:null", async () => {
+    const response = await request(`/api/groups/${groupId}`, {
+      method: "PATCH",
+      body: { summaryTime: null },
+    });
+    assert.equal(response.status, 200, response.text);
+    assert.match(response.text, /"summaryTime":null/);
+  });
+
+  await check("run request surfaces interval errors", async () => {
+    const response = await request("/api/summary-runs", {
+      method: "POST",
+      body: {
+        groupId,
+        interval: {
+          start: "2026-10-29T00:00:00.000Z",
+          end: "2026-10-28T00:00:00.000Z",
+          timezone: "Europe/Madrid",
+        },
+      },
+    });
+    assert.equal(response.status, 400, response.text);
+    assert.match(response.text, /interval\.end/);
+  });
+
+  const interval = {
+    start: "2026-10-20T00:00:00.000Z",
+    end: "2026-10-21T00:00:00.000Z",
+    timezone: "Europe/Madrid",
+  };
+
+  await check("run create returns 201", async () => {
+    const response = await request("/api/summary-runs", {
+      method: "POST",
+      body: { groupId, interval },
+    });
+    assert.equal(response.status, 201, response.text);
+  });
+
+  await check("identical run returns 200 (already requested)", async () => {
+    const response = await request("/api/summary-runs", {
+      method: "POST",
+      body: { groupId, interval },
+    });
+    assert.equal(response.status, 200, response.text);
+  });
+
+  await check("run list returns items", async () => {
+    const response = await request("/api/summary-runs");
+    assert.equal(response.status, 200, response.text);
+    const payload = JSON.parse(response.text);
+    assert.ok(payload.items.length >= 3);
+  });
+
+  await check("completed run has a summary", async () => {
+    const response = await request(
+      "/api/summary-runs/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/summary",
+    );
+    assert.equal(response.status, 200, response.text);
+    assert.match(response.text, /"aiGenerated":true/);
+  });
+
+  await check("pending run summary is 404", async () => {
+    const response = await request(
+      "/api/summary-runs/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff/summary",
+    );
+    assert.equal(response.status, 404, response.text);
+  });
+
+  await check("retry of a completed run returns 409", async () => {
+    const response = await request(
+      "/api/summary-runs/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/retry",
+      { method: "POST" },
+    );
+    assert.equal(response.status, 409, response.text);
+    assert.match(response.text, /"code":"conflict"/);
+  });
+
+  await check("retry of a failed run returns pending", async () => {
+    const response = await request(
+      "/api/summary-runs/cccccccc-dddd-4eee-8fff-000000000000/retry",
+      { method: "POST" },
+    );
+    assert.equal(response.status, 200, response.text);
+    assert.match(response.text, /"status":"pending"/);
+  });
+
+  await check("provider config is 404 when unset", async () => {
+    const response = await request("/api/settings/ai-provider");
+    assert.equal(response.status, 404, response.text);
+  });
+
+  await check("provider save reports hasApiKey without echoing the key", async () => {
+    const secret = "sk-smoke-not-a-real-key";
+    const response = await request("/api/settings/ai-provider", {
+      method: "PUT",
+      body: {
+        provider: "openai",
+        model: "gpt-4o-mini",
+        baseUrl: null,
+        apiKey: secret,
+      },
+    });
+    assert.equal(response.status, 200, response.text);
+    assert.match(response.text, /"hasApiKey":true/);
+    assert.ok(!response.text.includes(secret), "response echoed the API key");
+  });
+
+  await check("provider key can be removed with apiKey:null", async () => {
+    const response = await request("/api/settings/ai-provider", {
+      method: "PUT",
+      body: { provider: "openai", model: "gpt-4o-mini", baseUrl: null, apiKey: null },
+    });
+    assert.equal(response.status, 200, response.text);
+    assert.match(response.text, /"hasApiKey":false/);
+  });
+
+  const pages = [
+    ["/", 200],
+    ["/groups", 200],
+    ["/runs", 200],
+    ["/runs/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", 200],
+    ["/settings", 200],
+    ["/login", 200],
+    ["/setup", 200],
+    ["/recover", 200],
+    ["/does-not-exist", 404],
+  ];
+
+  let homeHtml = "";
+
+  for (const [page, expected] of pages) {
+    await check(`page ${page} responds ${expected}`, async () => {
+      const response = await request(page);
+      assert.equal(response.status, expected, response.text.slice(0, 300));
+      assert.match(response.text, /<html/i);
+      if (page === "/") homeHtml = response.text;
+    });
+  }
+
+  await check("app shell renders navigation", async () => {
+    assert.match(homeHtml, /Summary runs/);
+    assert.match(homeHtml, /Sign out/);
+  });
+
+  await check("setup screen renders its first-run copy", async () => {
+    const response = await request("/setup");
+    assert.match(
+      response.text,
+      /First-time setup|Checking this installation/,
+    );
+  });
+
+  await check("login screen renders the sign-in form", async () => {
+    const response = await request("/login");
+    assert.match(response.text, /Sign in/);
+  });
+
+  await check("run detail screen renders", async () => {
+    const response = await request(
+      "/runs/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    );
+    assert.match(response.text, /Summary run/);
+  });
+
+  await check("session cookie value never appears in served HTML", async () => {
+    assert.equal(cookie.length > 0, true, "no session cookie captured");
+    assert.ok(
+      !homeHtml.includes(SESSION_VALUE),
+      "the session cookie value was rendered into HTML",
+    );
+  });
+
+  await check("no backend origin in client bundles", async () => {
+    await assertNoBackendOriginInClientBundles();
+  });
+
+  await check("logout succeeds", async () => {
+    const response = await request("/api/auth/logout", { method: "POST" });
+    assert.equal(response.status, 200, response.text);
+    assert.match(response.text, /"ok":true/);
+  });
+}
+
+main()
+  .catch((error) => {
+    results.push({
+      name: "smoke run",
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  })
+  .finally(async () => {
+    await cleanup();
+    const failed = report();
+    process.exitCode = failed === 0 && results.length > 0 ? 0 : 1;
+  });

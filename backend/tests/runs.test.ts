@@ -11,7 +11,7 @@ const INTERVAL = {
 async function authedApp() {
   const ctx = await makeApp();
   await setupAdmin(ctx.app);
-  seedGroup(ctx.store);
+  await seedGroup(ctx.store);
   const session = await login(ctx.app);
   return { ...ctx, session };
 }
@@ -193,9 +193,9 @@ describe("summary runs", () => {
     expect(SummaryRun.parse(whilePending.json()).status).toBe("pending");
 
     // Failed -> pending.
-    const existing = store.runs.get(runId);
+    const existing = await store.getRun(runId);
     if (existing === undefined) throw new Error("run missing from store");
-    store.runs.set(runId, {
+    await store.updateRun({
       ...existing,
       status: "failed",
       error: { code: "provider_rate_limit", message: "Rate limited" },
@@ -211,7 +211,7 @@ describe("summary runs", () => {
     expect(retriedRun.error).toBeNull();
 
     // Completed -> conflict.
-    store.runs.set(runId, { ...retriedRun, status: "completed" });
+    await store.updateRun({ ...retriedRun, status: "completed" });
     const completed = await app.inject({
       method: "POST",
       url: `/api/summary-runs/${runId}/retry`,

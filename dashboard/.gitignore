@@ -1,0 +1,24 @@
+# Next.js build output
+/.next/
+/out/
+/build
+
+# Dependencies (the workspace root ignores these too)
+/node_modules/
+
+# Environment files — keep only the placeholder example
+.env
+.env.*
+!.env.example
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# OS and editor
+.DS_Store
+Thumbs.db

@@ -8,6 +8,8 @@ export class HttpError extends Error {
     readonly code: ErrorCode,
     message: string,
     readonly details?: ErrorDetail[],
+    /** Extra response headers (e.g. Retry-After on 429). */
+    readonly headers?: Record<string, string>,
   ) {
     super(message);
     this.name = "HttpError";

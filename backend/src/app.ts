@@ -3,7 +3,7 @@ import cookie from "@fastify/cookie";
 import { z } from "zod";
 import type { ErrorCode } from "@summarly/contracts";
 import { apiError, ERROR_STATUS, HttpError, zodDetails } from "./lib/errors.js";
-import type { InMemoryStore } from "./lib/store.js";
+import type { Store } from "./lib/store.js";
 import {
   registerAuthRoutes,
   registerSessionRoutes,
@@ -18,9 +18,16 @@ import { registerSettingsRoutes } from "./routes/settings.js";
 import { registerSummaryRoutes } from "./routes/summaries.js";
 
 export interface BuildAppOptions {
-  store: InMemoryStore;
+  store: Store;
   cookieSecure?: boolean;
   logger?: boolean;
+  /**
+   * Trusted reverse proxies (IPs/CIDRs) whose X-Forwarded-For header is
+   * honored when deriving the client IP (rate limiting). Unset = direct
+   * connections only; X-Forwarded-For is then ignored, so a client
+   * cannot spoof its way out of (or into) a lockout bucket.
+   */
+  trustProxy?: string[];
 }
 
 function codeForStatus(status: number): ErrorCode {
@@ -45,11 +52,15 @@ function statusCodeOf(error: unknown): number | undefined {
 }
 
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
-  const app = Fastify({ logger: options.logger ?? false });
+  const app = Fastify({
+    logger: options.logger ?? false,
+    trustProxy: options.trustProxy,
+  });
   await app.register(cookie);
 
   app.setErrorHandler((error: unknown, request, reply) => {
     if (error instanceof HttpError) {
+      if (error.headers !== undefined) reply.headers(error.headers);
       return reply
         .status(error.statusCode)
         .send(apiError(error.code, error.message, error.details));

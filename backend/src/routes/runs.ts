@@ -7,21 +7,21 @@ import {
 } from "@summarly/contracts";
 import { z } from "zod";
 import { HttpError } from "../lib/errors.js";
-import { nowIso, type InMemoryStore } from "../lib/store.js";
+import { nowIso, type Store } from "../lib/store.js";
 
 const RunParams = z.object({ id: Id });
 
 export function registerRunRoutes(
   app: FastifyInstance,
-  store: InMemoryStore,
+  store: Store,
 ): void {
   app.post("/api/summary-runs", async (request, reply) => {
     const body = CreateRunRequest.parse(request.body);
-    if (!store.groups.has(body.groupId)) {
+    if ((await store.getGroup(body.groupId)) === undefined) {
       throw new HttpError(404, "not_found", "Group not found.");
     }
     // Create-or-find: identical requests return the existing run (200).
-    const { run, created } = store.createOrFindRun({
+    const { run, created } = await store.createOrFindRun({
       groupId: body.groupId,
       interval: body.interval,
       // API-created runs are always manual; scheduled runs are owned by
@@ -32,15 +32,14 @@ export function registerRunRoutes(
   });
 
   app.get("/api/summary-runs", async () => {
-    const items = [...store.runs.values()].sort((a, b) =>
-      b.createdAt.localeCompare(a.createdAt),
-    );
+    // The store returns newest first.
+    const items = await store.listRuns();
     return RunListResponse.parse({ items, nextCursor: null });
   });
 
   app.get("/api/summary-runs/:id", async (request) => {
     const { id } = RunParams.parse(request.params);
-    const run = store.runs.get(id);
+    const run = await store.getRun(id);
     if (run === undefined) {
       throw new HttpError(404, "not_found", "Summary run not found.");
     }
@@ -49,7 +48,7 @@ export function registerRunRoutes(
 
   app.post("/api/summary-runs/:id/retry", async (request) => {
     const { id } = RunParams.parse(request.params);
-    const run = store.runs.get(id);
+    const run = await store.getRun(id);
     if (run === undefined) {
       throw new HttpError(404, "not_found", "Summary run not found.");
     }
@@ -68,7 +67,6 @@ export function registerRunRoutes(
       error: null,
       updatedAt: nowIso(),
     };
-    store.runs.set(id, updated);
-    return updated;
+    return store.updateRun(updated);
   });
 }

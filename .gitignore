@@ -4,6 +4,10 @@ dist/
 coverage/
 *.tsbuildinfo
 
+# Next.js build output (dashboard)
+.next/
+out/
+
 # Environment and secrets
 .env
 .env.*

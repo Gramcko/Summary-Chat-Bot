@@ -1,0 +1,34 @@
+# Development-only infrastructure for Summarly Chat Bot.
+#
+# PostgreSQL is the durable source of truth (docs/architecture.md §4.5).
+# Redis is intentionally absent: it arrives with the queue milestone
+# (BullMQ, docs/architecture.md §4.6) and will be added to this file then.
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml down        # keep the data volume
+#
+# The database is reachable only on the host loopback interface so it is
+# never exposed to the network. Override the credentials through your
+# shell environment or a local (untracked) .env file when needed.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-summarly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-summarly_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-summarly}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - summarly-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  summarly-postgres-data:

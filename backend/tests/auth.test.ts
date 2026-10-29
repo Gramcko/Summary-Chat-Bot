@@ -36,7 +36,18 @@ describe("login", () => {
     expect(cookieHeader).toContain("SameSite=Strict");
   });
 
-  it("rate-limits repeated failures", async () => {
+  it("rejects a login attempt before setup without revealing setup state", async () => {
+    const { app } = await makeApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { password: "any-password-at-all-123" },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(ApiError.parse(res.json()).error.code).toBe("unauthorized");
+  });
+
+  it("rate-limits repeated failures and sends Retry-After", async () => {
     const { app } = await makeApp();
     await setupAdmin(app);
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -54,6 +65,9 @@ describe("login", () => {
     });
     expect(locked.statusCode).toBe(429);
     expect(ApiError.parse(locked.json()).error.code).toBe("rate_limited");
+    const retryAfter = Number(locked.headers["retry-after"]);
+    expect(Number.isInteger(retryAfter)).toBe(true);
+    expect(retryAfter).toBeGreaterThan(0);
   });
 });
 
