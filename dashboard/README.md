@@ -22,6 +22,39 @@ written into `.next/routes-manifest.json` at build time, so set the variable for
 `next build` (and for `next dev`); changing it after a production build has no
 effect until the app is rebuilt.
 
+### Proxy header sanitization
+
+The backend rate-limits login/recovery per `request.ip` and trusts
+`x-forwarded-for` only from `TRUSTED_PROXIES` (loopback by default — exactly
+where this proxy connects from). A client-chosen `x-forwarded-for` would
+therefore let anyone pick their own rate-limit bucket or lock out an arbitrary
+third-party address.
+
+`src/proxy.ts` (Next.js 16 `proxy`, formerly middleware; Node runtime) runs
+before the rewrite and deletes every client-address header — `x-forwarded-for`,
+`x-real-ip`, `forwarded`, and the common CDN variants (`src/lib/forwarding-headers.ts`).
+It always adds a constant `x-summarly-proxy: strip` marker: Next only applies the
+header override when the resulting set is non-empty, so the marker keeps the
+override unconditional (no fail-open edge) and shows that the sanitizer ran.
+Cookies, bodies, status codes, and response headers (including `set-cookie`) are
+untouched: the rewrite still owns the proxying.
+
+This is the "strip" design, chosen after verification: on Next.js 16.4.3 there
+is no public way to read the TCP socket address from a route handler or from
+`proxy()` (`NextRequest` has no `ip`; the internal request symbol holds only
+`{ cookies, nextUrl, url }`), and Next fills `x-forwarded-for` from the socket
+only when the client omitted it while passing a client-supplied value through
+verbatim — the two cases cannot be told apart. Stripping means the backend sees
+the proxy's loopback address for everyone: one shared rate-limit bucket (no
+bucket shopping, no third-party lockout). If a trustworthy client address
+becomes available from Next's public API, `src/lib/forwarding-headers.ts` is the
+single place to start forwarding it.
+
+A route-handler proxy would have allowed the same sanitization, but it replaces
+the `/api/:path*` rewrite, which `scripts/e2e.mjs` (owned outside this package)
+asserts in `.next/routes-manifest.json`; the middleware design keeps that
+contract intact.
+
 ## Commands (workspace-scoped)
 
 ```bash
@@ -52,10 +85,22 @@ round-trip, error-envelope passthrough with `details[].path`, `401` handling,
 write-only behaviour, every page, and that neither the backend origin nor the
 session cookie value leaks into the served HTML or client bundles.
 
+It also asserts the proxy sanitization end to end: the test double records the
+headers it actually received, so spoofed `x-forwarded-for`, `x-real-ip`,
+`forwarded`, and CDN client-IP headers must be absent, no `x-forwarded-for` may
+be invented for clients that send none, and the session cookie must still
+arrive.
+
 Environment overrides: `SMOKE_BACKEND_PORT` (default `3999`), `SMOKE_APP_PORT`
 (default `3100`), `SMOKE_SKIP_BUILD=1` to reuse an existing `.next` build (it
-must then have been built with the same `BACKEND_URL`). Note that a smoke run
-leaves `.next` built for the stub, so rebuild before serving the real backend.
+must then have been built with the same `BACKEND_URL`).
+
+Because the build bakes the rewrite destination, the run rebuilds `.next` for
+the caller's `BACKEND_URL` — or the built-in default when the variable is unset
+— **on both the success and failure paths**, then verifies the destination in
+`.next/routes-manifest.json`. A later `next start` therefore never silently
+proxies to the smoke stub. With `SMOKE_SKIP_BUILD=1` no build is touched, so
+nothing is restored.
 
 ## Screens
 
@@ -80,3 +125,8 @@ leaves `.next` built for the stub, so rebuild before serving the real backend.
 - `src/lib/api.ts` exposes `setBrowserLocationForTests`, a narrow test seam that
   lets `tests/api.test.ts` cover the `401 → /login` rule without a DOM. It is
   only used by tests; passing `null` restores the real `window.location`.
+- `src/proxy.ts` is load-bearing for security, not just plumbing: it removes
+  client-address headers before the `/api` rewrite. Do not delete it.
+  `tests/forwarding-headers.test.ts` covers the sanitizer, `tests/proxy-wiring.test.ts`
+  guards the proxy entry point and matcher coverage with plain `npm test`, and
+  `npm run smoke -w @summarly/dashboard` asserts the real proxy path end to end.

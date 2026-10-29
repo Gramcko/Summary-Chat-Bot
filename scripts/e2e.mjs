@@ -14,8 +14,9 @@
  *
  * Isolation: a throwaway database `summarly_e2e_<timestamp>_<rand>` is created
  * for the run, migrated, and dropped during teardown. The development database
- * is never touched (backend/tests/postgres-store.test.ts TRUNCATEs whatever
- * database it is pointed at — do not point it at data you care about).
+ * is never touched (and never even targetable: the throwaway name is asserted
+ * below, and backend/tests/postgres-store.test.ts refuses to TRUNCATE any
+ * database whose name is not a test database — see DEF-2 guard).
  *
  * Usage:
  *   npm run test:e2e
@@ -29,15 +30,23 @@
  *   E2E_SKIP_BUILD=1     never rebuild the dashboard (fails if the baked
  *                        BACKEND_URL does not match E2E_BACKEND_PORT)
  *   E2E_KEEP_DATABASE=1  keep the throwaway database for inspection
+ *   E2E_ALLOW_REMOTE_PG=yes
+ *                        allow E2E_POSTGRES_URL to point at a non-loopback
+ *                        PostgreSQL host (refused by default: this script
+ *                        creates and drops a database there)
  *
  * Behaviour notes (deliberate, documented in the run output):
  *   - The login rate limiter is in-memory per backend process, so the
  *     rate-limit scenarios run last and restart the backend first to get a
  *     clean bucket. The restart also proves sessions survive a restart
  *     (registered state lives in PostgreSQL).
- *   - X-Forwarded-For through the dashboard proxy is observed, not "fixed":
- *     the observed result is reported as INFO, and the security implication is
- *     written to the summary for the reviewer.
+ *   - X-Forwarded-For / x-real-ip through the dashboard proxy is a HARD
+ *     assertion (QA follow-up). The dashboard proxy STRIPS client-supplied
+ *     forwarding headers — the implemented design, so all clients behind the
+ *     proxy share ONE soft-throttle bucket and spoofed values must never
+ *     select a different one ("no bucket shopping"). The shared bucket is
+ *     also asserted across distinct client addresses when the host provides
+ *     a second one.
  *   - Windows has no POSIX signals, so `child.kill()` terminates the servers
  *     instead of exercising the backend's graceful SIGTERM shutdown path.
  */
@@ -45,7 +54,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { connect } from "node:net";
 import { dirname, join, resolve } from "node:path";
@@ -71,6 +80,9 @@ const skipBuild = process.env.E2E_SKIP_BUILD === "1";
 const keepDatabase = process.env.E2E_KEEP_DATABASE === "1";
 
 const databaseName = `summarly_e2e_${Date.now()}_${randomBytes(3).toString("hex")}`;
+const postgresTargetHost = new URL(postgresBaseUrl).hostname.replace(/^\[|\]$/g, "");
+const allowRemotePg = process.env.E2E_ALLOW_REMOTE_PG === "yes";
+const LOOPBACK_PG_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"]);
 const backendUrl = `http://127.0.0.1:${backendPort}`;
 const dashboardUrl = `http://127.0.0.1:${dashboardPort}`;
 const untrustedPeerBackendUrl = `http://127.0.0.1:${untrustedPeerBackendPort}`;
@@ -410,6 +422,9 @@ async function requireFreePorts(ports) {
 // ---- orchestration state ------------------------------------------------
 
 let postgresStartedHere = false;
+// Set only after CREATE DATABASE succeeded: teardown must never attempt
+// drops against a host the run refused to touch (F3).
+let databaseCreated = false;
 const servers = {
   backend: null,
   untrustedPeerBackend: null,
@@ -479,6 +494,48 @@ async function bakedBackendOrigin() {
   } catch {
     return null;
   }
+}
+
+/** Newest modification time under `dir` (recursive, files only). */
+async function newestMtime(dir) {
+  let newest = 0;
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      newest = Math.max(newest, await newestMtime(full));
+      continue;
+    }
+    newest = Math.max(newest, (await stat(full)).mtimeMs);
+  }
+  return newest;
+}
+
+/**
+ * A build that is newer than its own sources is required: a stale `.next`
+ * (or one produced before `src/proxy.ts` existed) silently omits code such
+ * as the forwarding-header sanitizer, which would make this check test an
+ * old artefact instead of the current code. Comparing the baked backend URL
+ * alone is not enough.
+ */
+async function buildIsStale() {
+  const buildId = join(dashboardRoot, ".next", "BUILD_ID");
+  if (!existsSync(buildId)) return true;
+  const builtAt = (await stat(buildId)).mtimeMs;
+  let newestSource = 0;
+  for (const source of [
+    join(dashboardRoot, "src"),
+    join(dashboardRoot, "next.config.ts"),
+    join(dashboardRoot, "package.json"),
+  ]) {
+    if (!existsSync(source)) continue;
+    const info = await stat(source);
+    newestSource = Math.max(
+      newestSource,
+      info.isDirectory() ? await newestMtime(source) : info.mtimeMs,
+    );
+  }
+  if (newestSource === 0) return false;
+  return newestSource > builtAt;
 }
 
 // ---- scenarios ----------------------------------------------------------
@@ -1019,6 +1076,49 @@ async function scenarioRecovery() {
   });
 }
 
+/**
+ * Attempts one correct login through the dashboard from a SECOND client
+ * address (IPv6 loopback) while the first client's bucket is cooling down.
+ * The dashboard proxy strips client-supplied forwarding headers (the
+ * implemented design), so both addresses share one bucket and the probe
+ * must answer 429; a 200 would mean per-client buckets. Returns
+ * `{reachable: false}` when the host has no second client address — from
+ * a single address the shared bucket is not separately observable.
+ */
+async function secondClientProbe() {
+  const candidate = { host: "::1", origin: `http://[::1]:${dashboardPort}` };
+  const reachable = await new Promise((done) => {
+    const socket = connect({ host: candidate.host, port: dashboardPort });
+    socket.setTimeout(1500);
+    socket.once("connect", () => {
+      socket.destroy();
+      done(true);
+    });
+    socket.once("timeout", () => {
+      socket.destroy();
+      done(false);
+    });
+    socket.once("error", () => {
+      socket.destroy();
+      done(false);
+    });
+  });
+  if (!reachable) return { reachable: false };
+  const probe = await fetch(`${candidate.origin}/api/auth/login`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      "x-forwarded-for": "203.0.113.201",
+      "x-real-ip": "203.0.113.201",
+    },
+    body: JSON.stringify({ password: rotatedPassword }),
+    redirect: "manual",
+    signal: AbortSignal.timeout(15_000),
+  });
+  return { reachable: true, status: probe.status, address: candidate.host };
+}
+
 async function scenarioRateLimiting() {
   // Fresh backend process = fresh in-memory limiter (see the file header).
   await check("sessions survive a backend restart (state is in PostgreSQL)", async () => {
@@ -1030,7 +1130,7 @@ async function scenarioRateLimiting() {
     assert.equal(api.cookie, before, "the cookie changed on restart");
   });
 
-  await check("5 failed logins from one client are rate limited with Retry-After", async () => {
+  await check("5 failed logins from one client are rate limited with an accurate Retry-After", async () => {
     for (let attempt = 1; attempt <= 5; attempt += 1) {
       const response = await anon.request("/api/auth/login", {
         method: "POST",
@@ -1038,80 +1138,97 @@ async function scenarioRateLimiting() {
       });
       expectStatus(response, 401, `failed login ${attempt}`);
     }
-    const limited = await anon.request("/api/auth/login", {
-      method: "POST",
-      body: { password: rotatedPassword },
-    });
-    expectEnvelope(limited, 429, "rate_limited", "6th login attempt (locked)");
-    const retryAfter = limited.headers.get("retry-after");
-    assert.ok(retryAfter !== null, "the 429 response is missing Retry-After");
-    assert.match(retryAfter, /^\d+$/, `Retry-After is not a number of seconds: ${retryAfter}`);
-    const seconds = Number(retryAfter);
-    assert.ok(seconds > 0 && seconds <= 15 * 60, `Retry-After out of range: ${seconds}`);
+    // Soft throttle (audit follow-up): 5 failures inside the 60 s window
+    // start a 60 s cooldown; every attempt made while cooling down doubles it
+    // (60 → 120 → 240 → capped at 300 s). The first rejected attempt therefore
+    // reports 120 s — never the old 15-minute hard lock.
+    const expected = [120, 240, 300, 300];
+    const observed = [];
+    for (const [index, seconds] of expected.entries()) {
+      const response = await anon.request("/api/auth/login", {
+        method: "POST",
+        body: { password: rotatedPassword },
+      });
+      expectEnvelope(
+        response,
+        429,
+        "rate_limited",
+        `cooldown probe ${index + 1} for the shared dashboard bucket`,
+      );
+      const retryAfter = response.headers.get("retry-after");
+      assert.ok(retryAfter !== null, `cooldown probe ${index + 1}: missing Retry-After`);
+      assert.match(
+        retryAfter,
+        /^\d+$/,
+        `cooldown probe ${index + 1}: Retry-After is not a number of seconds: ${retryAfter}`,
+      );
+      observed.push(Number(retryAfter));
+    }
+    assert.deepEqual(
+      observed,
+      expected,
+      `Retry-After ladder should be ${expected.join(" → ")} s (60 s base, doubling, 300 s cap), got ${observed.join(" → ")}`,
+    );
+    // A correct password during the cooldown must not be evaluated at all:
+    // the same 429 envelope is returned regardless of credentials.
+    assert.ok(
+      observed.every((seconds) => seconds <= 300),
+      `Retry-After exceeded the 5-minute cap: ${observed.join(", ")}`,
+    );
   });
 
-  // X-Forwarded-For through the real Next proxy: observation only (a defect
-  // here is reported, not "fixed" by this script).
+  // X-Forwarded-For / x-real-ip through the real Next proxy: HARD assertion
+  // (QA follow-up). The implemented design is STRIP: the dashboard proxy
+  // sanitizes client-supplied forwarding headers before forwarding, so a
+  // client must never obtain its own rate-limit bucket by spoofing them
+  // ("no bucket shopping").
   await restartBackend();
-  const spoofNote = [];
-  let separateBuckets = false;
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     const spoofed = `203.0.113.${100 + attempt}`;
     const response = await anon.request("/api/auth/login", {
       method: "POST",
-      headers: { "x-forwarded-for": spoofed },
+      headers: { "x-forwarded-for": spoofed, "x-real-ip": spoofed },
       body: { password: `wrong-password-${attempt}` },
     });
     expectStatus(response, 401, `spoofed failed login ${attempt} (X-Forwarded-For: ${spoofed})`);
   }
-  {
+  await check("spoofed forwarding headers cannot select a rate-limit bucket (no bucket shopping)", async () => {
     const probe = await anon.request("/api/auth/login", {
       method: "POST",
-      headers: { "x-forwarded-for": "203.0.113.199" },
+      headers: { "x-forwarded-for": "203.0.113.199", "x-real-ip": "203.0.113.199" },
       body: { password: rotatedPassword },
     });
-    separateBuckets = probe.status === 200;
-    if (separateBuckets) {
-      spoofNote.push(
-        "separate buckets: after 5 failures under X-Forwarded-For 203.0.113.101..105, a correct login " +
-          "with X-Forwarded-For 203.0.113.199 returned 200 — the client-supplied header selects the bucket",
-      );
-    } else {
-      spoofNote.push(
-        `shared bucket: after 5 failures under different X-Forwarded-For values, a correct login with a fresh ` +
-          `value returned ${probe.status} — the header did not change the bucket`,
-      );
-    }
-  }
-  {
-    // Second probe: can a client lock out an address it does not own?
-    const victim = "192.0.2.77";
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
-      await anon.request("/api/auth/login", {
-        method: "POST",
-        headers: { "x-forwarded-for": victim },
-        body: { password: `wrong-password-${attempt}` },
-      });
-    }
-    const victimLocked = await anon.request("/api/auth/login", {
-      method: "POST",
-      headers: { "x-forwarded-for": victim },
-      body: { password: rotatedPassword },
-    });
-    spoofNote.push(
-      victimLocked.status === 429
-        ? "third-party lockout: 5 failures with X-Forwarded-For: 192.0.2.77 made a correct login carrying that same header answer 429"
-        : `third-party lockout not observed (status ${victimLocked.status} for the spoofed victim bucket)`,
+    assert.equal(
+      probe.status,
+      429,
+      "after 5 failed logins under five DIFFERENT spoofed x-forwarded-for values, a correct " +
+        `login carrying a fresh spoofed value answered ${probe.status} instead of 429 — the ` +
+        "client-supplied header selects its own rate-limit bucket (bucket shopping: the " +
+        "dashboard proxy forwards client headers verbatim and the backend trusts it as a proxy)",
     );
-  }
-  observe(
-    "X-Forwarded-For through the Next proxy (observation)",
-    `${spoofNote.join("; ")} ⇒ ${
-      separateBuckets
-        ? "a client that can set X-Forwarded-For escapes the login limit and can lock out arbitrary IPs (defect: the rewrite forwards the client header verbatim and the backend trusts loopback as a proxy)"
-        : "clients cannot choose their own lockout bucket through the proxy"
-    }`,
-  );
+    expectEnvelope(probe, 429, "rate_limited", "correct login with a fresh spoofed header");
+    assert.ok(probe.headers.get("retry-after") !== null, "missing Retry-After on the 429");
+  });
+
+  // The implemented design is STRIP: the dashboard proxy sanitizes
+  // client-supplied forwarding headers, so every client behind the proxy
+  // shares ONE soft-throttle bucket. When the host provides a second client
+  // address, that shared bucket is asserted directly: a correct login from
+  // the second address during the cooldown must answer 429. Per-client
+  // buckets would contradict the documented design.
+  await check("rate-limit bucket is shared across clients behind the dashboard proxy (strip design)", async () => {
+    const probe = await secondClientProbe();
+    if (!probe.reachable) {
+      return "not separately observable on this host (no second client address; client == proxy)";
+    }
+    assert.equal(
+      probe.status,
+      429,
+      `a correct login from a second client address (${probe.address}) during the cooldown answered ` +
+        `${probe.status} instead of 429 — per-client buckets contradict the implemented strip design`,
+    );
+    return `correct credentials from a second client address (${probe.address}) during the cooldown answered 429 — one shared bucket (strip design confirmed)`;
+  });
 
   // Untrusted socket peer: the header must be ignored. The primary backend
   // must trust loopback (the dashboard proxy), so this uses a second instance
@@ -1170,7 +1287,9 @@ async function teardown() {
 
   await closeDatabaseClient();
 
-  if (keepDatabase) {
+  if (!databaseCreated) {
+    progress("  database: never created — nothing to drop (run refused or failed early)");
+  } else if (keepDatabase) {
     progress(`  database kept: ${databaseName} (E2E_KEEP_DATABASE=1)`);
   } else {
     let dropped = false;
@@ -1196,6 +1315,7 @@ async function teardown() {
   }
 
   // Report the PostgreSQL state honestly: this script never stops PostgreSQL.
+  if (!databaseCreated) return;
   let reachable = false;
   const probe = new Client({ connectionString: adminDatabaseUrl });
   try {
@@ -1259,10 +1379,18 @@ async function ensurePostgres() {
 }
 
 async function createDatabase() {
+  // DEF-2-style self-check: this script creates and drops databases, so it
+  // must only ever target throwaway test names (`*_test` / `*_e2e_`).
+  assert.match(
+    databaseName,
+    /_test$|_e2e_/i,
+    `refusing to create database "${databaseName}" — not a throwaway test name`,
+  );
   const client = new Client({ connectionString: adminDatabaseUrl });
   await client.connect();
   try {
     await client.query(`CREATE DATABASE "${databaseName}"`);
+    databaseCreated = true;
     progress(`Database: created throwaway database ${databaseName}`);
   } finally {
     await client.end().catch(() => {});
@@ -1301,19 +1429,24 @@ async function ensureDashboardBuild() {
   }
 
   const baked = await bakedBackendOrigin();
-  if (baked === backendUrl) {
-    progress(`Dashboard: reusing the existing .next build (baked BACKEND_URL=${baked})`);
+  const stale = await buildIsStale();
+  if (baked === backendUrl && !stale) {
+    progress(`Dashboard: reusing the existing .next build (baked BACKEND_URL=${baked}, newer than src/)`);
     return;
   }
   if (skipBuild) {
     throw new Error(
-      `.next is baked for ${baked ?? "no backend"} but this run serves ${backendUrl}; ` +
-        "unset E2E_SKIP_BUILD or rebuild with BACKEND_URL=" +
+      (baked !== backendUrl
+        ? `.next is baked for ${baked ?? "no backend"} but this run serves ${backendUrl}`
+        : ".next is older than dashboard/src (stale build)") +
+        "; unset E2E_SKIP_BUILD or rebuild with BACKEND_URL=" +
         backendUrl,
     );
   }
   progress(
-    `Dashboard: .next baked for ${baked ?? "nothing"} — rebuilding with BACKEND_URL=${backendUrl}`,
+    baked === backendUrl
+      ? "Dashboard: .next is older than dashboard/src (stale build) — rebuilding"
+      : `Dashboard: .next baked for ${baked ?? "nothing"} — rebuilding with BACKEND_URL=${backendUrl}`,
   );
   const build = await runToCompletion(
     process.execPath,
@@ -1358,7 +1491,21 @@ async function main() {
   progress(`  backend:   ${backendUrl}`);
   progress(`  dashboard: ${dashboardUrl}`);
   progress(`  database:  ${databaseName} (throwaway)`);
+  progress(`  postgres:  ${postgresTargetHost} (from E2E_POSTGRES_URL)`);
   progress("");
+
+  // F3: this script creates and drops a database on the target PostgreSQL
+  // server. Non-loopback targets need an explicit opt-in.
+  if (!LOOPBACK_PG_HOSTS.has(postgresTargetHost.toLowerCase()) && !allowRemotePg) {
+    throw new Error(
+      `E2E_POSTGRES_URL points at a non-loopback PostgreSQL host (${postgresTargetHost}). ` +
+        "This check creates and drops a throwaway database there. Set " +
+        "E2E_ALLOW_REMOTE_PG=yes if that is intended.",
+    );
+  }
+  if (allowRemotePg && !LOOPBACK_PG_HOSTS.has(postgresTargetHost.toLowerCase())) {
+    progress(`  WARNING: E2E_ALLOW_REMOTE_PG=yes — creating/dropping a database on remote host ${postgresTargetHost}\n`);
+  }
 
   await requireFreePorts([backendPort, dashboardPort, untrustedPeerBackendPort]);
   await ensurePostgres();

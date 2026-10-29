@@ -32,9 +32,22 @@ single-administrator installation.
   or easily forgotten, and knowledge-based recovery is deprecated by NIST
   and OWASP guidance. If product requirements bring them back, treat them
   as an additional factor, never the only one.
-- **Hardening:** login and recovery share a per-IP guessing limit (5 failed
-  attempts → 15-minute lock); password change and recovery invalidate all
+- **Hardening (revised 2026-10-29 after the security review):** login and
+  recovery share one soft throttle instead of a hard lock. 5 failed
+  attempts within a 60-second sliding window start a 60-second cooldown
+  (`429` with an accurate `Retry-After`); every attempt made while cooling
+  down doubles the cooldown, capped at 5 minutes; a successful login or
+  recovery clears the state. Password change and recovery invalidate all
   existing sessions.
+  Behind the dashboard proxy all clients share **one** throttle bucket:
+  the proxy strips client-supplied forwarding headers (the implemented
+  design), so the key cannot be chosen by clients. The availability
+  trade-off is explicit: one user's wrong-password spree can briefly deny
+  login to others, bounded to at most 5 minutes after the last attempt —
+  chosen over the earlier fixed 5-failures → 15-minute deny, which was a
+  trivial availability attack once the bucket was shared. Operator escape
+  hatches: the server-side CLI password reset (recovery option B) and
+  restarting the backend (the throttle is in memory by design).
 
 ## Consequences
 

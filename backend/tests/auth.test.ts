@@ -47,7 +47,7 @@ describe("login", () => {
     expect(ApiError.parse(res.json()).error.code).toBe("unauthorized");
   });
 
-  it("rate-limits repeated failures and sends Retry-After", async () => {
+  it("rate-limits repeated failures and sends an accurate Retry-After", async () => {
     const { app } = await makeApp();
     await setupAdmin(app);
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -65,9 +65,13 @@ describe("login", () => {
     });
     expect(locked.statusCode).toBe(429);
     expect(ApiError.parse(locked.json()).error.code).toBe("rate_limited");
+    // Soft throttle (F1): 5 failures → 60 s cooldown; the blocked attempt
+    // doubles it, so the reported value is ~120 s and never above the
+    // 5-minute cap (the old design locked for 15 minutes).
     const retryAfter = Number(locked.headers["retry-after"]);
     expect(Number.isInteger(retryAfter)).toBe(true);
-    expect(retryAfter).toBeGreaterThan(0);
+    expect(retryAfter).toBeGreaterThanOrEqual(1);
+    expect(retryAfter).toBeLessThanOrEqual(300);
   });
 });
 

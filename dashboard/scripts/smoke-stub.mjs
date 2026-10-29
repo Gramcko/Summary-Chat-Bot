@@ -28,6 +28,8 @@ function createState() {
     needsSetup: true,
     provider: null,
     authed: false,
+    /** Raw request log, used by the smoke check to inspect forwarded headers. */
+    requests: [],
     groups: [
       {
         id: GROUP_FAMILY_ID,
@@ -202,6 +204,15 @@ async function handle(req, res, state) {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const path = url.pathname;
   const method = req.method ?? "GET";
+
+  // Recorded before any validation so the smoke check can assert exactly which
+  // headers reached the backend (never logged or returned by the stub).
+  state.requests.push({
+    method,
+    path: path + url.search,
+    headers: { ...req.headers },
+  });
+
   const body = method === "GET" ? undefined : await readJson(req);
 
   // --- Public -----------------------------------------------------------
@@ -450,8 +461,16 @@ export function startStubBackend({ port = 3999 } = {}) {
       resolve({
         port: boundPort,
         baseUrl: `http://127.0.0.1:${boundPort}`,
+        /** Request log (method, path, raw headers) for header-assertion checks. */
+        getRequests: () =>
+          state.requests.map((entry) => ({
+            method: entry.method,
+            path: entry.path,
+            headers: { ...entry.headers },
+          })),
         close: () =>
           new Promise((done) => {
+            server.closeAllConnections?.();
             server.close(() => done());
           }),
       });

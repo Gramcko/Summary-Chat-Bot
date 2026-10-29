@@ -48,6 +48,8 @@ describe("rate limiting and reverse proxies", () => {
       payload: { password: ADMIN_PASSWORD },
     });
     expect(locked.statusCode).toBe(429);
+    // Soft throttle (F1): never the old 15-minute deny.
+    expect(Number(locked.headers["retry-after"])).toBeLessThanOrEqual(300);
   });
 
   it("buckets by forwarded client IP when the peer is a trusted proxy", async () => {

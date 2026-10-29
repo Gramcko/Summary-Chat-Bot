@@ -13,8 +13,12 @@
  *   4. drives the real HTTP surface: the `/api` proxy, the session cookie,
  *      error-envelope passthrough, idempotent run creation, retry conflicts,
  *      provider key handling, and every page's response;
- *   5. asserts no backend origin and no session cookie value leak into the
- *      served HTML / client bundles.
+ *   5. asserts the proxy strips client-supplied forwarding headers (the stub
+ *      records what the backend actually received), and that no backend origin
+ *      or session cookie value leaks into the served HTML / client bundles;
+ *   6. rebuilds `.next` for the caller's `BACKEND_URL` (or the built-in
+ *      default) on both the success and failure paths, so a later `next start`
+ *      never silently proxies to the stub.
  *
  * Environment:
  *   SMOKE_BACKEND_PORT  stub backend port           (default 3999)
@@ -40,6 +44,13 @@ const skipBuild = process.env.SMOKE_SKIP_BUILD === "1";
 const appUrl = `http://127.0.0.1:${appPort}`;
 const results = [];
 let cookie = "";
+
+/** The caller's BACKEND_URL, restored into `.next` after the run. */
+const originalBackendUrl = process.env.BACKEND_URL;
+/** Set before `next build` runs: the build output may be replaced from then on. */
+let didBuild = false;
+/** Resolved in `main`; needed by the teardown rebuild. */
+let nextBinPath = null;
 
 // --- helpers -------------------------------------------------------------
 
@@ -181,8 +192,48 @@ async function assertNoBackendOriginInClientBundles() {
   assert.deepEqual(offenders, [], "backend origin found in client bundles");
 }
 
+function expectedBackendBaseUrl() {
+  return (originalBackendUrl ?? "http://127.0.0.1:3000").replace(/\/+$/, "");
+}
+
+/**
+ * Rebuilds `.next` for the caller's BACKEND_URL (or the built-in default) so a
+ * later `next start` cannot silently proxy to the smoke stub. Runs on both the
+ * success and failure paths; verifies the rewrite destination afterwards.
+ */
+async function restoreDefaultBuild() {
+  const env = { ...process.env, NEXT_TELEMETRY_DISABLED: "1" };
+  if (originalBackendUrl === undefined) delete env.BACKEND_URL;
+  else env.BACKEND_URL = originalBackendUrl;
+
+  const target = expectedBackendBaseUrl();
+  console.log(`\n  build:  restoring the production build for ${target}`);
+  const exit = await runToCompletion(
+    process.execPath,
+    [nextBinPath, "build"],
+    { cwd: dashboardRoot, env, stdio: "inherit" },
+  );
+  if (exit !== 0) {
+    throw new Error(`the restore build exited with code ${exit}`);
+  }
+
+  const manifest = JSON.parse(
+    await readFile(join(dashboardRoot, ".next", "routes-manifest.json"), "utf8"),
+  );
+  const rewrite = (manifest.rewrites?.afterFiles ?? []).find(
+    (entry) => entry.source === "/api/:path*",
+  );
+  const destination = rewrite?.destination ?? "(missing)";
+  assert.ok(
+    destination.startsWith(`${target}/api/`),
+    `the restored build still proxies to ${destination}`,
+  );
+  return destination;
+}
+
 async function main() {
-  const nextBin = resolveNextBin();
+  nextBinPath = resolveNextBin();
+  const nextBin = nextBinPath;
 
   console.log(`Summarly dashboard smoke check`);
   console.log(`  app:    ${appUrl}`);
@@ -201,6 +252,9 @@ async function main() {
     );
   } else {
     console.log("  build:  next build\n");
+    // From here on `.next` targets the stub. The teardown rebuilds it for the
+    // caller's BACKEND_URL on success and on failure (see `restoreDefaultBuild`).
+    didBuild = true;
     const buildExit = await runToCompletion(
       process.execPath,
       [nextBin, "build"],
@@ -294,6 +348,95 @@ async function main() {
     const response = await request("/api/groups");
     assert.equal(response.status, 200, response.text);
     assert.equal(parseList(response.text).length, 2);
+  });
+
+  // --- proxy header sanitization ---------------------------------------
+  // The stub records the exact headers the backend receives, so these are
+  // echo captures of the real proxy path: a client must not be able to choose
+  // the backend's rate-limit bucket or inject forwarding metadata.
+  function stubRequestFor(path) {
+    const matches = stub.getRequests().filter((entry) => entry.path === path);
+    return matches.length === 0 ? null : matches[matches.length - 1];
+  }
+
+  const spoofedAddress = "203.0.113.7";
+  const probePath = `/api/groups?probe=xff-${Date.now()}`;
+  const spoofedHeaders = {
+    "x-forwarded-for": spoofedAddress,
+    "x-real-ip": "198.51.100.9",
+    forwarded: `for=${spoofedAddress};proto=http`,
+    "cf-connecting-ip": "203.0.113.8",
+    "true-client-ip": "203.0.113.9",
+    "x-client-ip": "203.0.113.10",
+    // A client must not be able to fake the sanitizer's own marker.
+    "x-summarly-proxy": "spoofed-by-client",
+  };
+
+  await check("spoofed x-forwarded-for never reaches the backend", async () => {
+    const response = await request(probePath, { headers: spoofedHeaders });
+    assert.equal(response.status, 200, response.text);
+    const observed = stubRequestFor(probePath);
+    assert.ok(observed !== null, "the backend never received the probe request");
+    const forwarded = observed.headers["x-forwarded-for"];
+    assert.ok(
+      forwarded === undefined || !forwarded.includes(spoofedAddress),
+      `the client-supplied x-forwarded-for reached the backend: ${forwarded}`,
+    );
+    // This dashboard uses the strip design (no trustworthy socket address is
+    // available to Next application code), so nothing may be invented either.
+    assert.equal(
+      forwarded,
+      undefined,
+      `the strip design must forward no x-forwarded-for, got: ${forwarded}`,
+    );
+    assert.ok(
+      !JSON.stringify(observed.headers).includes(spoofedAddress),
+      "a spoofed address reached the backend in some other header",
+    );
+  });
+
+  await check("spoofed x-real-ip and other client-address headers are stripped", async () => {
+    const observed = stubRequestFor(probePath);
+    assert.ok(observed !== null, "the backend never received the probe request");
+    for (const name of [
+      "x-real-ip",
+      "forwarded",
+      "cf-connecting-ip",
+      "true-client-ip",
+      "x-client-ip",
+    ]) {
+      assert.equal(
+        observed.headers[name],
+        undefined,
+        `${name} reached the backend: ${observed.headers[name]}`,
+      );
+    }
+  });
+
+  await check("no x-forwarded-for is invented for clients that send none", async () => {
+    const path = `/api/groups?probe=plain-${Date.now()}`;
+    const response = await request(path);
+    assert.equal(response.status, 200, response.text);
+    const observed = stubRequestFor(path);
+    assert.ok(observed !== null, "the backend never received the probe request");
+    assert.equal(observed.headers["x-forwarded-for"], undefined);
+    assert.equal(observed.headers["x-real-ip"], undefined);
+  });
+
+  await check("the sanitizer's marker reaches the backend (override applied)", async () => {
+    const observed = stubRequestFor(probePath);
+    assert.ok(observed !== null, "the backend never received the probe request");
+    assert.equal(
+      observed.headers["x-summarly-proxy"],
+      "strip",
+      `expected x-summarly-proxy: strip, got: ${observed.headers["x-summarly-proxy"]}`,
+    );
+  });
+
+  await check("session cookie still reaches the backend after sanitization", async () => {
+    const observed = stubRequestFor(probePath);
+    assert.ok(observed !== null, "the backend never received the probe request");
+    assert.match(String(observed.headers.cookie ?? ""), /summarly_session=/);
   });
 
   const groupId = "4f9d2b6a-1c31-4a2f-9a3e-9c0a1b2c3d4e";
@@ -501,6 +644,24 @@ main()
   })
   .finally(async () => {
     await cleanup();
+    if (didBuild) {
+      // Give the terminated server a moment to release `.next` on Windows.
+      await delay(500);
+      try {
+        const destination = await restoreDefaultBuild();
+        results.push({
+          name: "production build restored for the caller's BACKEND_URL",
+          ok: true,
+          detail: destination,
+        });
+      } catch (error) {
+        results.push({
+          name: "production build restored for the caller's BACKEND_URL",
+          ok: false,
+          detail: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
     const failed = report();
     process.exitCode = failed === 0 && results.length > 0 ? 0 : 1;
   });

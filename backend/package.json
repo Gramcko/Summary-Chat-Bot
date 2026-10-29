@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
+    "test:integration": "tsx scripts/require-test-db.ts && vitest run",
     "migrate": "tsx scripts/migrate.ts",
     "reset-password": "tsx scripts/reset-password.ts"
   },

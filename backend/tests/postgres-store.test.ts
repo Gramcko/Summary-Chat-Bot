@@ -19,6 +19,7 @@ import {
   resetAdminPassword,
 } from "../src/lib/reset-password.js";
 import { hashSessionToken, nowIso, type Store } from "../src/lib/store.js";
+import { assertTestDatabaseName } from "../scripts/test-db-guard.js";
 import {
   ADMIN_PASSWORD,
   NEW_PASSWORD,
@@ -27,13 +28,34 @@ import {
 } from "./helpers.js";
 
 /**
- * PostgreSQL integration tests for PostgresStore. Skipped cleanly when
- * no DATABASE_URL is set. Run against the dev database with:
+ * PostgreSQL integration tests for PostgresStore.
+ *
+ * SAFETY (DEF-2): every test TRUNCATEs all application tables. NEVER
+ * point DATABASE_URL at a database with real data — destructive setup
+ * refuses to run unless the database name ends in `_test` or contains
+ * `_e2e_` (or SUMMARLY_TEST_DB_CONFIRM=yes is set explicitly).
+ *
+ * Safe workflow: create a throwaway database and run the guarded entry
+ * point (recommended — it fails fast instead of skipping):
  *
  *   docker compose -f docker-compose.dev.yml up -d
- *   npm run migrate -w @summarly/backend up
- *   DATABASE_URL=postgres://... npm test -w @summarly/backend
+ *   createdb summarly_test
+ *   DATABASE_URL=postgres://.../summarly_test npm run test:integration
+ *
+ * Without DATABASE_URL the suite is skipped and a loud warning is
+ * printed; it is never silently omitted.
  */
+
+// Loud skip (DEF-3): make an omitted integration run impossible to miss.
+// process.stderr.write is used deliberately: vitest's reporter drops
+// collection-time console output for skipped files.
+if (!process.env["DATABASE_URL"]) {
+  process.stderr.write(
+    "[summarly] WARNING: PostgreSQL integration tests were SKIPPED " +
+      "(DATABASE_URL is not set). Run them with `npm run test:integration` " +
+      "(requires PostgreSQL — see docker-compose.dev.yml).\n",
+  );
+}
 
 const INTERVAL = {
   start: "2026-10-28T00:00:00Z",
@@ -74,10 +96,16 @@ describe.skipIf(!process.env["DATABASE_URL"])(
   () => {
     let pool: Pool;
 
-    beforeAll(() => {
+    beforeAll(async () => {
       const databaseUrl = process.env["DATABASE_URL"];
       if (databaseUrl === undefined) throw new Error("DATABASE_URL missing");
       pool = new Pool({ connectionString: databaseUrl });
+      // DEF-2: refuse before ANY destructive statement when the target is
+      // not unmistakably a throwaway test database.
+      const result = await pool.query<{ name: string }>(
+        "SELECT current_database() AS name",
+      );
+      assertTestDatabaseName(result.rows[0]?.name ?? "");
     });
 
     afterAll(async () => {

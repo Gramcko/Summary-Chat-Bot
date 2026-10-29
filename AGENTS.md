@@ -19,6 +19,7 @@ These rules apply to all coding agents working in this repository. Read this fil
 - Build dashboard: `npm run build -w @summarly/dashboard`
 - Type-check dashboard: `npm run typecheck -w @summarly/dashboard`
 - Tests (dashboard): `npm test -w @summarly/dashboard`
+- Integration tests (requires PostgreSQL, see docker-compose.dev.yml): `npm run test:integration`
 - End-to-end (starts real services): `npm run test:e2e`
 - Database migrations: `npm run migrate -w @summarly/backend up` (or `down`; requires `DATABASE_URL`, see `.env.example`)
 - CLI password reset (recovery option B): `npm run reset-password -w @summarly/backend`

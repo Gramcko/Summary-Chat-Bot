@@ -45,8 +45,19 @@
 | POST | `/api/auth/login` | `OkResponse` | Sets the session cookie. |
 | POST | `/api/auth/recover` | `OkResponse` | Single-use recovery code + new password. Invalidates all sessions. |
 
-Login and recovery share a per-IP guessing limit: 5 failed attempts →
-15-minute lock (`429`).
+Login and recovery share one soft throttle (not a hard lock): 5 failed
+attempts within a 60-second sliding window start a 60-second cooldown
+(`429` with an accurate `Retry-After`); every attempt made while cooling
+down doubles the cooldown, capped at 5 minutes. A successful login or
+recovery clears the state. Behind the dashboard proxy all clients share
+**one** throttle bucket — the proxy strips client-supplied forwarding
+headers, so the bucket key cannot be chosen by clients — which means one
+user's wrong-password spree can briefly deny login (and recovery) to
+others. That availability trade-off is deliberate and bounded (at most
+5 minutes after the last attempt); operator escape hatches are the
+server-side CLI password reset (`npm run reset-password -w
+@summarly/backend`) and restarting the backend, which clears the
+in-memory throttle.
 
 ### Session (authentication required)
 
@@ -101,13 +112,14 @@ pending → processing → completed
 - Passwords are hashed with scrypt (see `docs/decisions/0002`).
 - Recovery codes are single-use **128-bit** codes, shown once, and stored as
   SHA-256 hashes.
-- Login and recovery share the per-IP guessing limit above.
-- The client IP used for that limit honors `X-Forwarded-For` **only** when the
-  immediate peer is listed in `TRUSTED_PROXIES` (default: loopback, which
-  covers a local dashboard proxy). Never add an untrusted address: it would
-  let clients choose their own lockout bucket. With no trusted peer, the
-  header is ignored and all clients share the direct-connection bucket.
-  Rate-limited responses carry a `Retry-After` header.
+- Login and recovery share the soft throttle above. Behind the dashboard
+  proxy there is **one shared bucket** (the proxy strips client-supplied
+  forwarding headers, so they cannot be trusted); direct connections are
+  bucketed by socket peer, with `X-Forwarded-For` honored only from
+  `TRUSTED_PROXIES` peers. Never add an untrusted address there: it would
+  let clients choose their own bucket.
+- Rate-limited responses carry an accurate `Retry-After` header (≤ 5
+  minutes; see the soft-throttle semantics above).
 - Password change and recovery invalidate all existing sessions.
 - The backend binds to loopback by default; do not expose it to untrusted
   networks without HTTPS and a reviewed authentication model.
