@@ -1,0 +1,97 @@
+import Fastify, { type FastifyInstance } from "fastify";
+import cookie from "@fastify/cookie";
+import { z } from "zod";
+import type { ErrorCode } from "@summarly/contracts";
+import { apiError, ERROR_STATUS, HttpError, zodDetails } from "./lib/errors.js";
+import type { InMemoryStore } from "./lib/store.js";
+import {
+  registerAuthRoutes,
+  registerSessionRoutes,
+  requireAuth,
+} from "./routes/auth.js";
+import { registerConnectionRoutes } from "./routes/connection.js";
+import { registerGroupRoutes } from "./routes/groups.js";
+import { registerHealthRoutes } from "./routes/health.js";
+import { registerRunRoutes } from "./routes/runs.js";
+import { registerSetupRoutes } from "./routes/setup.js";
+import { registerSettingsRoutes } from "./routes/settings.js";
+import { registerSummaryRoutes } from "./routes/summaries.js";
+
+export interface BuildAppOptions {
+  store: InMemoryStore;
+  cookieSecure?: boolean;
+  logger?: boolean;
+}
+
+function codeForStatus(status: number): ErrorCode {
+  for (const code of Object.keys(ERROR_STATUS) as ErrorCode[]) {
+    if (ERROR_STATUS[code] === status) return code;
+  }
+  // Unknown 4xx statuses (payload too large, unsupported media type, ...)
+  // are request problems; reserve "internal" for the 5xx class.
+  return status >= 400 && status < 500 ? "validation_error" : "internal";
+}
+
+function statusCodeOf(error: unknown): number | undefined {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "statusCode" in error &&
+    typeof error.statusCode === "number"
+  ) {
+    return error.statusCode;
+  }
+  return undefined;
+}
+
+export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
+  const app = Fastify({ logger: options.logger ?? false });
+  await app.register(cookie);
+
+  app.setErrorHandler((error: unknown, request, reply) => {
+    if (error instanceof HttpError) {
+      return reply
+        .status(error.statusCode)
+        .send(apiError(error.code, error.message, error.details));
+    }
+    if (error instanceof z.ZodError) {
+      return reply
+        .status(400)
+        .send(apiError("validation_error", "Request validation failed.", zodDetails(error)));
+    }
+    const status = statusCodeOf(error) ?? 500;
+    const safeStatus = status >= 400 && status < 500 ? status : 500;
+    if (safeStatus >= 500) {
+      request.log.error({ err: error }, "unhandled error");
+    }
+    const message =
+      safeStatus < 500 && error instanceof Error
+        ? error.message
+        : "Internal server error.";
+    return reply.status(safeStatus).send(apiError(codeForStatus(safeStatus), message));
+  });
+
+  app.setNotFoundHandler((_request, reply) =>
+    reply.status(404).send(apiError("not_found", "Route not found.")),
+  );
+
+  // Public routes: health, first-run setup, login, and recovery.
+  registerHealthRoutes(app);
+  registerSetupRoutes(app, options.store);
+  registerAuthRoutes(app, options.store, {
+    cookieSecure: options.cookieSecure ?? false,
+  });
+
+  // Protected routes: everything that reads or changes application state.
+  await app.register(async (api) => {
+    api.addHook("onRequest", requireAuth(options.store));
+    registerSessionRoutes(api, options.store);
+    registerConnectionRoutes(api, options.store);
+    registerGroupRoutes(api, options.store);
+    registerRunRoutes(api, options.store);
+    registerSummaryRoutes(api, options.store);
+    registerSettingsRoutes(api, options.store);
+  });
+
+  return app;
+}

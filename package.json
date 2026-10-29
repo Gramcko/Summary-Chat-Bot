@@ -1,0 +1,24 @@
+{
+  "name": "summarly-chat-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted WhatsApp group daily summaries (Summarly).",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*",
+    "backend"
+  ],
+  "scripts": {
+    "build": "npm run build -w @summarly/contracts && npm run build -w @summarly/backend",
+    "typecheck": "npm run build -w @summarly/contracts && npm run typecheck -w @summarly/contracts && npm run typecheck -w @summarly/backend",
+    "test": "npm run build -w @summarly/contracts && npm test -w @summarly/contracts && npm test -w @summarly/backend"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^5.0.0"
+  }
+}
