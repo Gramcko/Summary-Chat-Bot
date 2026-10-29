@@ -1,4 +1,12 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "default_agent": "orchestrator"
+  "default_agent": "orchestrator",
+  "permissions": [
+    { "action": "shell", "resource": "*", "effect": "allow" },
+    { "action": "shell", "resource": "npm install*", "effect": "ask" },
+    { "action": "shell", "resource": "npm ci*", "effect": "ask" },
+    { "action": "shell", "resource": "npm i *", "effect": "ask" },
+    { "action": "shell", "resource": "npm add*", "effect": "ask" },
+    { "action": "shell", "resource": "git push*", "effect": "ask" }
+  ]
 }

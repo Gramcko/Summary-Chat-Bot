@@ -3,8 +3,13 @@ description: Designs and executes unit, integration and regression tests.
 mode: subagent
 model: opencode-go/deepseek-v4.1-flash
 permissions:
-  - { action: "edit", resource: "*", effect: "ask" }
-  - { action: "shell", resource: "*", effect: "ask" }
+  - { action: "edit", resource: "*", effect: "allow" }
+  - { action: "shell", resource: "*", effect: "allow" }
+  - { action: "shell", resource: "npm install*", effect: "ask" }
+  - { action: "shell", resource: "npm ci*", effect: "ask" }
+  - { action: "shell", resource: "npm i *", effect: "ask" }
+  - { action: "shell", resource: "npm add*", effect: "ask" }
+  - { action: "shell", resource: "git push*", effect: "ask" }
   - { action: "subagent", resource: "*", effect: "deny" }
 ---
 
