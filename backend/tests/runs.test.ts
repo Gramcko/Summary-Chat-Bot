@@ -220,3 +220,137 @@ describe("summary runs", () => {
     expect(completed.statusCode).toBe(409);
   });
 });
+
+describe("summary run enqueue wiring (queue contract, architecture A6)", () => {
+  it("enqueues the new run after the durable row exists", async () => {
+    const { app, enqueue, session } = await authedApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload: { groupId: GROUP_ID, interval: INTERVAL },
+    });
+    expect(res.statusCode).toBe(201);
+    const run = SummaryRun.parse(res.json());
+    // Identifier-only payload is asserted in contracts; the route hands
+    // the QUEUE only the run id (RecordingEnqueuer records it).
+    expect(enqueue.enqueued).toEqual([run.id]);
+  });
+
+  it("re-requests of a non-terminal run enqueue again (safe: job-id dedupe)", async () => {
+    const { app, enqueue, session } = await authedApp();
+    const payload = { groupId: GROUP_ID, interval: INTERVAL };
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload,
+    });
+    const runId = SummaryRun.parse(first.json()).id;
+    const second = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload,
+    });
+    expect(second.statusCode).toBe(200);
+    // The route asks again; at-most-one-live-job is guaranteed at the
+    // queue level by jobId = summaryRunId (see lib/enqueue.ts).
+    expect(enqueue.enqueued).toEqual([runId, runId]);
+  });
+
+  it("never re-enqueues terminal runs on create-or-find", async () => {
+    const { app, store, enqueue, session } = await authedApp();
+    const payload = { groupId: GROUP_ID, interval: INTERVAL };
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload,
+    });
+    const run = SummaryRun.parse(first.json());
+    await store.updateRun({ ...run, status: "completed" });
+    enqueue.enqueued.length = 0;
+
+    const repeat = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload,
+    });
+    expect(repeat.statusCode).toBe(200);
+    expect(SummaryRun.parse(repeat.json()).status).toBe("completed");
+    // Regeneration is unsupported; failed runs use the retry endpoint.
+    expect(enqueue.enqueued).toEqual([]);
+  });
+
+  it("a failed enqueue leaves the run pending and still answers success", async () => {
+    const { app, store, enqueue, session } = await authedApp();
+    enqueue.failWith = new Error("connect ECONNREFUSED 127.0.0.1:6379");
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload: { groupId: GROUP_ID, interval: INTERVAL },
+    });
+    // Architecture A6: the durable run is recoverable (reconciliation
+    // re-enqueues it), so the API does not fail the request.
+    expect(res.statusCode).toBe(201);
+    const run = SummaryRun.parse(res.json());
+    expect(run.status).toBe("pending");
+    expect(run.error).toBeNull();
+    expect(enqueue.enqueued).toEqual([]);
+    expect((await store.getRun(run.id))?.status).toBe("pending");
+  });
+
+  it("re-enqueues only on the failed -> pending retry transition", async () => {
+    const { app, store, enqueue, session } = await authedApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload: { groupId: GROUP_ID, interval: INTERVAL },
+    });
+    const run = SummaryRun.parse(created.json());
+    expect(enqueue.enqueued).toEqual([run.id]);
+
+    // Retry while pending: no-op, no additional enqueue.
+    await app.inject({
+      method: "POST",
+      url: `/api/summary-runs/${run.id}/retry`,
+      headers: { cookie: session },
+    });
+    expect(enqueue.enqueued).toEqual([run.id]);
+
+    // failed -> pending: this is THE re-enqueue path.
+    const existing = await store.getRun(run.id);
+    if (existing === undefined) throw new Error("run missing from store");
+    await store.updateRun({
+      ...existing,
+      status: "failed",
+      error: { code: "provider_error", message: "boom" },
+    });
+    const retried = await app.inject({
+      method: "POST",
+      url: `/api/summary-runs/${run.id}/retry`,
+      headers: { cookie: session },
+    });
+    expect(retried.statusCode).toBe(200);
+    expect(enqueue.enqueued).toEqual([run.id, run.id]);
+
+    // A failed enqueue on retry must not break the response either.
+    await store.updateRun({
+      ...(await store.getRun(run.id))!,
+      status: "failed",
+      error: { code: "provider_error", message: "boom" },
+    });
+    enqueue.failWith = new Error("Connection is closed.");
+    const retriedAgain = await app.inject({
+      method: "POST",
+      url: `/api/summary-runs/${run.id}/retry`,
+      headers: { cookie: session },
+    });
+    expect(retriedAgain.statusCode).toBe(200);
+    expect(SummaryRun.parse(retriedAgain.json()).status).toBe("pending");
+  });
+});

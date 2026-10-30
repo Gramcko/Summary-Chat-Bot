@@ -3,14 +3,19 @@
  * Reproducible end-to-end check for Summarly Chat Bot — the REAL system, not a
  * test double:
  *
- *   PostgreSQL 16 (docker compose) → migrations (node-pg-migrate) →
- *   Fastify backend (real DATABASE_URL + ENCRYPTION_KEY + TRUSTED_PROXIES) →
- *   Next.js dashboard (`next start`, /api/* rewritten to the backend)
+ *   PostgreSQL 16 (docker compose) + Redis 7 (BullMQ queue state) + migrations
+ *   (node-pg-migrate) + Fastify backend (real DATABASE_URL + REDIS_URL +
+ *   ENCRYPTION_KEY + TRUSTED_PROXIES) + summary-worker (real BullMQ worker +
+ *   pipeline) + Next.js dashboard (`next start`, /api/* rewritten to the
+ *   backend)
  *
  * Every scenario drives the dashboard origin over HTTP with a real cookie jar,
  * so the Next.js proxy, the httpOnly session cookie, the standard error
  * envelope, and the rate limiter are all exercised together — the combination
- * that unit tests and the isolated dashboard smoke check cannot cover.
+ * that unit tests and the isolated dashboard smoke check cannot cover. The
+ * summary loop scenario additionally proves the full async path: a run created
+ * through the API is enqueued into Redis, consumed by a REAL summary-worker
+ * child process, and surfaces a validated SummaryResult via the API.
  *
  * Isolation: a throwaway database `summarly_e2e_<timestamp>_<rand>` is created
  * for the run, migrated, and dropped during teardown. The development database
@@ -24,6 +29,8 @@
  * Environment:
  *   E2E_POSTGRES_URL     base PostgreSQL URL without a database name
  *                        (default: postgres://summarly:summarly_dev_password@127.0.0.1:5432)
+ *   E2E_REDIS_URL        Redis URL for BullMQ queue state
+ *                        (default: redis://127.0.0.1:6379)
  *   E2E_BACKEND_PORT     backend port (default 3000 — the dashboard build must
  *                        point at it; the script rebuilds if it does not)
  *   E2E_DASHBOARD_PORT   dashboard port (default 3100)
@@ -47,8 +54,12 @@
  *     select a different one ("no bucket shopping"). The shared bucket is
  *     also asserted across distinct client addresses when the host provides
  *     a second one.
+ *   - The summary-worker child starts only for the summary loop scenario and
+ *     is stopped in teardown. Its own unit/integration suites cover the
+ *     worker contract; this scenario covers the wired system end to end.
  *   - Windows has no POSIX signals, so `child.kill()` terminates the servers
- *     instead of exercising the backend's graceful SIGTERM shutdown path.
+ *     instead of exercising graceful SIGTERM shutdown paths. Teardown is
+ *     kill + wait + SIGKILL fallback so the worker never outlives the run.
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -76,6 +87,10 @@ const untrustedPeerBackendPort = backendPort + 901;
 const postgresBaseUrl =
   process.env.E2E_POSTGRES_URL ??
   "postgres://summarly:summarly_dev_password@127.0.0.1:5432";
+const redisUrl = process.env.E2E_REDIS_URL ?? "redis://127.0.0.1:6379";
+// Dedicated BullMQ key-prefix namespace for this run (audit M1): test
+// workers must never steal jobs from a dev instance ("summarly").
+const e2eQueuePrefix = "summarly-e2e";
 const skipBuild = process.env.E2E_SKIP_BUILD === "1";
 const keepDatabase = process.env.E2E_KEEP_DATABASE === "1";
 
@@ -102,6 +117,22 @@ const interval = {
   end: "2026-10-21T00:00:00.000Z",
   timezone: "Europe/Madrid",
 };
+
+// Demo data for the summary loop scenario (a fresh group + interval so
+// the run identity cannot collide with the earlier scenarios).
+const demoGroupId = "5c2f9a71-8d36-4f0e-b7a4-1e9c3b6d8f20";
+const loopInterval = {
+  start: "2026-10-25T00:00:00.000Z",
+  end: "2026-10-26T00:00:00.000Z",
+  timezone: "Europe/Madrid",
+};
+const demoMessages = [
+  { sender: "Ana", text: "The demo deploy finished without errors." },
+  { sender: "Bo", text: "We agreed to ship the release on Friday." },
+  // Task-like on purpose (mock provider classifies it as a task) with NO
+  // stated owner or due date — the summary must not invent either.
+  { sender: "Cid", text: "We need to send the invoices tomorrow." },
+];
 
 // ---- reporting ----------------------------------------------------------
 
@@ -393,6 +424,25 @@ async function waitForHttp(url, timeoutMs, started, accepted = (response) => res
   );
 }
 
+/** Waits until a child process has written `needle` to its captured output. */
+async function waitForOutput(state, needle, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (state.exited) {
+      throw new Error(
+        `${state.label} exited before becoming ready.\n${truncate(state.output, 2000)}`,
+      );
+    }
+    if (state.output.includes(needle)) return;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `Timed out waiting for ${state.label} output "${needle}".\n${truncate(state.output, 2000)}`,
+      );
+    }
+    await delay(250);
+  }
+}
+
 function portIsFree(port) {
   return new Promise((done) => {
     const socket = connect({ host: "127.0.0.1", port });
@@ -429,6 +479,7 @@ const servers = {
   backend: null,
   untrustedPeerBackend: null,
   dashboard: null,
+  worker: null,
 };
 
 function backendEnv(port, trustedProxies) {
@@ -438,6 +489,10 @@ function backendEnv(port, trustedProxies) {
     HOST: "127.0.0.1",
     COOKIE_SECURE: "false",
     DATABASE_URL: e2eDatabaseUrl,
+    REDIS_URL: redisUrl,
+    // Dedicated queue namespace (audit M1): this run must never share
+    // queue state with a dev instance or other suites.
+    SUMMARY_QUEUE_PREFIX: e2eQueuePrefix,
     ENCRYPTION_KEY: encryptionKey,
     TRUSTED_PROXIES: trustedProxies,
     NEXT_TELEMETRY_DISABLED: "1",
@@ -463,6 +518,30 @@ async function restartBackend() {
   servers.backend = null;
   servers.backend = await startBackend(backendPort, "127.0.0.1,::1");
   await waitForHttp(`${dashboardUrl}/login`, 60_000, servers.dashboard);
+}
+
+/**
+ * The REAL summary-worker as a child process (tsx entry, same Node
+ * process model as the backend above — one PID to kill, reliable on
+ * Windows). Ready when its structured log reports worker_started.
+ */
+function startSummaryWorker() {
+  const state = startProcess(
+    "summary-worker",
+    process.execPath,
+    ["--import", "tsx", join(repoRoot, "summary-worker", "src", "index.ts")],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        DATABASE_URL: e2eDatabaseUrl,
+        REDIS_URL: redisUrl,
+        SUMMARY_QUEUE_PREFIX: e2eQueuePrefix,
+        NODE_ENV: "production",
+      },
+    },
+  );
+  return state;
 }
 
 function resolveNextBin() {
@@ -1263,6 +1342,128 @@ async function scenarioHealth() {
   });
 }
 
+/**
+ * The full async loop (architecture A5.2/A6): seed messages, create a
+ * run through the API, let the REAL summary-worker child process
+ * consume the BullMQ job, and read the validated summary back. The
+ * worker starts here (late) so the earlier scenarios keep full control
+ * over run state; it is stopped in teardown.
+ */
+async function scenarioSummaryLoop() {
+  // Seed a demo group with messages via SQL (bot-worker capture is out
+  // of scope for this milestone; this is exactly the normalized shape
+  // ingestion writes).
+  const chatId = `${demoGroupId}@g.us`;
+  await sql("INSERT INTO whatsapp_connections (id, state) VALUES (gen_random_uuid(), 'connected')");
+  await sql(
+    `INSERT INTO groups (id, chat_id, name, monitored, timezone, summary_time)
+     VALUES ($1, $2, $3, true, 'Europe/Madrid', NULL)`,
+    [demoGroupId, chatId, "E2E Demo Group"],
+  );
+  for (const [index, message] of demoMessages.entries()) {
+    const sentAt = new Date(Date.parse(loopInterval.start) + (index + 1) * 60_000 * 60);
+    await sql(
+      `INSERT INTO messages
+         (connection_id, chat_id, whatsapp_message_id, sender_id, sent_at, body)
+       SELECT id, $1, $2, $3, $4, $5 FROM whatsapp_connections LIMIT 1`,
+      [chatId, `wa-e2e-${index}`, message.sender, sentAt.toISOString(), message.text],
+    );
+  }
+
+  progress("summary-worker: starting (real BullMQ worker + pipeline)");
+  servers.worker = startSummaryWorker();
+  await waitForOutput(servers.worker, '"event":"worker_started"', 60_000);
+  progress("summary-worker: ready\n");
+
+  let runId = null;
+
+  await check("POST /api/summary-runs queues the demo run (201)", async () => {
+    const response = await api.request("/api/summary-runs", {
+      method: "POST",
+      body: { groupId: demoGroupId, interval: loopInterval },
+    });
+    expectStatus(response, 201, "POST demo run");
+    assert.equal(response.json?.status, "pending", response.text);
+    assert.match(response.json?.id ?? "", /^[0-9a-f-]{36}$/, response.text);
+    runId = response.json.id;
+    // Throwaway-DB cross-check (audit L5): the backend child's write
+    // must land in THIS script's database, not the dev one.
+    const row = await sql("SELECT id FROM summary_runs WHERE id = $1", [runId]);
+    assert.equal(
+      row.rows.length,
+      1,
+      `the backend child did not write the run to the throwaway database "${databaseName}" (check DATABASE_URL and the repository .env)`,
+    );
+  });
+
+  await check("the summary-worker completes the run (pending -> completed)", async () => {
+    const deadline = Date.now() + 90_000;
+    for (;;) {
+      const response = await api.request(`/api/summary-runs/${runId}`);
+      expectStatus(response, 200, "GET demo run");
+      const status = response.json?.status;
+      if (status === "completed") {
+        assert.ok(
+          response.json?.attempts >= 1,
+          `expected at least one processing attempt, got ${response.json?.attempts}`,
+        );
+        assert.equal(response.json?.error, null, response.text);
+        return `completed with attempts=${response.json?.attempts}`;
+      }
+      if (status === "failed") {
+        throw new Error(`demo run failed: ${JSON.stringify(response.json?.error)}`);
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`demo run still "${status}" after 90s`);
+      }
+      await delay(250);
+    }
+  });
+
+  await check(
+    "GET /api/summary-runs/:id/summary returns a validated SummaryResult (aiGenerated, quoted sources, no invented owner)",
+    async () => {
+      const response = await api.request(`/api/summary-runs/${runId}/summary`);
+      expectStatus(response, 200, "GET demo run summary");
+      const summary = response.json;
+      assert.equal(summary?.runId, runId, response.text);
+      assert.equal(summary?.provider, "mock", response.text);
+      // Throwaway-DB cross-check (audit L5): the summary-Worker child's
+      // write must land in THIS script's database, not the dev one.
+      const rows = await sql("SELECT id FROM summaries WHERE run_id = $1", [runId]);
+      assert.equal(
+        rows.rows.length,
+        1,
+        `the summary-worker child did not write the summary to the throwaway database "${databaseName}" (check DATABASE_URL and the repository .env)`,
+      );
+      const result = summary?.result;
+      assert.ok(result !== null && typeof result === "object", truncate(response.text));
+      assert.equal(result.aiGenerated, true, "the summary must be marked AI-generated");
+
+      // Source fidelity: seeded messages appear as quoted snippets.
+      const discussions = (result.keyDiscussions ?? []).join("\n");
+      for (const message of demoMessages) {
+        assert.ok(
+          discussions.includes(message.text),
+          `missing quoted message "${message.text}" in: ${truncate(discussions)}`,
+        );
+      }
+
+      // No invented owners or due dates (the task-like message states
+      // neither, so anything else would be fabrication).
+      assert.ok(
+        (result.tasks ?? []).length >= 1,
+        `expected the task-like message to be classified: ${truncate(JSON.stringify(result))}`,
+      );
+      for (const task of result.tasks ?? []) {
+        assert.equal(task.owner, null, `invented owner: ${JSON.stringify(task)}`);
+        assert.equal(task.dueDate, null, `invented due date: ${JSON.stringify(task)}`);
+      }
+      return `overview: ${truncate(result.overview, 120)}`;
+    },
+  );
+}
+
 async function scenarioNoKeyMaterialAnywhere() {
   await check("the provider API key never appears in any response body", async () => {
     const offenders = responses
@@ -1277,7 +1478,9 @@ async function scenarioNoKeyMaterialAnywhere() {
 
 async function teardown() {
   progress("\nTeardown:");
-  for (const key of ["dashboard", "untrustedPeerBackend", "backend"]) {
+  // The worker first: it must never outlive the run (kill + SIGKILL
+  // fallback in stopProcess keeps this reliable on Windows).
+  for (const key of ["worker", "dashboard", "untrustedPeerBackend", "backend"]) {
     const state = servers[key];
     if (state === null) continue;
     await stopProcess(state);
@@ -1349,14 +1552,7 @@ async function ensurePostgres() {
   }
 
   progress("PostgreSQL: not reachable — starting docker-compose.dev.yml");
-  const up = await runToCompletion(
-    "docker",
-    ["compose", "-f", "docker-compose.dev.yml", "up", "-d"],
-    { cwd: repoRoot, env: process.env },
-  );
-  if (up.code !== 0) {
-    throw new Error(`docker compose up failed (exit ${up.code}).\n${truncate(up.output, 2000)}`);
-  }
+  await ensureComposeUp();
   postgresStartedHere = true;
   const deadline = Date.now() + 90_000;
   for (;;) {
@@ -1376,6 +1572,105 @@ async function ensurePostgres() {
       await delay(1000);
     }
   }
+}
+
+/** Starts docker-compose.dev.yml (PostgreSQL + Redis) on this host. */
+async function ensureComposeUp() {
+  const up = await runToCompletion(
+    "docker",
+    ["compose", "-f", "docker-compose.dev.yml", "up", "-d"],
+    { cwd: repoRoot, env: process.env },
+  );
+  if (up.code !== 0) {
+    throw new Error(`docker compose up failed (exit ${up.code}).\n${truncate(up.output, 2000)}`);
+  }
+}
+
+/**
+ * Minimal Redis PING over a raw socket (RESP) — no dependencies, works
+ * for the password-less local dev Redis in docker-compose.dev.yml.
+ */
+function pingRedis(url, timeoutMs = 2000) {
+  return new Promise((done) => {
+    const target = new URL(url);
+    const socket = connect({
+      host: target.hostname.replace(/^\[|\]$/g, ""),
+      port: Number(target.port || 6379),
+    });
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      done(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => {
+      socket.write("*1\r\n$4\r\nPING\r\n");
+    });
+    socket.once("data", (chunk) => {
+      finish(String(chunk).includes("PONG"));
+    });
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
+}
+
+/**
+ * Redis backs the BullMQ queue (docs/decisions/0003): the backend and
+ * the summary-worker both require it, so the loop scenario needs a live
+ * instance. Same policy as PostgreSQL: reuse a healthy one, otherwise
+ * start docker-compose.dev.yml and wait.
+ */
+async function ensureRedis() {
+  if (await pingRedis(redisUrl)) {
+    progress("Redis: reusing the healthy instance on 127.0.0.1:6379");
+    return;
+  }
+  progress("Redis: not reachable — starting docker-compose.dev.yml");
+  await ensureComposeUp();
+  const deadline = Date.now() + 60_000;
+  for (;;) {
+    if (await pingRedis(redisUrl)) {
+      progress("Redis: ready");
+      return;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`Redis did not become ready at ${redisUrl.replace(/\/\/.*@/, "//")}`);
+    }
+    await delay(500);
+  }
+}
+
+/**
+ * The children must really use the throwaway database (audit L5): on a
+ * developer machine the repository `.env` could otherwise win over this
+ * script's injected env and the run would silently write to the dev
+ * database. The script's own client is checked literally
+ * (SELECT current_database()); the children are checked behaviorally —
+ * the observable equivalent of asking them the same question:
+ *   - backend: its view of setup state must match the throwaway DB
+ *     (and later scenarios assert rows it writes appear there);
+ *   - summary-worker: the summary it writes for the demo run must
+ *     appear in this script's connection to the throwaway DB
+ *     (asserted in scenarioSummaryLoop).
+ */
+async function verifyThrowawayDatabaseUsage() {
+  const current = await sql("SELECT current_database() AS name");
+  assert.equal(
+    current.rows[0]?.name,
+    databaseName,
+    `this script's client is connected to "${current.rows[0]?.name}" instead of the throwaway database "${databaseName}"`,
+  );
+  const admins = await sql("SELECT count(*)::int AS count FROM admin_credentials");
+  const response = await direct.request("/api/setup/status");
+  expectStatus(response, 200, "GET /api/setup/status (database probe)");
+  assert.equal(
+    response.json?.needsSetup,
+    admins.rows[0].count === 0,
+    "the backend child disagrees with the throwaway database about setup state — " +
+      `it is not reading/writing "${databaseName}" (check DATABASE_URL and the repository .env)`,
+  );
 }
 
 async function createDatabase() {
@@ -1487,11 +1782,12 @@ async function startDashboard() {
 }
 
 async function main() {
-  progress("Summarly end-to-end check (real PostgreSQL + backend + dashboard)");
+  progress("Summarly end-to-end check (real PostgreSQL + Redis + backend + summary-worker + dashboard)");
   progress(`  backend:   ${backendUrl}`);
   progress(`  dashboard: ${dashboardUrl}`);
   progress(`  database:  ${databaseName} (throwaway)`);
   progress(`  postgres:  ${postgresTargetHost} (from E2E_POSTGRES_URL)`);
+  progress(`  redis:     ${redisUrl.replace(/\/\/.*@/, "//")} (from E2E_REDIS_URL)`);
   progress("");
 
   // F3: this script creates and drops a database on the target PostgreSQL
@@ -1509,12 +1805,15 @@ async function main() {
 
   await requireFreePorts([backendPort, dashboardPort, untrustedPeerBackendPort]);
   await ensurePostgres();
+  await ensureRedis();
   await createDatabase();
   await runMigrations();
 
   progress("Backend: starting Fastify on " + backendUrl);
   servers.backend = await startBackend(backendPort, "127.0.0.1,::1");
   progress("Backend: ready (TRUSTED_PROXIES=127.0.0.1,::1)");
+  await verifyThrowawayDatabaseUsage();
+  progress("Database usage: children verified against " + databaseName);
 
   await ensureDashboardBuild();
   progress("Dashboard: starting next start");
@@ -1530,6 +1829,7 @@ async function main() {
   await scenarioRecovery();
   await scenarioHealth();
   await scenarioRateLimiting();
+  await scenarioSummaryLoop();
   await scenarioNoKeyMaterialAnywhere();
 }
 

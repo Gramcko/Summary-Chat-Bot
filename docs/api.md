@@ -73,11 +73,11 @@ in-memory throttle.
 | GET | `/api/connection` | `ConnectionStatus` | Non-secret WhatsApp connection state. |
 | GET | `/api/groups` | `Group[]` | Monitored groups. |
 | PATCH | `/api/groups/:id` | `Group` | Partial update. `summaryTime: null` clears the daily cutoff. |
-| POST | `/api/summary-runs` | `SummaryRun` (201/200) | Create-or-find (see conventions). |
+| POST | `/api/summary-runs` | `SummaryRun` (201/200) | Create-or-find (see conventions). Non-terminal runs are queued for the summary-worker (`generate-summary`, docs/decisions/0003); enqueue failures leave the run `pending` and are repaired by reconciliation. |
 | GET | `/api/summary-runs` | `RunListResponse` | Newest first. `nextCursor` is `null` in the skeleton. |
 | GET | `/api/summary-runs/:id` | `SummaryRun` | |
-| POST | `/api/summary-runs/:id/retry` | `SummaryRun` | `failed → pending`; no-op for `pending`/`processing`; `409` for `completed` (regeneration is an open decision). |
-| GET | `/api/summaries/:id` | `Summary` | `404` until the summary-worker exists. |
+| POST | `/api/summary-runs/:id/retry` | `SummaryRun` | `failed → pending` **and re-enqueues the run**; no-op for `pending`/`processing`; `409` for `completed` (regeneration is an open decision). |
+| GET | `/api/summaries/:id` | `Summary` | `404` until the summary-worker has completed the run. |
 | GET | `/api/summary-runs/:id/summary` | `Summary` | `404` for an unknown run or a run without a summary yet. |
 | GET | `/api/settings/ai-provider` | `ProviderConfigPublic` | `404` when unconfigured. Never returns key material. |
 | PUT | `/api/settings/ai-provider` | `ProviderConfigPublic` | Upsert. `apiKey`: omit = keep, string = replace, `null` = clear. |
@@ -96,6 +96,21 @@ pending → processing → completed
                      ↘ failed → (retry) → pending
 ```
 
+Runs progress **automatically**: a created run is enqueued into the
+BullMQ `summaries` queue (payload = the run id only, docs/decisions/0003),
+consumed by the summary-worker, and marked `completed` together with its
+summary. `GET /api/summary-runs/:id/summary` then returns the `Summary`.
+Reconciliation (backend, every 60 s by default) re-enqueues runs that
+stay `pending`/`processing` too long, so a lost job or a queue outage
+never strands a run.
+
+**Empty periods are valid.** A run whose interval contains no messages
+completes normally with a summary whose overview states the period was
+empty and whose sections are all empty — `404` from the summary
+endpoints only means "not finished yet" (or an unknown run), never
+"nothing to summarize". (The exact overview wording is adapter
+behavior, not part of this API contract.)
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -104,8 +119,11 @@ pending → processing → completed
 | `HOST` | `127.0.0.1` | Bind address. Set `0.0.0.0` inside containers. |
 | `COOKIE_SECURE` | `false` | Set `true` when serving over HTTPS |
 | `DATABASE_URL` | — (required) | PostgreSQL connection string |
+| `REDIS_URL` | — (required) | Redis connection string for BullMQ queue state (summary runs; docs/decisions/0003) |
 | `ENCRYPTION_KEY` | — (required) | Base64 for 32 random bytes; encrypts stored provider keys (AES-256-GCM) |
 | `TRUSTED_PROXIES` | `127.0.0.1,::1` | Comma-separated IPs/CIDRs whose `X-Forwarded-For` is trusted for client-IP derivation (rate limiting) |
+| `RECONCILE_INTERVAL_MS` | `60000` | Cadence of the summary-run reconciliation pass (positive integer, milliseconds; the floor is 1000) |
+| `SUMMARY_QUEUE_PREFIX` | `summarly` | BullMQ key-prefix namespace for the summary queue (backend + summary-worker must agree; tests use `summarly-test`, e2e `summarly-e2e`) |
 
 ## Security notes
 

@@ -1,8 +1,14 @@
 import { Pool } from "pg";
+import { parseQueuePrefix, parseRetryBaseMs } from "@summarly/contracts";
 import { buildApp } from "./app.js";
 import { parseEncryptionKey } from "./lib/crypto.js";
+import {
+  createRedisSummaryEnqueuer,
+  type EnqueueLogger,
+} from "./lib/enqueue.js";
 import { loadRepoEnv } from "./lib/load-env.js";
 import { PostgresStore } from "./lib/postgres-store.js";
+import { parseReconcileIntervalMs, Reconciler } from "./lib/reconcile.js";
 
 // Load the repository-root .env (see .env.example) before any
 // configuration is read. Shell-exported variables win over the file.
@@ -45,6 +51,19 @@ function requireDatabaseUrl(): string {
   return databaseUrl;
 }
 
+function requireRedisUrl(): string {
+  const redisUrl = process.env["REDIS_URL"]?.trim();
+  if (redisUrl === undefined || redisUrl === "") {
+    return fail(
+      "REDIS_URL is required (BullMQ queue state for summary runs). Copy " +
+        ".env.example to .env at the repository root (it is loaded " +
+        "automatically) or export it in the environment (docker-compose.dev.yml " +
+        "provides a local Redis).",
+    );
+  }
+  return redisUrl;
+}
+
 function requireEncryptionKey(): Buffer {
   try {
     return parseEncryptionKey(process.env["ENCRYPTION_KEY"]);
@@ -53,20 +72,75 @@ function requireEncryptionKey(): Buffer {
   }
 }
 
+/** Structured operational logs: identifiers and safe metadata only. */
+const log: EnqueueLogger = (event, fields) => {
+  const line = `${JSON.stringify({
+    time: new Date().toISOString(),
+    service: "summarly-backend",
+    event,
+    ...fields,
+  })}\n`;
+  process.stdout.write(line);
+};
+
 const pool = new Pool({ connectionString: requireDatabaseUrl() });
 // Log only the driver message; never query parameters or credentials.
 pool.on("error", (error) => {
   console.error(`[summarly-backend] database pool error: ${error.message}`);
 });
 
+const redisUrl = requireRedisUrl();
+
+// Producer-side queue configuration (docs/decisions/0003): the retry
+// policy is stored on the job at enqueue time, so the backend — not the
+// worker — is where SUMMARY_RETRY_BASE_MS takes effect (M2).
+let retryBaseMs: number;
+let queuePrefix: string;
+let reconcileIntervalMs: number;
+try {
+  retryBaseMs = parseRetryBaseMs(process.env["SUMMARY_RETRY_BASE_MS"]);
+  queuePrefix = parseQueuePrefix(process.env["SUMMARY_QUEUE_PREFIX"]);
+  reconcileIntervalMs = parseReconcileIntervalMs(
+    process.env["RECONCILE_INTERVAL_MS"],
+  );
+} catch (error) {
+  fail(error instanceof Error ? error.message : "Invalid configuration.");
+}
+
+const enqueuer = createRedisSummaryEnqueuer({
+  redisUrl,
+  retryBaseMs,
+  prefix: queuePrefix,
+  log,
+});
+
+const store = new PostgresStore(pool, requireEncryptionKey());
+
+const reconciler = new Reconciler({
+  store,
+  enqueue: enqueuer,
+  intervalMs: reconcileIntervalMs,
+  log,
+});
+
 const app = await buildApp({
-  store: new PostgresStore(pool, requireEncryptionKey()),
+  store,
+  enqueue: enqueuer,
   cookieSecure: process.env["COOKIE_SECURE"] === "true",
   logger: process.env["NODE_ENV"] !== "test",
   trustProxy: parseTrustedProxies(process.env["TRUSTED_PROXIES"]),
 });
 
 await app.listen({ port, host });
+// Architecture A6: reconciliation starts with the backend — one pass at
+// startup (repair the backlog after a restart) and then on an interval.
+reconciler.start();
+log("backend_started", {
+  port,
+  reconcileIntervalMs,
+  retryBaseMs,
+  queuePrefix,
+});
 
 let shuttingDown = false;
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
@@ -75,8 +149,13 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     shuttingDown = true;
     void (async () => {
       try {
+        // Stop scheduled work first, then HTTP, then the queue, then
+        // the database pool (architecture A6 graceful shutdown).
+        await reconciler.stop();
         await app.close();
+        await enqueuer.close();
         await pool.end();
+        log("backend_stopped", { signal });
         process.exit(0);
       } catch {
         process.exit(1);

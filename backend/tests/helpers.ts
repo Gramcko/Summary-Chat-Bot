@@ -1,5 +1,6 @@
 import { CreateAdminResponse } from "@summarly/contracts";
 import { buildApp } from "../src/app.js";
+import type { EnqueueOutcome, SummaryEnqueuer } from "../src/lib/enqueue.js";
 import { InMemoryStore } from "../src/lib/store.js";
 import { SESSION_COOKIE } from "../src/routes/auth.js";
 
@@ -9,10 +10,43 @@ export const ADMIN_PASSWORD = "correct-horse-battery-123";
 export const NEW_PASSWORD = "new-secret-password-456";
 export const GROUP_ID = "4f9d2b6a-1c31-4a2f-9a3e-9c0a1b2c3d4e";
 
-export async function makeApp(): Promise<{ app: TestApp; store: InMemoryStore }> {
+/**
+ * In-memory enqueuer: records every enqueue request so route tests can
+ * assert queue wiring WITHOUT Redis. Set `failWith` to simulate a queue
+ * outage (the routes must swallow it and leave the run recoverable).
+ */
+export class RecordingEnqueuer implements SummaryEnqueuer {
+  readonly enqueued: string[] = [];
+  failWith: Error | undefined;
+
+  async enqueueSummaryRun(runId: string): Promise<EnqueueOutcome> {
+    if (this.failWith !== undefined) throw this.failWith;
+    this.enqueued.push(runId);
+    return "enqueued";
+  }
+}
+
+/** Enqueuer that discards everything (tests that do not care). */
+export const noopEnqueuer: SummaryEnqueuer = {
+  async enqueueSummaryRun(): Promise<EnqueueOutcome> {
+    return "already-queued";
+  },
+};
+
+export async function makeApp(): Promise<{
+  app: TestApp;
+  store: InMemoryStore;
+  enqueue: RecordingEnqueuer;
+}> {
   const store = new InMemoryStore();
-  const app = await buildApp({ store, cookieSecure: false, logger: false });
-  return { app, store };
+  const enqueue = new RecordingEnqueuer();
+  const app = await buildApp({
+    store,
+    enqueue,
+    cookieSecure: false,
+    logger: false,
+  });
+  return { app, store, enqueue };
 }
 
 export async function setupAdmin(app: TestApp): Promise<string[]> {

@@ -3,6 +3,7 @@ import cookie from "@fastify/cookie";
 import { z } from "zod";
 import type { ErrorCode } from "@summarly/contracts";
 import { apiError, ERROR_STATUS, HttpError, zodDetails } from "./lib/errors.js";
+import type { SummaryEnqueuer } from "./lib/enqueue.js";
 import type { Store } from "./lib/store.js";
 import {
   registerAuthRoutes,
@@ -19,6 +20,12 @@ import { registerSummaryRoutes } from "./routes/summaries.js";
 
 export interface BuildAppOptions {
   store: Store;
+  /**
+   * Queue producer for `generate-summary` jobs. Injected so routes stay
+   * testable without Redis (tests pass an in-memory enqueuer); the real
+   * implementation is createRedisSummaryEnqueuer (lib/enqueue.ts).
+   */
+  enqueue: SummaryEnqueuer;
   cookieSecure?: boolean;
   logger?: boolean;
   /**
@@ -99,7 +106,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     registerSessionRoutes(api, options.store);
     registerConnectionRoutes(api, options.store);
     registerGroupRoutes(api, options.store);
-    registerRunRoutes(api, options.store);
+    registerRunRoutes(api, options.store, options.enqueue);
     registerSummaryRoutes(api, options.store);
     registerSettingsRoutes(api, options.store);
   });

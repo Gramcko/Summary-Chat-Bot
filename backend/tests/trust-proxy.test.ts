@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import { InMemoryStore } from "../src/lib/store.js";
-import { ADMIN_PASSWORD, setupAdmin } from "./helpers.js";
+import { ADMIN_PASSWORD, noopEnqueuer, setupAdmin } from "./helpers.js";
 
 /**
  * Per-IP rate limiting behind reverse proxies (M3). request.ip must
@@ -12,7 +12,13 @@ import { ADMIN_PASSWORD, setupAdmin } from "./helpers.js";
 
 async function appWith(trustProxy?: string[]) {
   const store = new InMemoryStore();
-  const app = await buildApp({ store, cookieSecure: false, logger: false, trustProxy });
+  const app = await buildApp({
+    store,
+    enqueue: noopEnqueuer,
+    cookieSecure: false,
+    logger: false,
+    trustProxy,
+  });
   await setupAdmin(app);
   return app;
 }

@@ -1,0 +1,24 @@
+{
+  "name": "@summarly/summary-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:integration": "tsx scripts/require-infra.ts && vitest run"
+  },
+  "dependencies": {
+    "@summarly/contracts": "*",
+    "bullmq": "^6.5.2",
+    "ioredis": "^5.11.1",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1"
+  }
+}

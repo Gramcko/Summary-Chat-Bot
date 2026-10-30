@@ -1,15 +1,16 @@
 # Development-only infrastructure for Summarly Chat Bot.
 #
-# PostgreSQL is the durable source of truth (docs/architecture.md §4.5).
-# Redis is intentionally absent: it arrives with the queue milestone
-# (BullMQ, docs/architecture.md §4.6) and will be added to this file then.
+# PostgreSQL is the durable source of truth (docs/architecture.md 4.5).
+# Redis carries BullMQ queue state for the summary milestone
+# (docs/architecture.md 4.6) — it is NOT a source of truth: messages,
+# runs, and completed summaries live in PostgreSQL only.
 #
 # Usage:
 #   docker compose -f docker-compose.dev.yml up -d
-#   docker compose -f docker-compose.dev.yml down        # keep the data volume
+#   docker compose -f docker-compose.dev.yml down        # keep the data volumes
 #
-# The database is reachable only on the host loopback interface so it is
-# never exposed to the network. Override the credentials through your
+# Both services are reachable only on the host loopback interface so they
+# are never exposed to the network. Override the credentials through your
 # shell environment or a local (untracked) .env file when needed.
 
 services:
@@ -30,5 +31,25 @@ services:
       timeout: 3s
       retries: 10
 
+  # Redis: BullMQ queue state ONLY (docs/architecture.md 4.6). Queue
+  # retention (bounded removeOnComplete/removeOnFail), finite retries,
+  # and the run reconciliation semantics live in docs/architecture.md
+  # 4.6 and 6 — Redis persistence below reduces, but does not eliminate,
+  # the need for recovery/reconciliation logic.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - summarly-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   summarly-postgres-data:
+  summarly-redis-data:

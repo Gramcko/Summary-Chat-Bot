@@ -11,16 +11,19 @@ These rules apply to all coding agents working in this repository. Read this fil
 ### Current commands (npm workspaces)
 
 - Install: `npm install`
-- Type-check: `npm run typecheck` (contracts + backend + dashboard)
-- Tests: `npm test` (contracts + backend + dashboard)
-- Build: `npm run build` (contracts + backend + dashboard)
+- Type-check: `npm run typecheck` (contracts + backend + summary-worker + dashboard)
+- Tests: `npm test` (contracts + backend + summary-worker + dashboard)
+- Build: `npm run build` (contracts + backend + summary-worker + dashboard)
 - Dev backend: `npm run dev -w @summarly/backend`
+- Dev summary-worker: `npm run dev -w @summarly/summary-worker`
 - Dev dashboard: `npm run dev -w @summarly/dashboard`
 - Build dashboard: `npm run build -w @summarly/dashboard`
 - Type-check dashboard: `npm run typecheck -w @summarly/dashboard`
 - Tests (dashboard): `npm test -w @summarly/dashboard`
-- Integration tests (requires PostgreSQL, see docker-compose.dev.yml): `npm run test:integration`
-- End-to-end (starts real services): `npm run test:e2e`
+- Tests (summary-worker): `npm test -w @summarly/summary-worker`
+- Integration tests (requires PostgreSQL + Redis, see docker-compose.dev.yml): `npm run test:integration`
+- Integration tests (summary-worker only): `npm run test:integration -w @summarly/summary-worker`
+- End-to-end (starts real services including the summary-worker): `npm run test:e2e`
 - Database migrations: `npm run migrate -w @summarly/backend up` (or `down`; requires `DATABASE_URL`, see `.env.example`)
 - CLI password reset (recovery option B): `npm run reset-password -w @summarly/backend`
 - Lint: not configured yet — `npm run lint` does not exist (follow-up in docs/decisions/0001)

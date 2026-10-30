@@ -24,6 +24,7 @@ import {
   ADMIN_PASSWORD,
   NEW_PASSWORD,
   login,
+  noopEnqueuer,
   setupAdmin,
 } from "./helpers.js";
 
@@ -269,6 +270,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
         const store = new PostgresStore(pool, ENCRYPTION_KEY);
         const app = await buildApp({
           store,
+          enqueue: noopEnqueuer,
           cookieSecure: false,
           logger: false,
         });
@@ -408,6 +410,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
         // End to end: the API accepts the new password.
         const app = await buildApp({
           store,
+          enqueue: noopEnqueuer,
           cookieSecure: false,
           logger: false,
         });
@@ -463,6 +466,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
 
         const app = await buildApp({
           store,
+          enqueue: noopEnqueuer,
           cookieSecure: false,
           logger: false,
         });
@@ -628,6 +632,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
         const store = new PostgresStore(pool, ENCRYPTION_KEY);
         const app = await buildApp({
           store,
+          enqueue: noopEnqueuer,
           cookieSecure: false,
           logger: false,
         });
