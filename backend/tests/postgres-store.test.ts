@@ -503,28 +503,40 @@ describe.skipIf(!process.env["DATABASE_URL"])(
     });
 
     describe("group registration (chat natural key)", () => {
-      it("keeps the stored id when the same chat is registered again", async () => {
+      it("keeps the stored id and NEVER clobbers admin preferences (never-clobber)", async () => {
         const store = new PostgresStore(pool);
         const chatId = "123456789012345678@g.us";
         const first = await store.upsertGroup({
           id: randomUUID(),
           chatId,
           name: "First name",
-          monitored: true,
-          timezone: "Europe/Madrid",
+          monitored: false,
+          timezone: "UTC",
           summaryTime: null,
         });
+        // The admin opts in and configures the group — updateGroup is
+        // the only admin-preference writer (ADR 0004 / audit M3).
+        await store.updateGroup({
+          ...first,
+          monitored: true,
+          timezone: "America/Bogota",
+          summaryTime: "06:30",
+        });
+
+        // A re-registration (discovery / subject rename) with DIFFERENT
+        // preference values must update ONLY the name.
         const again = await store.upsertGroup({
           id: randomUUID(),
           chatId,
           name: "Renamed",
           monitored: false,
-          timezone: "America/Bogota",
-          summaryTime: "06:30",
+          timezone: "Europe/Madrid",
+          summaryTime: "23:00",
         });
         expect(again.id).toBe(first.id);
         expect(again.name).toBe("Renamed");
-        expect(again.monitored).toBe(false);
+        expect(again.monitored).toBe(true);
+        expect(again.timezone).toBe("America/Bogota");
         expect(again.summaryTime).toBe("06:30");
 
         const rows = await pool.query<{ count: string }>(

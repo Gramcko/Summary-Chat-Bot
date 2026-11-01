@@ -9,14 +9,15 @@
   "workspaces": [
     "packages/*",
     "backend",
+    "bot-worker",
     "dashboard",
     "summary-worker"
   ],
   "scripts": {
-    "build": "npm run build -w @summarly/contracts && npm run build -w @summarly/backend && npm run build -w @summarly/summary-worker && npm run build -w @summarly/dashboard",
-    "typecheck": "npm run build -w @summarly/contracts && npm run typecheck -w @summarly/contracts && npm run typecheck -w @summarly/backend && npm run typecheck -w @summarly/summary-worker && npm run typecheck -w @summarly/dashboard",
-    "test": "npm run build -w @summarly/contracts && npm test -w @summarly/contracts && npm test -w @summarly/backend && npm test -w @summarly/summary-worker && npm test -w @summarly/dashboard",
-    "test:integration": "npm run test:integration -w @summarly/backend && npm run test:integration -w @summarly/summary-worker",
+    "build": "npm run build -w @summarly/contracts && npm run build -w @summarly/backend && npm run build -w @summarly/summary-worker && npm run build -w @summarly/bot-worker && npm run build -w @summarly/dashboard",
+    "typecheck": "npm run build -w @summarly/contracts && npm run typecheck -w @summarly/contracts && npm run typecheck -w @summarly/backend && npm run typecheck -w @summarly/summary-worker && npm run typecheck -w @summarly/bot-worker && npm run typecheck -w @summarly/dashboard",
+    "test": "npm run build -w @summarly/contracts && npm test -w @summarly/contracts && npm test -w @summarly/backend && npm test -w @summarly/summary-worker && npm test -w @summarly/bot-worker && npm test -w @summarly/dashboard",
+    "test:integration": "npm run test:integration -w @summarly/backend && npm run test:integration -w @summarly/summary-worker && npm run test:integration -w @summarly/bot-worker",
     "test:e2e": "node scripts/e2e.mjs"
   },
   "devDependencies": {
@@ -24,5 +25,8 @@
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^5.0.0"
+  },
+  "overrides": {
+    "libsignal": "6.0.0"
   }
 }

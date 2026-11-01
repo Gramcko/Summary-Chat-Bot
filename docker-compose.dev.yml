@@ -53,3 +53,10 @@ services:
 volumes:
   summarly-postgres-data:
   summarly-redis-data:
+  # WhatsApp (Baileys) session state — protected persistent storage
+  # (ADR 0004, architecture §4.3/§9). Phase F mounts this on the
+  # bot-worker service (WA_SESSION_DIR) with restrictive permissions
+  # and a non-root user. It is NEVER stored in PostgreSQL, never
+  # committed to Git, never exposed by any API or log, and must be
+  # treated as sensitive in backups (it can link the account).
+  summarly-wa-session:

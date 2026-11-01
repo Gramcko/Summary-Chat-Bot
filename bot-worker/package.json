@@ -1,0 +1,24 @@
+{
+  "name": "@summarly/bot-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:integration": "tsx scripts/require-infra.ts && vitest run"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.24",
+    "pg": "^8.23.1",
+    "qrcode-terminal": "0.12.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1",
+    "@types/qrcode-terminal": "^0.12.2"
+  }
+}

@@ -12,7 +12,8 @@
     "test": "vitest run --fileParallelism=false",
     "test:integration": "tsx scripts/require-test-db.ts && vitest run --fileParallelism=false",
     "migrate": "tsx scripts/migrate.ts",
-    "reset-password": "tsx scripts/reset-password.ts"
+    "reset-password": "tsx scripts/reset-password.ts",
+    "purge-messages": "tsx scripts/purge-messages.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.0",

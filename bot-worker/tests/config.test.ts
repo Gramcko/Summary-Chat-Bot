@@ -1,0 +1,160 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { describe, expect, it } from "vitest";
+import {
+  ConfigError,
+  ensureSessionStorage,
+  findRepoRoot,
+  isInsideRoot,
+  loadConfig,
+} from "../src/config.js";
+
+/**
+ * Session-storage safety (audit M1/M2, CR-m3):
+ * - relative WA_SESSION_DIR values resolve against the REPOSITORY ROOT
+ * - session directories inside the repository working tree are refused
+ *   unless WA_SESSION_ALLOW_INSECURE=yes (explicit escape hatch)
+ * - permission hardening is verified, not silently best-effort: win32
+ *   refuses unless acknowledged; POSIX enforces owner-only mode
+ * - error messages never contain the path
+ */
+
+const REPO_ROOT = findRepoRoot();
+if (REPO_ROOT === null) {
+  throw new Error("tests must run inside the repository");
+}
+const SECRET_DIR_NAME = "super-secret-session-dir-name";
+const OUTSIDE = mkdtempSync(join(tmpdir(), "summarly-wa-"));
+const BASE_ENV = { DATABASE_URL: "postgres://localhost/test" };
+
+describe("loadConfig: session directory resolution and containment", () => {
+  it("resolves explicit relative values against the repository root", () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      WA_SESSION_DIR: "custom-wa-session",
+      WA_SESSION_ALLOW_INSECURE: "yes",
+    });
+    expect(config.sessionDir).toBe(resolve(REPO_ROOT, "custom-wa-session"));
+  });
+
+  it("defaults to <repo root>/wa-session", () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      WA_SESSION_ALLOW_INSECURE: "yes",
+    });
+    expect(config.sessionDir).toBe(resolve(REPO_ROOT, "wa-session"));
+  });
+
+  it("refuses session directories inside the repository working tree", () => {
+    const inside = join(REPO_ROOT, SECRET_DIR_NAME);
+    let error: unknown;
+    try {
+      loadConfig({ ...BASE_ENV, WA_SESSION_DIR: inside });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(ConfigError);
+    const message = (error as Error).message;
+    expect(message).toContain("WA_SESSION_ALLOW_INSECURE");
+    // The path itself must never appear in the error (ADR 0004).
+    expect(message).not.toContain(SECRET_DIR_NAME);
+  });
+
+  it("refuses the in-tree default without the explicit escape hatch", () => {
+    expect(() => loadConfig({ ...BASE_ENV })).toThrow(ConfigError);
+  });
+
+  it("allows in-tree storage with WA_SESSION_ALLOW_INSECURE=yes", () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      WA_SESSION_DIR: join(REPO_ROOT, SECRET_DIR_NAME),
+      WA_SESSION_ALLOW_INSECURE: "yes",
+    });
+    expect(config.allowInsecureSessionStorage).toBe(true);
+  });
+
+  it("accepts out-of-tree paths without the hatch", () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      WA_SESSION_DIR: join(OUTSIDE, "wa-session"),
+    });
+    expect(config.sessionDir).toBe(join(OUTSIDE, "wa-session"));
+  });
+
+  it("validates the remaining values", () => {
+    expect(() => loadConfig({})).toThrow(ConfigError);
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        WA_SESSION_ALLOW_INSECURE: "yes",
+        DEFAULT_GROUP_TIMEZONE: "Not/AZone",
+      }),
+    ).toThrow(ConfigError);
+    expect(() =>
+      loadConfig({ ...BASE_ENV, WA_SESSION_ALLOW_INSECURE: "yes", WA_LINKING_DISPLAY: "sometimes" }),
+    ).toThrow(ConfigError);
+    expect(() =>
+      loadConfig({ ...BASE_ENV, WA_SESSION_ALLOW_INSECURE: "yes", LOG_LEVEL: "loud" }),
+    ).toThrow(ConfigError);
+    expect(() =>
+      loadConfig({ ...BASE_ENV, WA_SESSION_ALLOW_INSECURE: "yes", WA_PHONE_NUMBER: "abc" }),
+    ).toThrow(ConfigError);
+  });
+});
+
+describe("isInsideRoot", () => {
+  it("detects the root itself and nested paths", () => {
+    expect(isInsideRoot(REPO_ROOT, REPO_ROOT)).toBe(true);
+    expect(isInsideRoot(join(REPO_ROOT, "a", "b"), REPO_ROOT)).toBe(true);
+    expect(isInsideRoot(join(REPO_ROOT, "..", "outside"), REPO_ROOT)).toBe(false);
+    expect(isInsideRoot(OUTSIDE, REPO_ROOT)).toBe(false);
+  });
+});
+
+describe("ensureSessionStorage: permission post-conditions", () => {
+  it("refuses win32 unless explicitly acknowledged (NTFS ACLs unverifiable)", () => {
+    const dir = join(OUTSIDE, "win32-session");
+    let error: unknown;
+    try {
+      ensureSessionStorage(dir, { allowInsecure: false, platform: "win32" });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(ConfigError);
+    expect((error as Error).message).toContain("WA_SESSION_ALLOW_INSECURE");
+    expect((error as Error).message).not.toContain(dir);
+
+    // Explicit acknowledgment passes (the operator owns NTFS ACLs).
+    expect(() =>
+      ensureSessionStorage(dir, { allowInsecure: true, platform: "win32" }),
+    ).not.toThrow();
+  });
+
+  it("creates the directory and verifies owner-only mode on POSIX", () => {
+    const dir = join(OUTSIDE, "posix-session");
+    // Note: the mode post-condition itself needs real POSIX permissions
+    // and cannot be simulated on a Windows dev host — the win32 refusal
+    // and the error paths above cover the guard logic here.
+    if (process.platform === "win32") return;
+    expect(() =>
+      ensureSessionStorage(dir, { allowInsecure: false, platform: "linux" }),
+    ).not.toThrow();
+  });
+
+  it("reports fs failures without leaking the path", () => {
+    // A parent that is a plain file makes mkdir fail with an fs error.
+    const filePath = join(OUTSIDE, "not-a-directory");
+    writeFileSync(filePath, "x");
+    const dir = join(filePath, "wa-session");
+    let error: unknown;
+    try {
+      ensureSessionStorage(dir, { allowInsecure: true, platform: "linux" });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(ConfigError);
+    expect((error as Error).message).toContain("WA_SESSION_DIR");
+    expect((error as Error).message).not.toContain(OUTSIDE);
+  });
+});

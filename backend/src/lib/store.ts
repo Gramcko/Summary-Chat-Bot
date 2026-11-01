@@ -84,12 +84,13 @@ export interface Store {
   /** Full replacement of mutable group fields. Undefined when unknown. */
   updateGroup(group: Group): Promise<Group | undefined>;
   /**
-   * Natural-key registration for discovered groups (bot-worker). When
-   * `chatId` is provided it is the identity: repeated upserts of the
-   * same chat update the existing record and keep its stored id (so
-   * run/message foreign keys stay stable) regardless of the id supplied
-   * by the caller. Without a chatId the id is the key (insert or
-   * replace).
+   * Natural-key registration for discovered chats. When `chatId` is
+   * provided it is the identity: repeated upserts of the same chat keep
+   * the stored id (so run/message foreign keys stay stable) and update
+   * ONLY the name — never-clobber (ADR 0004 / audit M3): monitored,
+   * timezone, and summary_time are admin preferences and are never
+   * overwritten here (updateGroup is the only admin-preference writer).
+   * Without a chatId the id is the key (insert or full replace).
    */
   upsertGroup(group: Group): Promise<Group>;
 
@@ -215,11 +216,13 @@ export class InMemoryStore implements Store {
 
   async upsertGroup(group: Group): Promise<Group> {
     // Natural key is chatId when provided (see Store.upsertGroup): the
-    // stored id wins so foreign keys stay stable across rediscovery.
+    // stored id wins so foreign keys stay stable across rediscovery, and
+    // ONLY the name is updated — never-clobber (ADR 0004): admin
+    // preferences (monitored/timezone/summaryTime) survive re-registration.
     if (group.chatId !== null) {
       for (const [id, existing] of this.groups) {
         if (existing.chatId === group.chatId) {
-          const stored: Group = { ...group, id };
+          const stored: Group = { ...existing, name: group.name };
           this.groups.set(id, stored);
           return stored;
         }

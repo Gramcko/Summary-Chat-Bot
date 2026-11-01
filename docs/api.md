@@ -141,3 +141,18 @@ behavior, not part of this API contract.)
 - Password change and recovery invalidate all existing sessions.
 - The backend binds to loopback by default; do not expose it to untrusted
   networks without HTTPS and a reviewed authentication model.
+
+## Data retention
+
+- Captured messages (`messages`) are **retained until deleted**. There is
+  **no automatic expiry in the MVP**; the retention policy has not been
+  productized yet (tracked for Phase E/F — see `docs/decisions/0004` §11).
+- The explicit deletion path today is the operator CLI
+  `npm run purge-messages -w @summarly/backend` (by group id, chat id,
+  and/or a `--before <ISO date>` cutoff; destructive, with a typed
+  confirmation or an explicit `--yes` flag; it reports counts only).
+  There is no API or dashboard deletion endpoint yet.
+- **Database backups are as sensitive as the WhatsApp session volume**:
+  dumps contain full conversations and phone-number-bearing sender JIDs.
+  Encrypt and rotate dumps, restrict their access — and remember that
+  purging rows does not remove them from backups taken earlier.

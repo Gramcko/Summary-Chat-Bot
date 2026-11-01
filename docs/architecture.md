@@ -338,9 +338,12 @@ Use short ADRs under `docs/decisions/` for decisions with meaningful trade-offs.
 5. **Secrets and authentication:** initial administrator/access model, key storage, encryption master key, remote access constraints.
 6. **Retention and backups:** message retention default, deletion behavior, backup encryption, restore procedure.
 
-Recorded so far: `docs/decisions/0001-stack.md` (topic 1, decided) and
-`docs/decisions/0002-admin-authentication.md` (topic 5, initial model decided;
-key-encryption master key still open).
+Recorded so far: `docs/decisions/0001-stack.md` (topic 1, decided),
+`docs/decisions/0002-admin-authentication.md` (topic 5, initial model
+decided; key-encryption master key still open),
+`docs/decisions/0003-queue-strategy.md` (topic 3, decided), and
+`docs/decisions/0004-whatsapp-integration.md` (topic 2, decided; topic 6
+retention policy documented, product defaults still open).
 
 Do not block small implementation tasks on documenting every future decision. Record decisions before they become hard to reverse and update this document when the implemented design diverges.
 

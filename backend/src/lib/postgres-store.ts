@@ -288,16 +288,20 @@ export class PostgresStore implements Store {
   }
 
   async upsertGroup(group: Group): Promise<Group> {
-    // Natural key is chat_id when provided (bot-worker idempotent
-    // registration). The stored id wins over the caller's id so foreign
-    // keys (messages, summary_runs) stay stable across rediscovery.
+    // Natural key is chat_id when provided (idempotent registration by
+    // chat). NEVER-CLOBBER (ADR 0004 / audit M3): a chat-keyed upsert
+    // updates ONLY the name — monitored, timezone, summary_time (and id)
+    // are admin preferences and are never overwritten here. updateGroup
+    // is the only admin-preference writer. The stored id wins over the
+    // caller's id so foreign keys (messages, summary_runs) stay stable
+    // across rediscovery.
     if (group.chatId !== null) {
       const byChat = await this.pool.query<GroupRow>(
         `UPDATE groups
-         SET name = $2, monitored = $3, timezone = $4, summary_time = $5, updated_at = now()
+         SET name = $2, updated_at = now()
          WHERE chat_id = $1
          RETURNING ${GROUP_COLUMNS}`,
-        [group.chatId, group.name, group.monitored, group.timezone, group.summaryTime],
+        [group.chatId, group.name],
       );
       const chatRow = byChat.rows[0];
       if (chatRow !== undefined) return toGroup(chatRow);
@@ -312,8 +316,9 @@ export class PostgresStore implements Store {
     const insertedRow = inserted.rows[0];
     if (insertedRow !== undefined) return toGroup(insertedRow);
     // The insert lost to an existing row: either the id is already
-    // registered (replace it, including its chat_id) or a concurrent
-    // upsert registered the same chat first (keep that stored id).
+    // registered (replace it, including its chat_id — an explicit-id
+    // write is the caller's full statement) or a concurrent upsert
+    // registered the same chat first (name-only: never-clobber).
     const byId = await this.pool.query<GroupRow>(
       `UPDATE groups
        SET chat_id = $2, name = $3, monitored = $4, timezone = $5, summary_time = $6, updated_at = now()
@@ -326,10 +331,10 @@ export class PostgresStore implements Store {
     if (group.chatId !== null) {
       const byChat = await this.pool.query<GroupRow>(
         `UPDATE groups
-         SET name = $2, monitored = $3, timezone = $4, summary_time = $5, updated_at = now()
+         SET name = $2, updated_at = now()
          WHERE chat_id = $1
          RETURNING ${GROUP_COLUMNS}`,
-        [group.chatId, group.name, group.monitored, group.timezone, group.summaryTime],
+        [group.chatId, group.name],
       );
       const chatRow = byChat.rows[0];
       if (chatRow !== undefined) return toGroup(chatRow);
