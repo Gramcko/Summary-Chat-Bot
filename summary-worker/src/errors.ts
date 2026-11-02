@@ -28,11 +28,18 @@ export class PermanentRunError extends Error {
 export class RetryableRunError extends Error {
   /** Short machine-readable category (e.g. "provider_rate_limit"). */
   readonly code: string;
+  /**
+   * Provider-supplied retry hint in milliseconds (e.g. the Gemini API's
+   * Retry-After header or google.rpc.RetryInfo). Purely advisory delay
+   * metadata — never provider text (audit L1: fixed messages only).
+   */
+  readonly retryAfterMs?: number;
 
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, retryAfterMs?: number) {
     super(message);
     this.name = "RetryableRunError";
     this.code = code;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 

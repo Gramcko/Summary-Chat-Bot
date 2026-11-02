@@ -383,6 +383,26 @@ export class PostgresStore implements Store {
     return { run: toSummaryRun(row), created: row.created };
   }
 
+  async findRunByIdentity(
+    input: CreateRunInput,
+  ): Promise<SummaryRun | undefined> {
+    // Identity is (group, start instant, end instant, kind) — the same
+    // tuple as the UNIQUE constraint. Read-only: the scheduler uses it
+    // to avoid re-creating/re-enqueueing an already-scheduled window.
+    const result = await this.pool.query<RunRow>(
+      `SELECT ${RUN_COLUMNS} FROM summary_runs
+       WHERE group_id = $1 AND start_at = $2 AND end_at = $3 AND kind = $4`,
+      [
+        input.groupId,
+        new Date(input.interval.start),
+        new Date(input.interval.end),
+        input.kind,
+      ],
+    );
+    const row = result.rows[0];
+    return row === undefined ? undefined : toSummaryRun(row);
+  }
+
   async getRun(id: string): Promise<SummaryRun | undefined> {
     const result = await this.pool.query<RunRow>(
       `SELECT ${RUN_COLUMNS} FROM summary_runs WHERE id = $1`,

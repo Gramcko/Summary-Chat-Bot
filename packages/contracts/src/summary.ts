@@ -2,9 +2,18 @@ import { z } from "zod";
 import { Id, IsoDateTime } from "./common.js";
 
 /**
- * Reference to a source message supporting a summary claim.
- * An empty `sourceRefs` list means the item is not verifiable against
- * specific messages and must be presented with appropriate uncertainty.
+ * Reference to a source message supporting a summary claim. The
+ * summary-worker VERIFIES every ref against the messages fetched for
+ * the run and normalizes `sentAt` to the stored message's timestamp.
+ *
+ * Provenance policy (audit E-1, ADR 0005): consequential items
+ * (`DecisionItem` in confirmedDecisions/proposals/unresolvedQuestions,
+ * and `TaskItem`) require at least ONE verified sourceRef or the worker
+ * drops the item — an empty list here means "no message supports this
+ * claim", and such claims must not appear as decisions, proposals,
+ * questions, or tasks (AGENTS.md). Ref-less content is only kept in
+ * `keyDiscussions`. The schema still permits empty lists (a provider
+ * may emit one; the verification boundary enforces the policy).
  */
 export const SourceRef = z.object({
   messageId: Id,

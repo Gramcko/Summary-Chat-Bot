@@ -38,6 +38,19 @@ export interface RunContext {
   groupName: string;
 }
 
+/**
+ * The `ai_provider_configs` row as the worker needs it (single-row
+ * table; written by the backend's settings API). The API key stays
+ * ENCRYPTED here — decryption happens in ai/resolve-provider.ts and
+ * the plaintext is never logged (AGENTS.md).
+ */
+export interface StoredProviderConfig {
+  provider: string;
+  model: string;
+  baseUrl: string | null;
+  apiKeyEncrypted: string | null;
+}
+
 export interface UpsertSummaryInput {
   runId: string;
   provider: string;
@@ -52,8 +65,15 @@ export interface WorkerDb {
   /**
    * Messages for a group over the half-open interval [start, end),
    * ordered deterministically (sent_at, then the stable message id).
+   * `limit` caps the rows RETURNED (audit M3/E-4: callers decide
+   * too_large from a bounded slice instead of materializing a whole
+   * interval); omitted = no limit.
    */
-  fetchMessages(groupId: string, interval: Interval): Promise<StoredMessage[]>;
+  fetchMessages(
+    groupId: string,
+    interval: Interval,
+    limit?: number,
+  ): Promise<StoredMessage[]>;
   /**
    * Idempotent write keyed by runId (UNIQUE(summaries.run_id)): a
    * repeated write replaces the result and keeps the original id and
@@ -76,6 +96,12 @@ export interface WorkerDb {
    * completed run is never downgraded by a late failure.
    */
   markRunFailed(summaryRunId: string, error: RunError): Promise<boolean>;
+  /**
+   * The saved AI provider configuration (ai_provider_configs, at most
+   * one row), or undefined when the admin has not configured one —
+   * in that case the mock adapter is used (ADR 0005).
+   */
+  loadProviderConfig(): Promise<StoredProviderConfig | undefined>;
 }
 
 type RunRow = QueryResultRow & {
@@ -109,6 +135,13 @@ type SummaryRow = QueryResultRow & {
   model: string;
   result: unknown;
   created_at: Date;
+};
+
+type ProviderConfigRow = QueryResultRow & {
+  provider: string;
+  model: string;
+  base_url: string | null;
+  api_key_encrypted: string | null;
 };
 
 const RUN_COLUMNS =
@@ -182,18 +215,21 @@ export class PostgresWorkerDb implements WorkerDb {
   async fetchMessages(
     groupId: string,
     interval: Interval,
+    limit?: number,
   ): Promise<StoredMessage[]> {
     // Half-open [start, end): `sent_at >= start AND sent_at < end`, so
     // adjacent periods never overlap or double-count (architecture §5.3).
     // ORDER BY sent_at, id gives a deterministic order independent of
-    // insertion/visibility timing.
+    // insertion/visibility timing. LIMIT $4 bounds the rows returned
+    // (LIMIT NULL = unbounded) — audit M3/E-4.
     const result = await this.pool.query<MessageRow>(
       `SELECT m.id, m.sender_id, m.sent_at, m.body
        FROM messages m
        JOIN groups g ON g.chat_id = m.chat_id
        WHERE g.id = $1 AND m.sent_at >= $2 AND m.sent_at < $3
-       ORDER BY m.sent_at ASC, m.id ASC`,
-      [groupId, new Date(interval.start), new Date(interval.end)],
+       ORDER BY m.sent_at ASC, m.id ASC
+       LIMIT $4`,
+      [groupId, new Date(interval.start), new Date(interval.end), limit ?? null],
     );
     return result.rows.map(toStoredMessage);
   }
@@ -279,5 +315,23 @@ export class PostgresWorkerDb implements WorkerDb {
       [summaryRunId, safe.code, safe.message],
     );
     return (result.rowCount ?? 0) > 0;
+  }
+
+  async loadProviderConfig(): Promise<StoredProviderConfig | undefined> {
+    // Single-row table (backend enforces one row); the key stays
+    // encrypted in transit through this layer.
+    const result = await this.pool.query<ProviderConfigRow>(
+      `SELECT provider, model, base_url, api_key_encrypted
+       FROM ai_provider_configs
+       LIMIT 1`,
+    );
+    const row = result.rows[0];
+    if (row === undefined) return undefined;
+    return {
+      provider: row.provider,
+      model: row.model,
+      baseUrl: row.base_url,
+      apiKeyEncrypted: row.api_key_encrypted,
+    };
   }
 }

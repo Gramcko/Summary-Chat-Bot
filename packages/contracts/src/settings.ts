@@ -1,6 +1,37 @@
 import { z } from "zod";
 
 /**
+ * Provider base-URL validation (audit E-2). The URL addresses a
+ * CREDENTIAL-BEARING endpoint: the saved API key is sent as a header,
+ * so a hostile or mistaken base URL can exfiltrate it.
+ *
+ * Schema-level rules (always enforced):
+ * - https only;
+ * - best-effort rejection of obvious internal targets (localhost,
+ *   loopback, RFC1918, link-local, *.internal, *.local). This is
+ *   defense in depth, not a security boundary — SSRF protection is the
+ *   deployment's job.
+ *
+ * Runtime-level rule (see the summary-worker's resolve-provider): a
+ * custom (non-Google) host is honored only when the operator sets
+ * AI_ALLOW_CUSTOM_BASE_URL=yes (privileged; documented in ADR 0005).
+ */
+const INTERNAL_HOST_RE =
+  /^(localhost|127(\.\d{1,3}){3}|10(\.\d{1,3}){3}|192\.168(\.\d{1,3}){2}|172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2}|169\.254(\.\d{1,3}){2}|\[::1\]|.*\.(internal|local))$/i;
+
+export const ProviderBaseUrl = z
+  .url()
+  .max(500)
+  .refine(
+    (url) => new URL(url).protocol === "https:",
+    "must be an https URL",
+  )
+  .refine(
+    (url) => !INTERNAL_HOST_RE.test(new URL(url).hostname),
+    "must not target an internal host",
+  );
+
+/**
  * Provider configuration as returned to the browser.
  * Deliberately contains no key field of any kind: saved credentials are
  * masked by construction and cannot leak through this type. Reads only
@@ -9,7 +40,7 @@ import { z } from "zod";
 export const ProviderConfigPublic = z.object({
   provider: z.string().min(1).max(100),
   model: z.string().min(1).max(200),
-  baseUrl: z.url().max(500).nullable(),
+  baseUrl: ProviderBaseUrl.nullable(),
   hasApiKey: z.boolean(),
 });
 
@@ -20,7 +51,7 @@ export const ProviderConfigPublic = z.object({
 export const ProviderConfigUpdate = z.object({
   provider: z.string().min(1).max(100),
   model: z.string().min(1).max(200),
-  baseUrl: z.url().max(500).nullable().optional(),
+  baseUrl: ProviderBaseUrl.nullable().optional(),
   apiKey: z.string().min(1).max(500).nullable().optional(),
 });
 

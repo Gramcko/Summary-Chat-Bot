@@ -57,6 +57,12 @@
  *   - The summary-worker child starts only for the summary loop scenario and
  *     is stopped in teardown. Its own unit/integration suites cover the
  *     worker contract; this scenario covers the wired system end to end.
+ *   - The daily-summary scheduler runs DISABLED for the baseline
+ *     scenarios (their run-count assertions must not race a background
+ *     pass); scenarioScheduler() restarts the backend with
+ *     SCHEDULER_ENABLED=true and a fast interval, and asserts the D5
+ *     flow: one scheduled run per previous-day window, no duplicates,
+ *     completed by the running summary-worker.
  *   - Windows has no POSIX signals, so `child.kill()` terminates the servers
  *     instead of exercising graceful SIGTERM shutdown paths. Teardown is
  *     kill + wait + SIGKILL fallback so the worker never outlives the run.
@@ -231,6 +237,74 @@ function expectEnvelope(response, status, code, label) {
     `${label}: the error envelope must carry a message`,
   );
   return body.error;
+}
+
+// ---- time-zone helpers (D5 window, mirror of backend scheduler) --------
+
+/**
+ * Same two-pass Intl approach as backend/src/lib/scheduler.ts: the e2e
+ * computes the expected previous-day window independently so the
+ * assertions are not circular against the code under test.
+ */
+function zonedParts(instantMs, timeZone) {
+  const record = {};
+  for (const part of new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(instantMs))) {
+    if (part.type !== "literal") record[part.type] = part.value;
+  }
+  return {
+    year: Number(record.year),
+    month: Number(record.month),
+    day: Number(record.day),
+    hour: Number(record.hour),
+    minute: Number(record.minute),
+    second: Number(record.second),
+  };
+}
+
+function zonedMidnightMs(year, month, day, timeZone) {
+  const guess = Date.UTC(year, month - 1, day, 0, 0, 0);
+  const offsetAt = (instantMs) => {
+    const p = zonedParts(instantMs, timeZone);
+    return (
+      Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) -
+      Math.floor(instantMs / 1000) * 1000
+    );
+  };
+  const offset1 = offsetAt(guess);
+  let instant = guess - offset1;
+  const offset2 = offsetAt(instant);
+  if (offset2 !== offset1) instant = guess - offset2;
+  return instant;
+}
+
+/** Previous local day of `nowMs` as [startMs, endMs) instants. */
+function previousDayWindowMs(nowMs, timeZone) {
+  const local = zonedParts(nowMs, timeZone);
+  const todayCiv = Date.UTC(local.year, local.month - 1, local.day);
+  const yesterday = new Date(todayCiv - 86_400_000);
+  return {
+    startMs: zonedMidnightMs(
+      yesterday.getUTCFullYear(),
+      yesterday.getUTCMonth() + 1,
+      yesterday.getUTCDate(),
+      timeZone,
+    ),
+    endMs: zonedMidnightMs(local.year, local.month, local.day, timeZone),
+  };
+}
+
+function hhmm(minutesOfDay) {
+  const clamped = Math.max(0, Math.min(1439, minutesOfDay));
+  return `${String(Math.floor(clamped / 60)).padStart(2, "0")}:${String(clamped % 60).padStart(2, "0")}`;
 }
 
 // ---- HTTP clients (real cookie jars) ------------------------------------
@@ -482,7 +556,7 @@ const servers = {
   worker: null,
 };
 
-function backendEnv(port, trustedProxies) {
+function backendEnv(port, trustedProxies, extraEnv = {}) {
   return {
     ...process.env,
     PORT: String(port),
@@ -493,30 +567,42 @@ function backendEnv(port, trustedProxies) {
     // Dedicated queue namespace (audit M1): this run must never share
     // queue state with a dev instance or other suites.
     SUMMARY_QUEUE_PREFIX: e2eQueuePrefix,
+    // The scheduler is OFF for the deterministic baseline scenarios
+    // (their run-count assertions must not race a background pass);
+    // scenarioScheduler() restarts the backend with it enabled.
+    SCHEDULER_ENABLED: "false",
     ENCRYPTION_KEY: encryptionKey,
     TRUSTED_PROXIES: trustedProxies,
+    ...extraEnv,
     NEXT_TELEMETRY_DISABLED: "1",
   };
 }
 
-async function startBackend(port, trustedProxies) {
+async function startBackend(port, trustedProxies, extraEnv = {}) {
   const state = startProcess(
     `backend:${port}`,
     process.execPath,
     ["--import", "tsx", join(repoRoot, "backend", "src", "index.ts")],
     {
       cwd: repoRoot,
-      env: { ...backendEnv(port, trustedProxies), NODE_ENV: "production" },
+      env: {
+        ...backendEnv(port, trustedProxies, extraEnv),
+        NODE_ENV: "production",
+      },
     },
   );
   await waitForHttp(`http://127.0.0.1:${port}/health`, 60_000, state);
   return state;
 }
 
-async function restartBackend() {
+async function restartBackend(extraEnv = {}) {
   await stopProcess(servers.backend);
   servers.backend = null;
-  servers.backend = await startBackend(backendPort, "127.0.0.1,::1");
+  servers.backend = await startBackend(
+    backendPort,
+    "127.0.0.1,::1",
+    extraEnv,
+  );
   await waitForHttp(`${dashboardUrl}/login`, 60_000, servers.dashboard);
 }
 
@@ -1350,6 +1436,15 @@ async function scenarioHealth() {
  * over run state; it is stopped in teardown.
  */
 async function scenarioSummaryLoop() {
+  // The settings scenario deliberately leaves a bogus provider name
+  // configured ("openai"); the summary-worker rejects unknown providers
+  // with permanent provider_config (ADR 0005). Select the supported
+  // mock adapter so the loop below exercises the summary pipeline.
+  await api.request("/api/settings/ai-provider", {
+    method: "PUT",
+    body: { provider: "mock", model: "mock-1" },
+  });
+
   // Seed a demo group with messages via SQL (bot-worker capture is out
   // of scope for this milestone; this is exactly the normalized shape
   // ingestion writes).
@@ -1460,6 +1555,179 @@ async function scenarioSummaryLoop() {
         assert.equal(task.dueDate, null, `invented due date: ${JSON.stringify(task)}`);
       }
       return `overview: ${truncate(result.overview, 120)}`;
+    },
+  );
+}
+
+/**
+ * D5 scheduling loop (docs/decisions/0006): a monitored group whose
+ * cutoff just passed gets exactly ONE `kind: "scheduled"` run covering
+ * the PREVIOUS calendar day in its timezone, and the already-running
+ * summary-worker completes it. Deterministic by construction: the
+ * cutoff is computed server-side as "now minus 2 minutes" in the group
+ * timezone (floored at 00:00 for the midnight edge), all waits are
+ * bounded polling, and the scheduler runs at a fast interval.
+ */
+async function scenarioScheduler() {
+  const timezone = "Europe/Madrid";
+  const nowMs = Date.now();
+  const local = zonedParts(nowMs, timezone);
+  // "Just past" cutoff in the group timezone; at local 00:00-00:01 the
+  // subtraction underflows midnight, so floor at 00:00 (always due).
+  const summaryTime = hhmm(local.hour * 60 + local.minute - 2);
+  const window = previousDayWindowMs(nowMs, timezone);
+  const groupId = "b7e6d2c4-1a85-4f3d-9c6b-0d2e4a7f1b93";
+  const chatId = `${groupId}@g.us`;
+  const messageText = "The scheduled demo review happened yesterday.";
+
+  await sql(
+    `INSERT INTO whatsapp_connections (id, state)
+     SELECT gen_random_uuid(), 'connected'
+     WHERE NOT EXISTS (SELECT 1 FROM whatsapp_connections)`,
+  );
+  await sql(
+    `INSERT INTO groups (id, chat_id, name, monitored, timezone, summary_time)
+     VALUES ($1, $2, $3, true, $4, $5)`,
+    [groupId, chatId, "E2E Scheduler Group", timezone, summaryTime],
+  );
+  // One message INSIDE the previous-day window (local noon — night DST
+  // transitions never touch it): its presence in the summary proves the
+  // window really covers the previous local day.
+  await sql(
+    `INSERT INTO messages
+       (connection_id, chat_id, whatsapp_message_id, sender_id, sent_at, body)
+     SELECT id, $1, $2, $3, $4, $5 FROM whatsapp_connections LIMIT 1`,
+    [
+      chatId,
+      "wa-e2e-sched-1",
+      "Dana",
+      new Date(window.startMs + 12 * 3_600_000).toISOString(),
+      messageText,
+    ],
+  );
+
+  progress(
+    `scheduler: restarting backend with SCHEDULER_ENABLED=true ` +
+      `(cutoff ${summaryTime} ${timezone}, interval 2000ms)`,
+  );
+  await restartBackend({
+    SCHEDULER_ENABLED: "true",
+    SCHEDULER_INTERVAL_MS: "2000",
+  });
+
+  let runId = null;
+
+  await check(
+    "a due group gets exactly one scheduled run for the previous-day window",
+    async () => {
+      // Bounded polling: the scheduler's startup pass + fast interval.
+      // With the default BACKFILL_DAYS the fresh group also gets one
+      // run per older missing window — one run per DAY, never two for
+      // the same window.
+      const deadline = Date.now() + 30_000;
+      let rows = [];
+      for (;;) {
+        const result = await sql(
+          "SELECT id, kind, status, start_at, end_at, timezone FROM " +
+            "summary_runs WHERE group_id = $1 AND kind = 'scheduled'",
+          [groupId],
+        );
+        rows = result.rows;
+        if (rows.length > 0) break;
+        if (Date.now() > deadline) {
+          throw new Error("no scheduled run appeared within 30s");
+        }
+        await delay(250);
+      }
+      const windowRows = rows.filter(
+        (row) =>
+          new Date(row.start_at).toISOString() ===
+            new Date(window.startMs).toISOString() &&
+          new Date(row.end_at).toISOString() ===
+            new Date(window.endMs).toISOString(),
+      );
+      assert.equal(
+        windowRows.length,
+        1,
+        `expected exactly one scheduled run for the previous-day window, got ${windowRows.length}`,
+      );
+      runId = windowRows[0].id;
+      assert.equal(windowRows[0].kind, "scheduled", "run kind must be scheduled");
+      assert.equal(windowRows[0].timezone, timezone);
+      // The persisted window is exactly the previous local day.
+      const hours = (window.endMs - window.startMs) / 3_600_000;
+      assert.ok(
+        [23, 24, 25].includes(hours),
+        `the local day must be 23h/24h/25h (DST), got ${hours}h`,
+      );
+      // One run per DAY across the backfill window (default 3): three
+      // distinct windows, no doubles.
+      assert.equal(
+        rows.length,
+        3,
+        `expected one run per day in the backfill window, got ${rows.length}`,
+      );
+      assert.equal(
+        new Set(rows.map((row) => row.start_at.toISOString())).size,
+        3,
+        "backfill windows must be distinct",
+      );
+      // The API surfaces the run with its scheduled kind.
+      const run = await api.request(`/api/summary-runs/${runId}`);
+      expectStatus(run, 200, "GET scheduled run");
+      assert.equal(run.json?.kind, "scheduled", run.text);
+      return `kind=scheduled, window=${new Date(window.startMs).toISOString()} .. ${new Date(window.endMs).toISOString()} (${hours}h), 3 backfill days`;
+    },
+  );
+
+  await check("later scheduler ticks never duplicate the run", async () => {
+    await delay(6_000); // >= 3 ticks at SCHEDULER_INTERVAL_MS=2000
+    const result = await sql(
+      "SELECT start_at, count(*)::int AS count FROM summary_runs " +
+        "WHERE group_id = $1 AND kind = 'scheduled' GROUP BY start_at",
+      [groupId],
+    );
+    assert.equal(result.rows.length, 3, "the set of scheduled windows changed");
+    for (const row of result.rows) {
+      assert.equal(row.count, 1, "the scheduler duplicated a scheduled window");
+    }
+    return "still exactly 3 scheduled windows (one run each) after 3+ ticks";
+  });
+
+  await check(
+    "the summary-worker completes the scheduled run for the previous day",
+    async () => {
+      const deadline = Date.now() + 90_000;
+      for (;;) {
+        const response = await api.request(`/api/summary-runs/${runId}`);
+        expectStatus(response, 200, "GET scheduled run (poll)");
+        const status = response.json?.status;
+        if (status === "completed") break;
+        if (status === "failed") {
+          throw new Error(
+            `scheduled run failed: ${JSON.stringify(response.json?.error)}`,
+          );
+        }
+        if (Date.now() > deadline) {
+          throw new Error(`scheduled run still "${status}" after 90s`);
+        }
+        await delay(250);
+      }
+      const summary = await api.request(`/api/summary-runs/${runId}/summary`);
+      expectStatus(summary, 200, "GET scheduled run summary");
+      assert.equal(
+        summary.json?.result?.aiGenerated,
+        true,
+        "the summary must be marked AI-generated",
+      );
+      // The message seeded INSIDE the previous-day window is quoted —
+      // the D5 window semantics hold end to end.
+      const discussions = (summary.json?.result?.keyDiscussions ?? []).join("\n");
+      assert.ok(
+        discussions.includes(messageText),
+        `missing quoted message in: ${truncate(discussions)}`,
+      );
+      return "scheduled summary quotes the previous-day message";
     },
   );
 }
@@ -1830,6 +2098,7 @@ async function main() {
   await scenarioHealth();
   await scenarioRateLimiting();
   await scenarioSummaryLoop();
+  await scenarioScheduler();
   await scenarioNoKeyMaterialAnywhere();
 }
 

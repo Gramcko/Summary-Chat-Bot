@@ -13,6 +13,7 @@ import {
 import type {
   RunContext,
   StoredMessage,
+  StoredProviderConfig,
   UpsertSummaryInput,
   WorkerDb,
 } from "../src/db.js";
@@ -122,8 +123,19 @@ export class FakeDb implements WorkerDb {
     return { run: this.run, groupName: this.groupName };
   }
 
-  async fetchMessages(): Promise<StoredMessage[]> {
-    return this.messages;
+  /** Last requested fetch limit (audit M3/E-4 tests). */
+  fetchLimitUsed: number | undefined;
+  /** Set to throw a pg-like error from fetchMessages (audit E-6). */
+  fetchMessagesError: Error | undefined;
+
+  async fetchMessages(
+    _groupId?: string,
+    _interval?: Interval,
+    limit?: number,
+  ): Promise<StoredMessage[]> {
+    if (this.fetchMessagesError !== undefined) throw this.fetchMessagesError;
+    this.fetchLimitUsed = limit;
+    return limit === undefined ? this.messages : this.messages.slice(0, limit);
   }
 
   async upsertSummary(input: UpsertSummaryInput): Promise<Summary> {
@@ -177,5 +189,15 @@ export class FakeDb implements WorkerDb {
     this.run = { ...this.run, status: "failed", error };
     this.failedWrites.push(error);
     return true;
+  }
+
+  /** Saved provider config; undefined = unconfigured (mock). */
+  providerConfig: StoredProviderConfig | undefined = undefined;
+  /** Set to make loadProviderConfig throw (transient read failure). */
+  providerConfigError: Error | undefined = undefined;
+
+  async loadProviderConfig(): Promise<StoredProviderConfig | undefined> {
+    if (this.providerConfigError !== undefined) throw this.providerConfigError;
+    return this.providerConfig;
   }
 }

@@ -27,6 +27,15 @@ export interface CreateRunInput {
   kind: RunKind;
 }
 
+/**
+ * Run identity key: (group, start instant, end instant, kind) — the
+ * exact tuple protected by the database's UNIQUE constraint. The
+ * timezone label is deliberately excluded (presentation metadata).
+ */
+export function runIdentity(input: CreateRunInput): string {
+  return `${input.groupId}|${Date.parse(input.interval.start)}|${Date.parse(input.interval.end)}|${input.kind}`;
+}
+
 export function nowIso(): string {
   return new Date().toISOString();
 }
@@ -102,6 +111,12 @@ export interface Store {
    * is kept on the run; the label is presentation metadata, not identity.
    */
   createOrFindRun(input: CreateRunInput): Promise<{ run: SummaryRun; created: boolean }>;
+  /**
+   * Read-only identity lookup (group, interval instants, kind) — used
+   * by the scheduler to ask "does a run already exist for this
+   * window?" WITHOUT creating one. Undefined when there is none.
+   */
+  findRunByIdentity(input: CreateRunInput): Promise<SummaryRun | undefined>;
   getRun(id: string): Promise<SummaryRun | undefined>;
   /** Newest first. */
   listRuns(): Promise<SummaryRun[]>;
@@ -240,9 +255,7 @@ export class InMemoryStore implements Store {
     // timezone label is presentation metadata, not part of identity —
     // the message set for [start, end) is identical regardless — so the
     // first request's label is kept on the run.
-    const startMs = Date.parse(input.interval.start);
-    const endMs = Date.parse(input.interval.end);
-    const identity = `${input.groupId}|${startMs}|${endMs}|${input.kind}`;
+    const identity = runIdentity(input);
     const existingId = this.runsByIdentity.get(identity);
     if (existingId !== undefined) {
       const existing = this.runs.get(existingId);
@@ -263,6 +276,13 @@ export class InMemoryStore implements Store {
     this.runs.set(run.id, run);
     this.runsByIdentity.set(identity, run.id);
     return { run, created: true };
+  }
+
+  async findRunByIdentity(
+    input: CreateRunInput,
+  ): Promise<SummaryRun | undefined> {
+    const existingId = this.runsByIdentity.get(runIdentity(input));
+    return existingId === undefined ? undefined : this.runs.get(existingId);
   }
 
   async getRun(id: string): Promise<SummaryRun | undefined> {

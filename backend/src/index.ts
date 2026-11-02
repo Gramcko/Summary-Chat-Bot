@@ -9,6 +9,13 @@ import {
 import { loadRepoEnv } from "./lib/load-env.js";
 import { PostgresStore } from "./lib/postgres-store.js";
 import { parseReconcileIntervalMs, Reconciler } from "./lib/reconcile.js";
+import {
+  parseSchedulerEnabled,
+  parseSchedulerIntervalMs,
+  parseBackfillDays,
+  parseSummaryTime,
+  Scheduler,
+} from "./lib/scheduler.js";
 
 // Load the repository-root .env (see .env.example) before any
 // configuration is read. Shell-exported variables win over the file.
@@ -97,12 +104,22 @@ const redisUrl = requireRedisUrl();
 let retryBaseMs: number;
 let queuePrefix: string;
 let reconcileIntervalMs: number;
+let schedulerEnabled: boolean;
+let schedulerIntervalMs: number;
+let defaultSummaryTime: number;
+let backfillDays: number;
 try {
   retryBaseMs = parseRetryBaseMs(process.env["SUMMARY_RETRY_BASE_MS"]);
   queuePrefix = parseQueuePrefix(process.env["SUMMARY_QUEUE_PREFIX"]);
   reconcileIntervalMs = parseReconcileIntervalMs(
     process.env["RECONCILE_INTERVAL_MS"],
   );
+  schedulerEnabled = parseSchedulerEnabled(process.env["SCHEDULER_ENABLED"]);
+  schedulerIntervalMs = parseSchedulerIntervalMs(
+    process.env["SCHEDULER_INTERVAL_MS"],
+  );
+  defaultSummaryTime = parseSummaryTime(process.env["DEFAULT_SUMMARY_TIME"]);
+  backfillDays = parseBackfillDays(process.env["BACKFILL_DAYS"]);
 } catch (error) {
   fail(error instanceof Error ? error.message : "Invalid configuration.");
 }
@@ -123,6 +140,19 @@ const reconciler = new Reconciler({
   log,
 });
 
+// Daily-summary scheduler (architecture §5.3, D5 — previous calendar
+// day per group; docs/decisions/0006). Reconciliation and scheduling
+// are separate concerns on separate timers: the scheduler CREATES runs
+// for due groups, the reconciler RECOVERS runs whose enqueue was lost.
+const scheduler = new Scheduler({
+  store,
+  enqueue: enqueuer,
+  defaultCutoffMinutes: defaultSummaryTime,
+  intervalMs: schedulerIntervalMs,
+  backfillDays,
+  log,
+});
+
 const app = await buildApp({
   store,
   enqueue: enqueuer,
@@ -135,9 +165,20 @@ await app.listen({ port, host });
 // Architecture A6: reconciliation starts with the backend — one pass at
 // startup (repair the backlog after a restart) and then on an interval.
 reconciler.start();
+// The scheduler also passes once at startup (a restart must not miss
+// the day's cutoff) and then on its own interval.
+if (schedulerEnabled) {
+  scheduler.start();
+}
 log("backend_started", {
   port,
   reconcileIntervalMs,
+  schedulerEnabled,
+  schedulerIntervalMs,
+  backfillDays,
+  defaultSummaryTime: String(
+    `${String(Math.floor(defaultSummaryTime / 60)).padStart(2, "0")}:${String(defaultSummaryTime % 60).padStart(2, "0")}`,
+  ),
   retryBaseMs,
   queuePrefix,
 });
@@ -151,6 +192,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
       try {
         // Stop scheduled work first, then HTTP, then the queue, then
         // the database pool (architecture A6 graceful shutdown).
+        await scheduler.stop();
         await reconciler.stop();
         await app.close();
         await enqueuer.close();

@@ -82,6 +82,20 @@ in-memory throttle.
 | GET | `/api/settings/ai-provider` | `ProviderConfigPublic` | `404` when unconfigured. Never returns key material. |
 | PUT | `/api/settings/ai-provider` | `ProviderConfigPublic` | Upsert. `apiKey`: omit = keep, string = replace, `null` = clear. |
 
+AI provider strings (ADR 0005): enter `provider: "google-gemini"` with
+`model: "gemini-3.8-flash"` (or the cheaper `gemini-3.5-flash-lite`) to
+use the Gemini adapter; `provider: "mock"` (or leaving the settings
+unconfigured) selects the deterministic mock adapter used by tests.
+Provider failures surface as safe run error codes on the run
+(`error.code`, e.g. `provider_auth`, `provider_rate_limit`,
+`provider_config`, `too_large`) with fixed messages — raw provider
+error text is never stored or shown. Summary items in the
+consequential sections carry `sourceRefs` (message ids + timestamps)
+that were verified against the stored messages; rendering the cited
+message text itself is a tracked follow-up, so the "verify against
+sources" notice means "check the ids/timestamps against your records",
+not clickable citations yet.
+
 Note: `GET /api/summary-runs/:id/summary` is the primary result lookup for
 a run — it returns the `Summary` schema and answers `404` (standard error
 envelope) both when the run is unknown and when it has no summary yet.
@@ -111,6 +125,20 @@ endpoints only means "not finished yet" (or an unknown run), never
 "nothing to summarize". (The exact overview wording is adapter
 behavior, not part of this API contract.)
 
+**Scheduled runs (`kind: "scheduled"`).** The backend's scheduler
+(ADR 0006) creates one run per monitored group per day, covering the
+**previous calendar day** in the group's time zone — the half-open
+window `[00:00, 24:00)` local, stored as instants — once the group's
+cutoff is reached: its `summary_time` (HH:mm, set per group in the
+dashboard) or the install default `DEFAULT_SUMMARY_TIME` (env, default
+`09:00`). Exactly one run can exist per group/window (create-or-find),
+the scheduler never re-runs a window, and a missed enqueue is recovered
+by reconciliation. What the admin configures: per group `monitored`,
+`timezone`, `summary_time`; per install `SCHEDULER_ENABLED`,
+`SCHEDULER_INTERVAL_MS`, `DEFAULT_SUMMARY_TIME`. Scheduled runs flow
+through the same state machine and summary endpoints as manual runs;
+`POST /api/summary-runs/:id/retry` applies to them unchanged.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -124,6 +152,14 @@ behavior, not part of this API contract.)
 | `TRUSTED_PROXIES` | `127.0.0.1,::1` | Comma-separated IPs/CIDRs whose `X-Forwarded-For` is trusted for client-IP derivation (rate limiting) |
 | `RECONCILE_INTERVAL_MS` | `60000` | Cadence of the summary-run reconciliation pass (positive integer, milliseconds; the floor is 1000) |
 | `SUMMARY_QUEUE_PREFIX` | `summarly` | BullMQ key-prefix namespace for the summary queue (backend + summary-worker must agree; tests use `summarly-test`, e2e `summarly-e2e`) |
+| `SCHEDULER_ENABLED` | `true` | Daily-summary scheduler on/off (true/false) |
+| `SCHEDULER_INTERVAL_MS` | `60000` | Scheduler pass cadence (positive integer, milliseconds; the floor is 1000) |
+| `DEFAULT_SUMMARY_TIME` | `09:00` | Install default daily cutoff (HH:mm) for groups without `summary_time` |
+| `BACKFILL_DAYS` | `3` | Bounded missed-day recovery depth: each pass also schedules missing windows for the previous N local days (integer, clamped 1–31) |
+| `MAX_MESSAGES_PER_RUN` | `2000` | Cost/size cap: runs with more messages fail with `too_large` (permanent) |
+| `MAX_CHUNKS_PER_RUN` | `10` | Cost/size cap: runs needing more provider chunks fail with `too_large` (permanent) |
+| `AI_REQUEST_TIMEOUT_MS` | `120000` | Bounded timeout for one AI provider request (positive integer, milliseconds) |
+| `AI_ALLOW_CUSTOM_BASE_URL` | `unset` | PRIVILEGED opt-in (`yes`): allows saving a non-Google provider base URL — the API key is sent to that host (ADR 0005). Internal targets stay rejected regardless. |
 
 ## Security notes
 

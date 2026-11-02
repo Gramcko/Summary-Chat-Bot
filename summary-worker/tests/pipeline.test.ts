@@ -12,13 +12,19 @@ import {
   isPermanentFailure,
   PermanentRunError,
   RetryableRunError,
+  toRunError,
 } from "../src/errors.js";
 import {
   assembleResult,
   consolidate,
   MAX_CHARS_PER_CHUNK,
+  MAX_HONORED_RETRY_AFTER_MS,
+  parsePositiveEnvInt,
   processSummaryRun,
+  retryAfterWaitMs,
   splitIntoChunks,
+  verifyOutputSourceRefs,
+  verifySourceRefs,
   type PipelineDeps,
 } from "../src/pipeline.js";
 import {
@@ -498,6 +504,399 @@ describe("assembleResult (audit L2: fixed-text malformed-output handling)", () =
     // Round-trips cleanly (what the jsonb write needs).
     expect(JSON.parse(JSON.stringify(consolidated.overview))).toBe(
       consolidated.overview,
+    );
+  });
+});
+
+describe("provenance verification (audit L3 / E-1)", () => {
+  const FAKE_ID = "00000000-0000-4000-8000-000000000000";
+  const ref = (messageId: string, sentAt = "2026-10-28T09:00:00Z") => ({
+    messageId,
+    sentAt,
+  });
+  // id -> the STORED message's real sentAt (the model's is never trusted).
+  const validId = "4f9d2b6a-1c31-4a2f-9a3e-9c0a1b2c3d4e";
+  const messages = new Map([[validId, "2026-10-28T07:45:31.000Z"]]);
+
+  it("drops invented refs and keeps the valid remainder of an item", () => {
+    const kept = verifySourceRefs(
+      [{ text: "half true", sourceRefs: [ref(FAKE_ID), ref(validId)] }],
+      messages,
+    );
+    expect(kept).toEqual([
+      {
+        text: "half true",
+        sourceRefs: [{ messageId: validId, sentAt: "2026-10-28T07:45:31.000Z" }],
+      },
+    ]);
+  });
+
+  it("drops items whose ONLY cited ids were invented (fabricated provenance)", () => {
+    const kept = verifySourceRefs(
+      [
+        { text: "fabricated", sourceRefs: [ref(FAKE_ID)] },
+        { text: "real", sourceRefs: [ref(validId)] },
+      ],
+      messages,
+    );
+    expect(kept.map((item) => item.text)).toEqual(["real"]);
+  });
+
+  it("drops items that cite NOTHING (E-1: consequential claims need message support)", () => {
+    // AGENTS.md: do not label a statement a decision/deadline/task/owner
+    // unless source messages support it. Ref-less general observations
+    // belong in keyDiscussions, not here.
+    const kept = verifySourceRefs(
+      [{ text: "general point", sourceRefs: [] }],
+      messages,
+    );
+    expect(kept).toEqual([]);
+  });
+
+  it("normalizes a surviving ref's sentAt to the stored message's (review n3)", () => {
+    const kept = verifySourceRefs(
+      [
+        {
+          text: "right id, wrong time",
+          sourceRefs: [ref(validId, "2099-01-01T00:00:00Z")],
+        },
+      ],
+      messages,
+    );
+    expect(kept).toEqual([
+      {
+        text: "right id, wrong time",
+        sourceRefs: [{ messageId: validId, sentAt: "2026-10-28T07:45:31.000Z" }],
+      },
+    ]);
+  });
+
+  it("applies to every provenance section and leaves the rest alone", () => {
+    const output = fakeOutput({
+      overview: "overview stays",
+      keyDiscussions: ["stays too (keyDiscussions is the ref-less surface)"],
+      confirmedDecisions: [{ text: "drop me", sourceRefs: [ref(FAKE_ID)] }],
+      proposals: [{ text: "keep me", sourceRefs: [ref(validId)] }],
+      unresolvedQuestions: [{ text: "no refs - drop", sourceRefs: [] }],
+      tasks: [
+        {
+          text: "task with bad ref",
+          owner: null,
+          dueDate: null,
+          sourceRefs: [ref(FAKE_ID)],
+        },
+      ],
+      links: [{ url: "https://example.com", description: null }],
+    });
+    const verified = verifyOutputSourceRefs(output, messages);
+    expect(verified.overview).toBe("overview stays");
+    expect(verified.keyDiscussions).toEqual([
+      "stays too (keyDiscussions is the ref-less surface)",
+    ]);
+    expect(verified.confirmedDecisions).toEqual([]);
+    expect(verified.proposals).toEqual([
+      {
+        text: "keep me",
+        sourceRefs: [{ messageId: validId, sentAt: "2026-10-28T07:45:31.000Z" }],
+      },
+    ]);
+    // E-1: ref-less consequential items are dropped too.
+    expect(verified.unresolvedQuestions).toEqual([]);
+    expect(verified.tasks).toEqual([]);
+    expect(verified.links).toEqual(output.links);
+  });
+
+  it("removes injected fake ids end-to-end through the pipeline", async () => {
+    const run = makeRun();
+    const db = new FakeDb(run);
+    db.messages = makeStoredMessages(1);
+    const stored = db.messages[0];
+    if (stored === undefined) throw new Error("no seeded message");
+    const provider = new FakeProvider(() =>
+      fakeOutput({
+        confirmedDecisions: [
+          { text: "real", sourceRefs: [ref(stored.id)] },
+          { text: "half true", sourceRefs: [ref(FAKE_ID), ref(stored.id)] },
+          { text: "fabricated", sourceRefs: [ref(FAKE_ID)] },
+          { text: "unsupported claim", sourceRefs: [] },
+        ],
+      }),
+    );
+
+    const outcome = await processSummaryRun(makeDeps(db, provider), run.id);
+    expect(outcome).toBe("completed");
+    const result = db.summaries.get(run.id)?.result;
+    // Only items with surviving refs remain, and their timestamps are
+    // the STORED messages' (the model's sentAt is discarded).
+    expect(result?.confirmedDecisions).toEqual([
+      { text: "real", sourceRefs: [ref(stored.id, stored.sentAt)] },
+      { text: "half true", sourceRefs: [ref(stored.id, stored.sentAt)] },
+    ]);
+  });
+});
+
+describe("cost/size caps (audit M3 remainder)", () => {
+  it("fails permanently with too_large beyond the message cap", async () => {
+    const run = makeRun();
+    const db = new FakeDb(run);
+    db.messages = makeStoredMessages(3);
+    const provider = new FakeProvider(() => fakeOutput());
+
+    const error = await processSummaryRun(
+      {
+        ...makeDeps(db, provider),
+        limits: { maxMessagesPerRun: 2, maxChunksPerRun: 10 },
+      },
+      run.id,
+    ).catch((caught: unknown) => caught);
+
+    expect(isPermanentFailure(error)).toBe(true);
+    // The permanent path rethrows as UnrecoverableError with the code
+    // prefixed to the fixed message; the run row keeps the real code.
+    expect((error as Error).name).toBe("UnrecoverableError");
+    expect((error as Error).message).toBe(
+      "too_large: This conversation exceeds MAX_MESSAGES_PER_RUN (limit 2 messages).",
+    );
+    // The guard fires BEFORE any provider spend.
+    expect(provider.calls).toHaveLength(0);
+    expect(db.failedWrites.map((entry) => entry.code)).toEqual(["too_large"]);
+    expect(db.run?.status).toBe("failed");
+  });
+
+  it("fetches at most maxMessagesPerRun + 1 rows (memory bound, M3/E-4)", async () => {
+    const run = makeRun();
+    const db = new FakeDb(run);
+    db.messages = makeStoredMessages(50);
+    const provider = new FakeProvider(() => fakeOutput());
+
+    await processSummaryRun(
+      {
+        ...makeDeps(db, provider),
+        limits: { maxMessagesPerRun: 10, maxChunksPerRun: 10 },
+      },
+      run.id,
+    ).catch(() => undefined);
+
+    // The too_large decision was made from a bounded slice: the query
+    // asked for one row past the cap, never the whole interval.
+    expect(db.fetchLimitUsed).toBe(11);
+  });
+
+  it("fails permanently with too_large beyond the chunk cap", async () => {
+    const run = makeRun();
+    const db = new FakeDb(run);
+    // 6 x 4000 chars -> 2 chunks against a 20000-char budget.
+    db.messages = makeStoredMessages(6, "x".repeat(4000));
+    const provider = new FakeProvider(() => fakeOutput());
+
+    const error = await processSummaryRun(
+      {
+        ...makeDeps(db, provider),
+        limits: { maxMessagesPerRun: 100, maxChunksPerRun: 1 },
+      },
+      run.id,
+    ).catch((caught: unknown) => caught);
+
+    expect((error as Error).message).toBe(
+      "too_large: This conversation exceeds MAX_CHUNKS_PER_RUN (limit 1 chunks).",
+    );
+    expect(db.failedWrites.map((entry) => entry.code)).toEqual(["too_large"]);
+    expect(provider.calls).toHaveLength(0);
+  });
+
+  it("parses cap/timeout env vars with defaults and fail-fast", () => {
+    expect(parsePositiveEnvInt("X", undefined, 7)).toBe(7);
+    expect(parsePositiveEnvInt("X", "", 7)).toBe(7);
+    expect(parsePositiveEnvInt("X", "42", 7)).toBe(42);
+    for (const raw of ["0", "-3", "abc", "1.5"]) {
+      expect(() => parsePositiveEnvInt("X", raw, 7), raw).toThrow(/X/);
+    }
+  });
+});
+
+describe("per-run provider resolution (ADR 0005)", () => {
+  it("uses the resolved adapter and persists its identity", async () => {
+    const run = makeRun();
+    const db = new FakeDb(run);
+    db.messages = makeStoredMessages(1);
+    const staticProvider = new FakeProvider(() => {
+      throw new Error("the static fallback must not be used");
+    });
+    const resolvedProvider = new FakeProvider(() => fakeOutput());
+
+    const outcome = await processSummaryRun(
+      {
+        ...makeDeps(db, staticProvider),
+        resolveProvider: async () => ({
+          provider: resolvedProvider,
+          providerName: "google-gemini",
+          modelName: "gemini-3.8-flash",
+        }),
+      },
+      run.id,
+    );
+
+    expect(outcome).toBe("completed");
+    expect(staticProvider.calls).toHaveLength(0);
+    expect(resolvedProvider.calls).toHaveLength(1);
+    const summary = db.summaries.get(run.id);
+    expect(summary?.provider).toBe("google-gemini");
+    expect(summary?.model).toBe("gemini-3.8-flash");
+  });
+
+  it("propagates permanent config failures and marks the run failed", async () => {
+    const run = makeRun();
+    const db = new FakeDb(run);
+    const provider = new FakeProvider(() => fakeOutput());
+
+    const error = await processSummaryRun(
+      {
+        ...makeDeps(db, provider),
+        resolveProvider: async () => {
+          throw new PermanentRunError(
+            "provider_config",
+            "The AI provider configuration is invalid or unsupported.",
+          );
+        },
+      },
+      run.id,
+    ).catch((caught: unknown) => caught);
+
+    expect(isPermanentFailure(error)).toBe(true);
+    expect((error as Error).name).toBe("UnrecoverableError");
+    expect(db.failedWrites).toEqual([
+      {
+        code: "provider_config",
+        message: "The AI provider configuration is invalid or unsupported.",
+      },
+    ]);
+    expect(provider.calls).toHaveLength(0);
+  });
+});
+
+describe("retry-after honoring (bounded wait, audit L1 metadata)", () => {
+  it("clamps the honored wait", () => {
+    expect(retryAfterWaitMs(0)).toBe(0);
+    expect(retryAfterWaitMs(-5)).toBe(0);
+    expect(retryAfterWaitMs(10_000)).toBe(10_000);
+    expect(retryAfterWaitMs(10 * MAX_HONORED_RETRY_AFTER_MS)).toBe(
+      MAX_HONORED_RETRY_AFTER_MS,
+    );
+  });
+
+  it("waits at least the hint before rethrowing a retryable error", async () => {
+    const run = makeRun();
+    const db = new FakeDb(run);
+    const provider = new FakeProvider(() => {
+      throw new RetryableRunError(
+        "provider_rate_limit",
+        "The AI provider rate limit was reached.",
+        40,
+      );
+    });
+
+    const started = Date.now();
+    const error = await processSummaryRun(makeDeps(db, provider), run.id).catch(
+      (caught: unknown) => caught,
+    );
+    const elapsed = Date.now() - started;
+
+    expect((error as Error & { code?: string }).code).toBe("provider_rate_limit");
+    // The 40ms provider hint was honored before the rethrow.
+    expect(elapsed).toBeGreaterThanOrEqual(30);
+    expect(db.failedWrites).toEqual([]); // still retryable: no terminal write
+  });
+});
+
+describe("DB-call boundary (audit E-6: fixed messages, no pg text)", () => {
+  const PG_LIKE =
+    'error: duplicate key value violates unique constraint "summaries_run_id_key" DETAIL: Key (run_id)=(4f9d2b6a-secret-row) already exists.';
+
+  it("surfaces unexpected DB errors as retryable db_unavailable with FIXED text", async () => {
+    for (const failing of [
+      "fetchMessagesError",
+    ] as const) {
+      const run = makeRun();
+      const db = new FakeDb(run);
+      (db as unknown as Record<string, Error | undefined>)[failing] = new Error(
+        PG_LIKE,
+      );
+      const provider = new FakeProvider(() => fakeOutput());
+
+      const error = (await processSummaryRun(makeDeps(db, provider), run.id).catch(
+        (caught: unknown) => caught,
+      )) as Error & { code?: string };
+
+      expect(error).toBeInstanceOf(RetryableRunError);
+      expect(isPermanentFailure(error)).toBe(false);
+      expect(error?.code).toBe("db_unavailable");
+      expect(error?.message).toBe(
+        "A database operation failed; the run will be retried.",
+      );
+      // The pg text (with its row values) never reaches run metadata.
+      expect(JSON.stringify(toRunError(error))).not.toContain("4f9d2b6a-secret-row");
+      expect(JSON.stringify(toRunError(error))).not.toContain("duplicate key");
+      expect(db.failedWrites).toEqual([]); // retryable: no terminal write
+      expect(db.run?.status).toBe("processing"); // left processable
+    }
+  });
+
+  it("wraps upsertSummary and markRun* the same way", async () => {
+    const cases: Array<(db: FakeDb) => void> = [
+      (db) => {
+        db.upsertSummary = async () => {
+          throw new Error(PG_LIKE);
+        };
+      },
+      (db) => {
+        db.markRunProcessing = async () => {
+          throw new Error(PG_LIKE);
+        };
+      },
+      (db) => {
+        db.markRunCompleted = async () => {
+          throw new Error(PG_LIKE);
+        };
+      },
+    ];
+    for (const breakDb of cases) {
+      const run = makeRun();
+      const db = new FakeDb(run);
+      db.messages = makeStoredMessages(1);
+      breakDb(db);
+      const provider = new FakeProvider(() => fakeOutput());
+
+      const error = (await processSummaryRun(makeDeps(db, provider), run.id).catch(
+        (caught: unknown) => caught,
+      )) as Error & { code?: string };
+      expect(error?.code, String(breakDb)).toBe("db_unavailable");
+      expect(error?.message).toBe(
+        "A database operation failed; the run will be retried.",
+      );
+      expect(JSON.stringify(error)).not.toContain("duplicate key");
+    }
+  });
+
+  it("keeps typed pipeline errors unchanged across the boundary", async () => {
+    // A typed retryable error thrown by the DB layer must survive as
+    // itself (same code/message), not be re-wrapped.
+    const run = makeRun();
+    const db = new FakeDb(run);
+    db.messages = makeStoredMessages(1);
+    db.upsertSummary = async () => {
+      throw new RetryableRunError(
+        "provider_malformed_output",
+        "The assembled summary does not match the SummaryResult contract.",
+      );
+    };
+    const provider = new FakeProvider(() => fakeOutput());
+
+    const error = (await processSummaryRun(makeDeps(db, provider), run.id).catch(
+      (caught: unknown) => caught,
+    )) as Error & { code?: string };
+    expect(error?.code).toBe("provider_malformed_output");
+    expect(error?.message).toBe(
+      "The assembled summary does not match the SummaryResult contract.",
     );
   });
 });

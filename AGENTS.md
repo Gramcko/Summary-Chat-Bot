@@ -29,6 +29,7 @@ These rules apply to all coding agents working in this repository. Read this fil
 - End-to-end (starts real services including the summary-worker): `npm run test:e2e`
 - Database migrations: `npm run migrate -w @summarly/backend up` (or `down`; requires `DATABASE_URL`, see `.env.example`)
 - CLI password reset (recovery option B): `npm run reset-password -w @summarly/backend`
+- Provider smoke test (one tiny live Gemini call validating the request shape; prints a fixed error code or a success marker — never keys or responses): `node scripts/provider-smoke.mjs`
 - Lint: not configured yet — `npm run lint` does not exist (follow-up in docs/decisions/0001)
 - Run the narrowest relevant checks first, then broader checks when the changed surface warrants them.
 - Report the exact commands run and whether each passed, failed, was skipped, or could not run.

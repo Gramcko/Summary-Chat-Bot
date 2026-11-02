@@ -62,3 +62,24 @@ export interface AiProvider {
 export type AiMessage = z.infer<typeof AiMessage>;
 export type AiSummaryInput = z.infer<typeof AiSummaryInput>;
 export type ProviderSummaryOutput = z.infer<typeof ProviderSummaryOutput>;
+
+// ---- Provider identity strings (ADR 0005) ----
+//
+// These are the exact strings the admin enters in the settings screen
+// (`PUT /api/settings/ai-provider`) and the summary-worker uses to
+// select an adapter. Unknown values fail the run with a permanent
+// `provider_config` error instead of guessing.
+
+/** Deterministic mock adapter: the default and the test provider. */
+export const AI_PROVIDER_MOCK = "mock";
+
+/** Google Gemini REST adapter (see docs/decisions/0005-ai-provider.md). */
+export const AI_PROVIDER_GOOGLE_GEMINI = "google-gemini";
+
+/**
+ * Default model for {@link AI_PROVIDER_GOOGLE_GEMINI}: the stable
+ * Flash-tier model verified against the Gemini API docs on 2026-11-02
+ * (`gemini-3.8-flash`, 1M input / 65,536 output tokens). Model ids are
+ * version-sensitive — the saved config's `model` overrides this.
+ */
+export const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";

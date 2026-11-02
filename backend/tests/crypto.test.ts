@@ -118,3 +118,30 @@ describe("encryptSecret / decryptSecret", () => {
     );
   });
 });
+
+/**
+ * Cross-service crypto parity fixture (audit E-5): summary-worker
+ * carries a VERBATIM copy of this module (it must not import the
+ * backend). This fixed ciphertext — generated ONCE with the fixture key
+ * below — must keep decrypting in BOTH copies (see
+ * summary-worker/tests/crypto-parity.test.ts); if either copy drifts,
+ * one of the two parity suites fails. Test-only values; never reuse.
+ */
+const PARITY_KEY_BASE64 = "c3VtbWFybHktY3J5cHRvLXBhcml0eS1rZXktdjEuLi4=";
+const PARITY_CIPHERTEXT =
+  "enc:v1:MDEyMzQ1Njc4OWFi:dKSHOWo4OAYatSq7oLeYfw==:B7D57k1QOjRf8HyZl9CrBIc9crGmY0ID";
+const PARITY_PLAINTEXT = "sk-parity-fixture-secret";
+
+describe("cross-service crypto parity fixture (audit E-5)", () => {
+  it("decrypts the fixed fixture with the fixture key", () => {
+    const key = parseEncryptionKey(PARITY_KEY_BASE64);
+    expect(decryptSecret(key, PARITY_CIPHERTEXT)).toBe(PARITY_PLAINTEXT);
+  });
+
+  it("still round-trips through the same scheme (encrypt side intact)", () => {
+    const key = parseEncryptionKey(PARITY_KEY_BASE64);
+    expect(decryptSecret(key, encryptSecret(key, PARITY_PLAINTEXT))).toBe(
+      PARITY_PLAINTEXT,
+    );
+  });
+});
