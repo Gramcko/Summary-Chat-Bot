@@ -79,5 +79,6 @@ export async function seedGroup(store: InMemoryStore): Promise<void> {
     monitored: true,
     timezone: "Europe/Madrid",
     summaryTime: null,
+    historyImport: null,
   });
 }

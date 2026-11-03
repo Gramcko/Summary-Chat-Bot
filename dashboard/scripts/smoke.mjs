@@ -459,6 +459,46 @@ async function main() {
     assert.match(response.text, /"summaryTime":null/);
   });
 
+  const projectGroupId = "11111111-2222-4333-8444-555555555555";
+
+  await check("history import on an unmonitored group is rejected with 409", async () => {
+    const response = await request(`/api/groups/${projectGroupId}/history-import`, {
+      method: "POST",
+    });
+    assert.equal(response.status, 409, response.text);
+    assert.match(response.text, /"code":"conflict"/);
+    assert.match(response.text, /must be monitored/i);
+  });
+
+  await check("history import request returns 202 with pending state", async () => {
+    const response = await request(`/api/groups/${groupId}/history-import`, {
+      method: "POST",
+    });
+    assert.equal(response.status, 202, response.text);
+    const payload = JSON.parse(response.text);
+    assert.equal(payload.historyImport.status, "pending");
+    assert.equal(payload.historyImport.importedCount, 0);
+    assert.equal(payload.historyImport.error, null);
+  });
+
+  await check("repeated history import returns 200 (idempotent)", async () => {
+    const response = await request(`/api/groups/${groupId}/history-import`, {
+      method: "POST",
+    });
+    assert.equal(response.status, 200, response.text);
+    assert.match(response.text, /"status":"pending"/);
+  });
+
+  await check("PATCH never changes the system-managed history import", async () => {
+    const response = await request(`/api/groups/${groupId}`, {
+      method: "PATCH",
+      body: { monitored: true, timezone: "Europe/Madrid", summaryTime: "08:30" },
+    });
+    assert.equal(response.status, 200, response.text);
+    const payload = JSON.parse(response.text);
+    assert.equal(payload.historyImport.status, "pending");
+  });
+
   await check("run request surfaces interval errors", async () => {
     const response = await request("/api/summary-runs", {
       method: "POST",

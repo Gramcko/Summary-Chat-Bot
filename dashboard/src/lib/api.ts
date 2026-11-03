@@ -287,6 +287,22 @@ export const api = {
     }).then((result) => result.data);
   },
 
+  /**
+   * Requests a WhatsApp history import for a monitored group (ADR 0007).
+   * `202` accepts a new (or repeat) request; `200` means an import is already
+   * pending/running and the call was an idempotent no-op. `409` means the group
+   * is not monitored; `404` an unknown group.
+   */
+  async requestHistoryImport(
+    id: string,
+  ): Promise<{ group: Group; accepted: boolean }> {
+    const result = await requestRaw<Group>(
+      `/groups/${encodeURIComponent(id)}/history-import`,
+      { method: "POST" },
+    );
+    return { group: result.data, accepted: result.status === 202 };
+  },
+
   runs(): Promise<RunListResponse> {
     return requestRaw<RunListResponse>("/summary-runs").then(
       (result) => result.data,

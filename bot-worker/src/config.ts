@@ -8,6 +8,11 @@ import {
   constants as fsConstants,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  DEFAULT_HISTORY_IMPORT_BUDGETS,
+  HISTORY_IMPORT_BOUNDS,
+  validateHistoryImportBudgets,
+} from "./history-import.js";
 import { isLogLevel, type LogLevel } from "./lib/log.js";
 
 /**
@@ -70,8 +75,30 @@ export interface BotConfig {
    * pipelines).
    */
   linkingDisplay: "tty" | "none";
+  /** History-import budget knobs (ADR 0007); bounded best-effort. */
+  historyImport: HistoryImportSettings;
   logLevel: LogLevel;
   backoff: BackoffPolicy;
+}
+
+/**
+ * History-import knobs from the environment (ADR 0007). The import is
+ * BOUNDED best-effort: WhatsApp decides what history it returns and the
+ * import is partial by design. The remaining budget internals (round
+ * timeout, settle window, stale threshold) live in
+ * `history-import.ts`'s DEFAULT_HISTORY_IMPORT_BUDGETS.
+ */
+export interface HistoryImportSettings {
+  /** Poll interval for pending imports (floor 1000). */
+  pollMs: number;
+  /** Messages requested per round. */
+  batchCount: number;
+  /** Maximum request rounds per import. */
+  maxRounds: number;
+  /** Maximum messages collected per import. */
+  maxMessages: number;
+  /** Wall-clock budget per import, milliseconds. */
+  timeBudgetMs: number;
 }
 
 /** A configuration problem with an actionable, safe message. */
@@ -214,6 +241,49 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
     logLevel = rawLevel;
   }
 
+  // ---- History import budgets (ADR 0007): bounded best-effort ----
+  const historyImport: HistoryImportSettings = {
+    pollMs: parseBudgetInt(env, "HISTORY_IMPORT_POLL_MS", 5_000),
+    batchCount: parseBudgetInt(
+      env,
+      "HISTORY_IMPORT_BATCH_COUNT",
+      100,
+      HISTORY_IMPORT_BOUNDS.batchCount,
+    ),
+    maxRounds: parseBudgetInt(
+      env,
+      "HISTORY_IMPORT_MAX_ROUNDS",
+      20,
+      HISTORY_IMPORT_BOUNDS.maxRounds,
+    ),
+    maxMessages: parseBudgetInt(
+      env,
+      "HISTORY_IMPORT_MAX_MESSAGES",
+      2_000,
+      HISTORY_IMPORT_BOUNDS.maxMessages,
+    ),
+    timeBudgetMs: parseBudgetInt(env, "HISTORY_IMPORT_TIME_BUDGET_MS", 120_000),
+  };
+  // The poll interval has a hard floor (like RECONCILE_INTERVAL_MS):
+  // values below 1000ms would poll the database pointlessly.
+  if (historyImport.pollMs < 1_000) historyImport.pollMs = 1_000;
+
+  // Staleness invariant + bounds (SA-L1): a slow-but-active import must
+  // never look stale to the recovery sweep (timeBudget + roundTimeout
+  // < staleMs). Fails fast with the validator's clear message.
+  try {
+    validateHistoryImportBudgets({
+      ...DEFAULT_HISTORY_IMPORT_BUDGETS,
+      ...historyImport,
+    });
+  } catch (error) {
+    throw new ConfigError(
+      error instanceof Error
+        ? error.message
+        : "Invalid history import budget configuration.",
+    );
+  }
+
   return {
     databaseUrl,
     sessionDir,
@@ -222,9 +292,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
     allowInsecureSessionStorage,
     checkForUpdates,
     linkingDisplay,
+    historyImport,
     logLevel,
     backoff: DEFAULT_BACKOFF,
   };
+}
+
+/** Parses a positive-integer budget env; empty/unset keeps the default. */
+function parseBudgetInt(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number {
+  const raw = env[name]?.trim();
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > max) {
+    const range = max === Number.MAX_SAFE_INTEGER ? "" : ` between 1 and ${max}`;
+    throw new ConfigError(`${name} must be a positive integer${range} (got "${raw}").`);
+  }
+  return parsed;
 }
 
 export interface SessionStorageOptions {

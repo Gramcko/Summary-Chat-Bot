@@ -38,6 +38,13 @@ type GroupRow = QueryResultRow & {
   monitored: boolean;
   timezone: string;
   summary_time: string | null;
+  // System-managed history-import columns (ADR 0007).
+  history_import_status: string | null;
+  history_import_requested_at: Date | null;
+  history_import_started_at: Date | null;
+  history_import_finished_at: Date | null;
+  history_import_imported_count: number;
+  history_import_error: string | null;
 };
 
 type RunRow = QueryResultRow & {
@@ -85,7 +92,11 @@ const RUN_COLUMNS =
 
 const SUMMARY_COLUMNS = "id, run_id, provider, model, result, created_at";
 
-const GROUP_COLUMNS = "id, chat_id, name, monitored, timezone, summary_time";
+const GROUP_COLUMNS =
+  "id, chat_id, name, monitored, timezone, summary_time, " +
+  "history_import_status, history_import_requested_at, " +
+  "history_import_started_at, history_import_finished_at, " +
+  "history_import_imported_count, history_import_error";
 
 function toAdminRecord(row: AdminRow): AdminRecord {
   return {
@@ -102,6 +113,21 @@ function toGroup(row: GroupRow): Group {
     monitored: row.monitored,
     timezone: row.timezone,
     summaryTime: row.summary_time,
+    // System-managed history-import state (ADR 0007). Invariant: a set
+    // status always has requested_at (requestHistoryImport and the
+    // bot-worker maintain it); if it is ever violated the parse below
+    // fails loudly at this boundary instead of inventing a timestamp.
+    historyImport:
+      row.history_import_status === null
+        ? null
+        : {
+            status: row.history_import_status,
+            requestedAt: row.history_import_requested_at?.toISOString() ?? "",
+            startedAt: row.history_import_started_at?.toISOString() ?? null,
+            finishedAt: row.history_import_finished_at?.toISOString() ?? null,
+            importedCount: row.history_import_imported_count,
+            error: row.history_import_error,
+          },
   });
 }
 
@@ -307,11 +333,36 @@ export class PostgresStore implements Store {
       if (chatRow !== undefined) return toGroup(chatRow);
     }
     const inserted = await this.pool.query<GroupRow>(
-      `INSERT INTO groups (id, chat_id, name, monitored, timezone, summary_time)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO groups (
+         id, chat_id, name, monitored, timezone, summary_time,
+         history_import_status, history_import_requested_at,
+         history_import_started_at, history_import_finished_at,
+         history_import_imported_count, history_import_error)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT DO NOTHING
        RETURNING ${GROUP_COLUMNS}`,
-      [group.id, group.chatId, group.name, group.monitored, group.timezone, group.summaryTime],
+      [
+        group.id,
+        group.chatId,
+        group.name,
+        group.monitored,
+        group.timezone,
+        group.summaryTime,
+        // New rows may carry an initial history-import state (tests);
+        // writers of EXISTING rows never touch these columns below.
+        group.historyImport?.status ?? null,
+        group.historyImport === null || group.historyImport === undefined
+          ? null
+          : new Date(group.historyImport.requestedAt),
+        group.historyImport?.startedAt == null
+          ? null
+          : new Date(group.historyImport.startedAt),
+        group.historyImport?.finishedAt == null
+          ? null
+          : new Date(group.historyImport.finishedAt),
+        group.historyImport?.importedCount ?? 0,
+        group.historyImport?.error ?? null,
+      ],
     );
     const insertedRow = inserted.rows[0];
     if (insertedRow !== undefined) return toGroup(insertedRow);
@@ -340,6 +391,61 @@ export class PostgresStore implements Store {
       if (chatRow !== undefined) return toGroup(chatRow);
     }
     throw new Error("upsertGroup failed to persist the group");
+  }
+
+  async requestHistoryImport(
+    groupId: string,
+  ): Promise<{ group: Group; changed: boolean } | undefined> {
+    // Atomic transition (ADR 0007): only a group that is NOT already
+    // pending/running gets a fresh request (status, requested_at and
+    // progress fields reset together). Concurrent requests are safe:
+    // the WHERE clause lets exactly one through — that one reports
+    // `changed: true` (202) while the others observe the in-flight
+    // state and report `changed: false` (200), so the response code is
+    // decided by the WRITE, not by a pre-write read (review CR-m1).
+    const updated = await this.pool.query<GroupRow>(
+      `UPDATE groups
+       SET history_import_status = 'pending',
+           history_import_requested_at = now(),
+           history_import_started_at = NULL,
+           history_import_finished_at = NULL,
+           history_import_imported_count = 0,
+           history_import_error = NULL,
+           updated_at = now()
+       WHERE id = $1
+         AND (history_import_status IS NULL
+              OR history_import_status NOT IN ('pending', 'running'))
+       RETURNING ${GROUP_COLUMNS}`,
+      [groupId],
+    );
+    const row = updated.rows[0];
+    if (row !== undefined) return { group: toGroup(row), changed: true };
+    // No transition: either the group is unknown or an import is
+    // already in flight (idempotent — return it unchanged).
+    const existing = await this.getGroup(groupId);
+    return existing === undefined
+      ? undefined
+      : { group: existing, changed: false };
+  }
+
+  async cancelPendingHistoryImport(groupId: string): Promise<boolean> {
+    // SA-M1 (consent): un-monitoring revokes a PENDING import. One
+    // conditional statement; `running` rows are deliberately NOT
+    // matched — the bot-worker aborts its own in-flight work when it
+    // notices the group is unmonitored. done/failed states are history.
+    const result = await this.pool.query(
+      `UPDATE groups
+       SET history_import_status = NULL,
+           history_import_requested_at = NULL,
+           history_import_started_at = NULL,
+           history_import_finished_at = NULL,
+           history_import_imported_count = 0,
+           history_import_error = NULL,
+           updated_at = now()
+       WHERE id = $1 AND history_import_status = 'pending'`,
+      [groupId],
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 
   // ---- Summary runs ----

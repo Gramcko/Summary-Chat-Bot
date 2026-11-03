@@ -72,7 +72,8 @@ in-memory throttle.
 | --- | --- | --- | --- |
 | GET | `/api/connection` | `ConnectionStatus` | Non-secret WhatsApp connection state. |
 | GET | `/api/groups` | `Group[]` | Monitored groups. |
-| PATCH | `/api/groups/:id` | `Group` | Partial update. `summaryTime: null` clears the daily cutoff. |
+| PATCH | `/api/groups/:id` | `Group` | Partial update. `summaryTime: null` clears the daily cutoff. `historyImport` is system-managed and never changed by PATCH. |
+| POST | `/api/groups/:id/history-import` | `Group` (202/200) | Request a WhatsApp history import (opt-in, ADR 0007). `409` when the group is not monitored; `200` when an import is already pending/running; `202` otherwise (including re-requests after done/failed). |
 | POST | `/api/summary-runs` | `SummaryRun` (201/200) | Create-or-find (see conventions). Non-terminal runs are queued for the summary-worker (`generate-summary`, docs/decisions/0003); enqueue failures leave the run `pending` and are repaired by reconciliation. |
 | GET | `/api/summary-runs` | `RunListResponse` | Newest first. `nextCursor` is `null` in the skeleton. |
 | GET | `/api/summary-runs/:id` | `SummaryRun` | |
@@ -139,6 +140,45 @@ by reconciliation. What the admin configures: per group `monitored`,
 through the same state machine and summary endpoints as manual runs;
 `POST /api/summary-runs/:id/retry` applies to them unchanged.
 
+## History import
+
+When the admin switches a group to monitored, the dashboard asks
+whether to also retrieve the group's older WhatsApp messages. Accepting
+calls `POST /api/groups/:id/history-import`, which records the request
+on the group (`historyImport`, ADR 0007); the bot-worker performs the
+actual import and reports progress back. Behavior and limits:
+
+- **Opt-in per monitored group, user-driven.** Only monitored groups
+  can ever be imported (409 otherwise) and nothing is fetched without
+  this explicit request — the ADR 0004 privacy boundary is preserved.
+- **Bounded and partial by WhatsApp's data.** The import is capped in
+  messages/time (bot-worker budget) and WhatsApp only serves the
+  history it makes available — there is no full-archive guarantee.
+  `importedCount` reports what was actually stored. Reaching a budget
+  cap ends the import as `done` with a partial count (a successful
+  bounded backfill, ADR 0007); `failed` is reserved for real errors
+  (`history_unavailable`, `history_timeout`, `group_unmonitored`,
+  `history_internal` — the safe catch-all for unexpected importer
+  crashes).
+  Imported messages never update the connection's `lastMessageAt`.
+- **Visible progress on the group.** `Group.historyImport` (nullable)
+  carries `status` (`pending`/`running`/`done`/`failed`),
+  `requestedAt`/`startedAt`/`finishedAt`, `importedCount`, and a safe
+  `error` code/short message — never message content or secrets. It is
+  system-managed: PATCH cannot set it and discovery never resets it.
+- **Repeatable.** While `pending`/`running` a new request is an
+  idempotent `200`; after `done`/`failed` a new request is accepted
+  (`202`) and resets the progress fields.
+- **Consent is revocable.** Un-monitoring a group cancels a `pending`
+  import (the request never fires later); an import already `running`
+  is left to the bot-worker to abort, and `done`/`failed` history is
+  kept as record.
+- **Data retention.** Imported messages are ordinary `messages` rows
+  carrying their historical `sent_at` — retention and purge by
+  group/chat/date apply to them exactly as to live capture, and the two
+  are indistinguishable in storage (a provenance column is a tracked
+  follow-up).
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -160,6 +200,11 @@ through the same state machine and summary endpoints as manual runs;
 | `MAX_CHUNKS_PER_RUN` | `10` | Cost/size cap: runs needing more provider chunks fail with `too_large` (permanent) |
 | `AI_REQUEST_TIMEOUT_MS` | `120000` | Bounded timeout for one AI provider request (positive integer, milliseconds) |
 | `AI_ALLOW_CUSTOM_BASE_URL` | `unset` | PRIVILEGED opt-in (`yes`): allows saving a non-Google provider base URL — the API key is sent to that host (ADR 0005). Internal targets stay rejected regardless. |
+| `HISTORY_IMPORT_POLL_MS` | `5000` | bot-worker: how often the importer polls for `pending` history imports |
+| `HISTORY_IMPORT_BATCH_COUNT` | `100` | bot-worker: messages requested per history batch |
+| `HISTORY_IMPORT_MAX_ROUNDS` | `20` | bot-worker: maximum history batches per import |
+| `HISTORY_IMPORT_MAX_MESSAGES` | `2000` | bot-worker: message budget per import (reaching it ends the import `done`, partial) |
+| `HISTORY_IMPORT_TIME_BUDGET_MS` | `120000` | bot-worker: wall-clock budget per import |
 
 ## Security notes
 

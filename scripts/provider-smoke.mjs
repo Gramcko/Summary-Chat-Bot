@@ -18,6 +18,8 @@
  *   node scripts/provider-smoke.mjs
  *
  * Environment:
+ *   The repository-root .env is loaded automatically (shell-exported
+ *   variables still win).
  *   DATABASE_URL      required — the saved config lives in PostgreSQL
  *                     (ai_provider_configs, written via the dashboard's
  *                     Settings screen).
@@ -31,7 +33,31 @@
  * printed); 2 = configuration problem (nothing sent).
  */
 import { createDecipheriv } from "node:crypto";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "pg";
+
+/**
+ * Load the repository-root `.env` exactly like the backend and the workers
+ * do: variables already exported in the shell take precedence
+ * (`process.loadEnvFile` never overrides them). The script locates the repo
+ * by walking up from its own directory, so it can be run from anywhere.
+ */
+function loadRepoEnv() {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (;;) {
+    const candidate = join(dir, ".env");
+    if (existsSync(candidate)) {
+      process.loadEnvFile(candidate);
+      return;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return;
+    dir = parent;
+  }
+}
+loadRepoEnv();
 
 // ---- fixed error codes (mirrors summary-worker/src/ai/provider-errors.ts) ----
 

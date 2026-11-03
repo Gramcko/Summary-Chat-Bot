@@ -40,6 +40,7 @@ function makeGroup(overrides?: Partial<Group>): Group {
     monitored: true,
     timezone: "Europe/Madrid",
     summaryTime: "09:00",
+    historyImport: null,
     ...overrides,
   };
 }

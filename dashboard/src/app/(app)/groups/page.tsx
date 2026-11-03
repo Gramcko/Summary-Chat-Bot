@@ -2,15 +2,30 @@
 
 import type { Group } from "@summarly/contracts";
 import Link from "next/link";
+import { useEffect } from "react";
 import { GroupSettingsCard } from "@/components/groups/GroupSettingsCard";
 import { IanaTimeZoneOptions } from "@/components/TimeZones";
 import { Button, ButtonLink } from "@/components/ui/Button";
 import { EmptyState, ErrorState, LoadingBlock, PageHeader } from "@/components/ui/States";
 import { api } from "@/lib/api";
+import {
+  HISTORY_IMPORT_POLL_MS,
+  anyHistoryImportInFlight,
+} from "@/lib/history-import";
 import { useResource } from "@/lib/hooks";
 
 export default function GroupsPage() {
   const groups = useResource(() => api.groups(), []);
+
+  // Keep the import badges live while the bot-worker is importing, and stop as
+  // soon as nothing is pending/running. Manual refresh stays available.
+  const polling = anyHistoryImportInFlight(groups.data);
+  const reloadGroups = groups.reload;
+  useEffect(() => {
+    if (!polling) return;
+    const interval = window.setInterval(reloadGroups, HISTORY_IMPORT_POLL_MS);
+    return () => window.clearInterval(interval);
+  }, [polling, reloadGroups]);
 
   function handleSaved(updated: Group): void {
     groups.setData((previous) => {

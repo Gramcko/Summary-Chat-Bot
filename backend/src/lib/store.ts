@@ -90,7 +90,11 @@ export interface Store {
   // ---- Monitored groups ----
   listGroups(): Promise<Group[]>;
   getGroup(id: string): Promise<Group | undefined>;
-  /** Full replacement of mutable group fields. Undefined when unknown. */
+  /**
+   * Full replacement of the MUTABLE (admin-preference) group fields.
+   * Undefined when unknown. The system-managed `historyImport` state is
+   * NOT mutable here — it is always preserved untouched (ADR 0007).
+   */
   updateGroup(group: Group): Promise<Group | undefined>;
   /**
    * Natural-key registration for discovered chats. When `chatId` is
@@ -99,9 +103,33 @@ export interface Store {
    * ONLY the name — never-clobber (ADR 0004 / audit M3): monitored,
    * timezone, and summary_time are admin preferences and are never
    * overwritten here (updateGroup is the only admin-preference writer).
-   * Without a chatId the id is the key (insert or full replace).
+   * Without a chatId the id is the key (insert or full replace of the
+   * mutable fields). The system-managed `historyImport` state is always
+   * preserved: discovery must never reset an import (ADR 0007).
    */
   upsertGroup(group: Group): Promise<Group>;
+  /**
+   * Requests a history import for the group (ADR 0007): transitions the
+   * system-managed state to `pending` and resets its progress fields
+   * (startedAt/finishedAt null, importedCount 0, error null). Undefined
+   * when the group is unknown. The result reports whether THIS call
+   * performed the transition (`changed`) — the route derives 202
+   * (changed) from 200 (an import is already in flight, the returned
+   * group is unchanged). A no-op while `pending`/`running`; repeated
+   * requests after `done`/`failed` are accepted. The ROUTE enforces the
+   * "must be monitored" rule.
+   */
+  requestHistoryImport(
+    groupId: string,
+  ): Promise<{ group: Group; changed: boolean } | undefined>;
+  /**
+   * Cancels a PENDING history import by clearing the system-managed
+   * state (status/timestamps/error to null, count to 0). Returns true
+   * when a pending import was actually cleared. `running` imports are
+   * NEVER touched — the bot-worker aborts those itself (SA-M1: an
+   * un-monitored group's consent to import history is revoked).
+   */
+  cancelPendingHistoryImport(groupId: string): Promise<boolean>;
 
   // ---- Summary runs ----
   /**
@@ -224,9 +252,14 @@ export class InMemoryStore implements Store {
   }
 
   async updateGroup(group: Group): Promise<Group | undefined> {
-    if (!this.groups.has(group.id)) return undefined;
-    this.groups.set(group.id, group);
-    return group;
+    const existing = this.groups.get(group.id);
+    if (existing === undefined) return undefined;
+    // Admin preferences only: the system-managed history-import state
+    // is preserved untouched (ADR 0007) — even if a caller passes one,
+    // this writer can never alter it.
+    const stored: Group = { ...group, historyImport: existing.historyImport };
+    this.groups.set(group.id, stored);
+    return stored;
   }
 
   async upsertGroup(group: Group): Promise<Group> {
@@ -243,8 +276,53 @@ export class InMemoryStore implements Store {
         }
       }
     }
-    this.groups.set(group.id, group);
-    return group;
+    // Id key: insert or full replace of the MUTABLE fields. An existing
+    // row keeps its system-managed history-import state (discovery and
+    // re-registration must never reset an import — ADR 0007).
+    const existingById = this.groups.get(group.id);
+    const stored: Group =
+      existingById === undefined
+        ? group
+        : { ...group, historyImport: existingById.historyImport };
+    this.groups.set(group.id, stored);
+    return stored;
+  }
+
+  async requestHistoryImport(
+    groupId: string,
+  ): Promise<{ group: Group; changed: boolean } | undefined> {
+    const existing = this.groups.get(groupId);
+    if (existing === undefined) return undefined;
+    const current = existing.historyImport;
+    if (
+      current !== null &&
+      (current.status === "pending" || current.status === "running")
+    ) {
+      // Idempotent: an import in flight is never restarted (ADR 0007).
+      return { group: existing, changed: false };
+    }
+    const stored: Group = {
+      ...existing,
+      historyImport: {
+        status: "pending",
+        requestedAt: nowIso(),
+        startedAt: null,
+        finishedAt: null,
+        importedCount: 0,
+        error: null,
+      },
+    };
+    this.groups.set(groupId, stored);
+    return { group: stored, changed: true };
+  }
+
+  async cancelPendingHistoryImport(groupId: string): Promise<boolean> {
+    const existing = this.groups.get(groupId);
+    if (existing?.historyImport?.status !== "pending") return false;
+    // Pending only: a `running` import is aborted by the bot-worker
+    // itself; done/failed states are history and stay (SA-M1).
+    this.groups.set(groupId, { ...existing, historyImport: null });
+    return true;
   }
 
   async createOrFindRun(

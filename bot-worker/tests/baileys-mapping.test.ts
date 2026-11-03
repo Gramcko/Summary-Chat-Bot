@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { WAMessage } from "@whiskeysockets/baileys";
 import {
   classifyClose,
+  classifyHistoryCorrelation,
+  isIgnoredIncomingJid,
+  mapHistorySet,
   mapWAMessage,
 } from "../src/whatsapp/baileys-adapter.js";
 
@@ -380,5 +383,106 @@ describe("mapWAMessage (content classification)", () => {
 
   it("returns null when the message has no chat JID at all", () => {
     expect(mapWAMessage(wa({ key: {}, messageTimestamp: 1 }))).toBeNull();
+  });
+});
+
+describe("mapHistorySet (messaging-history.set translation, ADR 0007)", () => {
+  const A = "111111111111-22222222@g.us";
+  const B = "333333333333-44444444@g.us";
+
+  const historyMessage = (chatJid: string, id: string): WAMessage =>
+    wa({
+      key: { remoteJid: chatJid, fromMe: false, id, participant: "u@s.whatsapp.net" },
+      messageTimestamp: 1000,
+      message: { conversation: `text-${id}` },
+    });
+
+  it("emits one history event per requested chat, mapped via mapWAMessage", () => {
+    const events = mapHistorySet(
+      {
+        messages: [historyMessage(A, "M1"), historyMessage(A, "M2")],
+        progress: 0.5,
+        peerDataRequestSessionId: "req-1",
+      },
+      new Set([A]),
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0]?.type).toBe("history");
+    expect(events[0]?.chatJid).toBe(A);
+    expect(events[0]?.messages.map((m) => m.messageId)).toEqual(["M1", "M2"]);
+    expect(events[0]?.messages[0]?.kind).toBe("text");
+    expect(events[0]?.progress).toBe(0.5);
+    expect(events[0]?.requestId).toBe("req-1");
+  });
+
+  it("drops other chats' history BEFORE normalization (privacy)", () => {
+    const events = mapHistorySet(
+      { messages: [historyMessage(B, "OTHER"), historyMessage(A, "M1")] },
+      new Set([A]),
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0]?.chatJid).toBe(A);
+    expect(events[0]?.messages.map((m) => m.messageId)).toEqual(["M1"]);
+  });
+
+  it("emits nothing when no chat was requested (bulk sync)", () => {
+    const events = mapHistorySet(
+      { messages: [historyMessage(A, "M1")] },
+      new Set(),
+    );
+    expect(events).toEqual([]);
+  });
+
+  it("splits a multi-chat batch into per-chat events", () => {
+    const events = mapHistorySet(
+      { messages: [historyMessage(A, "M1"), historyMessage(B, "M2")] },
+      new Set([A, B]),
+    );
+    expect(events.map((e) => e.chatJid).sort()).toEqual([A, B].sort());
+    expect(events.find((e) => e.chatJid === A)?.messages).toHaveLength(1);
+  });
+});
+
+describe("isIgnoredIncomingJid (SA-L2 self-JID predicate)", () => {
+  const selfUsers = new Set(["1234567890", "987654321"]); // own PN + LID users
+
+  it("allows group chats", () => {
+    expect(isIgnoredIncomingJid("111111111111-22222222@g.us", selfUsers)).toBe(
+      false,
+    );
+  });
+
+  it("allows the account's own PN and LID JIDs, with or without device suffix", () => {
+    expect(isIgnoredIncomingJid("1234567890@s.whatsapp.net", selfUsers)).toBe(false);
+    expect(isIgnoredIncomingJid("1234567890:12@s.whatsapp.net", selfUsers)).toBe(false);
+    expect(isIgnoredIncomingJid("987654321:34@lid", selfUsers)).toBe(false);
+    expect(isIgnoredIncomingJid("987654321@lid", selfUsers)).toBe(false);
+  });
+
+  it("ignores DMs, status broadcasts, newsletters, and bare broadcasts", () => {
+    expect(isIgnoredIncomingJid("555000111@s.whatsapp.net", selfUsers)).toBe(true);
+    expect(isIgnoredIncomingJid("status@broadcast", selfUsers)).toBe(true);
+    expect(isIgnoredIncomingJid("123456789@newsletter", selfUsers)).toBe(true);
+    expect(isIgnoredIncomingJid("status@broadcast", new Set())).toBe(true);
+    expect(isIgnoredIncomingJid("555:1@s.whatsapp.net", new Set())).toBe(true);
+  });
+});
+
+describe("classifyHistoryCorrelation (SA-M3, log-only)", () => {
+  const known = new Set(["req-1", "req-2"]);
+
+  it("matches an outstanding request id", () => {
+    expect(classifyHistoryCorrelation("req-1", known)).toBe("match");
+  });
+
+  it("flags an absent session id", () => {
+    expect(classifyHistoryCorrelation(null, known)).toBe("missing-session-id");
+  });
+
+  it("flags a foreign session id", () => {
+    expect(classifyHistoryCorrelation("req-9", known)).toBe("unknown-session-id");
+    expect(classifyHistoryCorrelation("req-1", new Set())).toBe(
+      "unknown-session-id",
+    );
   });
 });

@@ -7,6 +7,7 @@ import {
   type BotConfig,
 } from "./config.js";
 import { PostgresBotDb } from "./db.js";
+import { HistoryImportService } from "./history-import.js";
 import { errorReason } from "./lib/errors.js";
 import { loadRepoEnv } from "./lib/load-env.js";
 import { createLogger, isLogLevel, type Logger } from "./lib/log.js";
@@ -134,6 +135,15 @@ const service = new CaptureService({
   onLinking: presentLinking,
 });
 
+// History imports (ADR 0007): bounded best-effort backfill driven by
+// admin requests recorded in PostgreSQL (no queue, no RPC).
+const historyImports = new HistoryImportService({
+  adapter,
+  db,
+  log,
+  budgets: config.historyImport,
+});
+
 log("info", "bot_worker_starting", {
   defaultTimezone: config.defaultTimezone,
   pairingCodeLinking: config.phoneNumber !== null,
@@ -154,6 +164,7 @@ try {
 }
 
 log("info", "bot_worker_started", { status: service.sessionStatus });
+historyImports.start();
 
 let shuttingDown = false;
 async function shutdown(signal: string): Promise<void> {
@@ -161,9 +172,16 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   log("info", "shutdown_started", { signal });
   let failed = false;
-  // Order matters: close the WhatsApp socket (the adapter saves its
+  // Order matters: stop the history-import poller first (it releases an
+  // active claim back to 'pending' and issues no further WhatsApp
+  // requests), then close the WhatsApp socket (the adapter saves its
   // auth state) and let in-flight message batches commit BEFORE the
-  // database pool goes away (architecture §5.1/§6).
+  // database pool goes away (architecture §5.1/§6, ADR 0007).
+  try {
+    await historyImports.stop();
+  } catch {
+    failed = true;
+  }
   try {
     await service.stop();
   } catch {

@@ -22,8 +22,23 @@ const backendUrl = (process.env.BACKEND_URL ?? "http://127.0.0.1:3000").replace(
   "",
 );
 
+/**
+ * Development-only: Next.js 16 blocks HMR/dev resources from origins it does
+ * not know. When you open the dev server from another device on your LAN
+ * (e.g. http://192.168.1.50:3001), add that host here via the
+ * NEXT_ALLOWED_DEV_ORIGINS env var (comma-separated, dashboard/.env.local is
+ * gitignored). This setting has no effect on `next build`/`next start`.
+ * Keep the dev server on trusted networks: it has no HTTPS or network
+ * hardening (production deployment is Phase F).
+ */
+const allowedDevOrigins = (process.env.NEXT_ALLOWED_DEV_ORIGINS ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter((origin) => origin !== "");
+
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  allowedDevOrigins,
   async rewrites() {
     return [
       {

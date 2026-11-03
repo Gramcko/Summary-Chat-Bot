@@ -39,6 +39,24 @@ export interface InsertMessagesResult {
   droppedUnmonitored: number;
 }
 
+/** A claimed history import (ADR 0007). */
+export interface HistoryImportClaim {
+  groupId: string;
+  chatJid: string;
+  requestedAt: Date;
+  /** Claim timestamp; guards completion against stale/older claims. */
+  startedAt: Date;
+}
+
+export interface HistoryImportOutcome {
+  /** `done` = completed within budget (partial by design); `failed`. */
+  status: "done" | "failed";
+  /** Messages INSERTED by this import (duplicates do not count). */
+  importedCount: number;
+  /** Safe code/short message only; null on success. */
+  error: string | null;
+}
+
 export interface UpsertChatsResult {
   inserted: number;
   updated: number;
@@ -47,6 +65,15 @@ export interface UpsertChatsResult {
 export interface ChatDefaults {
   /** Time zone for NEW groups only; never overwrites admin settings. */
   timezone: string;
+}
+
+export interface InsertMessagesOptions {
+  /**
+   * Whether the insert may update `whatsapp_connections.last_message_at`
+   * (default true). History imports pass false: imported messages are
+   * historical and must not masquerade as live traffic (ADR 0007).
+   */
+  touchLastMessage?: boolean;
 }
 
 export interface BotDb {
@@ -63,6 +90,7 @@ export interface BotDb {
   insertMessages(
     connectionId: string,
     rows: NewMessage[],
+    options?: InsertMessagesOptions,
   ): Promise<InsertMessagesResult>;
   /**
    * Privacy-first discovery upsert (ADR 0004): inserts NEW groups with
@@ -74,6 +102,52 @@ export interface BotDb {
     chats: DiscoveredChat[],
     defaults: ChatDefaults,
   ): Promise<UpsertChatsResult>;
+
+  // ---- History imports (ADR 0007) ----
+
+  /**
+   * Atomically claims up to `limit` groups with
+   * `history_import_status = 'pending'` that are ALSO `monitored`
+   * (privacy boundary, SQL-enforced) and have a linked chat. Sets them
+   * `running` with `started_at = now()` and returns the claims. Uses
+   * FOR UPDATE SKIP LOCKED, so concurrent claimers never double-claim.
+   */
+  claimPendingHistoryImports(limit?: number): Promise<HistoryImportClaim[]>;
+  /**
+   * Finishes a claimed import (`done`/`failed` with counts and a safe
+   * error code). Guarded by the claim's `started_at` so a stale claim
+   * can never overwrite a newer import's outcome.
+   */
+  completeHistoryImport(
+    claim: Pick<HistoryImportClaim, "groupId" | "startedAt">,
+    outcome: HistoryImportOutcome,
+  ): Promise<boolean>;
+  /**
+   * Publishes incremental progress (the running inserted count) so the
+   * dashboard can render "N imported so far" before the terminal state
+   * (CR-M2). Guarded exactly like completion (`running` + `started_at`
+   * fence): a stale claim never overwrites a newer import's progress.
+   */
+  updateHistoryImportProgress(
+    claim: Pick<HistoryImportClaim, "groupId" | "startedAt">,
+    importedCount: number,
+  ): Promise<boolean>;
+  /**
+   * Stale-claim recovery: `running` imports whose `started_at` is older
+   * than `olderThanMs` (a crashed worker) go back to `pending` so they
+   * can be claimed again. The staleness comparison runs in SQL against
+   * the DATABASE clock (SA-L1) — never the worker clock — so clock skew
+   * cannot requeue an active import. Returns how many rows were
+   * requeued.
+   */
+  requeueStaleHistoryImports(olderThanMs: number): Promise<number>;
+  /**
+   * Graceful-shutdown release: the claim goes back to `pending`
+   * immediately (guarded by `started_at`). Returns true when released.
+   */
+  releaseHistoryImport(
+    claim: Pick<HistoryImportClaim, "groupId" | "startedAt">,
+  ): Promise<boolean>;
 }
 
 type ConnectionRow = QueryResultRow & { id: string };
@@ -131,7 +205,9 @@ export class PostgresBotDb implements BotDb {
   async insertMessages(
     connectionId: string,
     rows: NewMessage[],
+    options: InsertMessagesOptions = {},
   ): Promise<InsertMessagesResult> {
+    const touchLastMessage = options.touchLastMessage !== false;
     if (rows.length === 0) {
       return { inserted: 0, duplicates: 0, droppedUnmonitored: 0 };
     }
@@ -192,9 +268,11 @@ export class PostgresBotDb implements BotDb {
         );
         inserted += result.rowCount ?? 0;
       }
-      if (inserted > 0) {
-        // Operational metadata only: when the latest captured message
-        // happened (contracts ConnectionStatus.lastMessageAt).
+      if (inserted > 0 && touchLastMessage) {
+        // Operational metadata only: when the latest LIVE captured
+        // message happened (contracts ConnectionStatus.lastMessageAt).
+        // Historical imports skip this — they must not masquerade as
+        // live traffic (ADR 0007).
         const newest = rows.reduce(
           (max, row) => (row.sentAt > max ? row.sentAt : max),
           rows[0]!.sentAt,
@@ -268,5 +346,134 @@ export class PostgresBotDb implements BotDb {
       }
     }
     return { inserted, updated };
+  }
+
+  // ---- History imports (ADR 0007) ----
+
+  async claimPendingHistoryImports(
+    limit = 1,
+  ): Promise<HistoryImportClaim[]> {
+    // Atomic claim (single statement, FOR UPDATE SKIP LOCKED in the
+    // subselect): concurrent claimers pick disjoint rows. The privacy
+    // boundary is IN the WHERE clause — an unmonitored group is never
+    // claimed even if a pending request exists (its status stays
+    // 'pending' until the admin opts the group in).
+    const result = await this.pool.query<{
+      id: string;
+      chat_id: string;
+      history_import_requested_at: Date | null;
+      history_import_started_at: Date;
+    }>(
+      // date_trunc('milliseconds') keeps the timestamp exactly
+      // round-trippable through JavaScript Dates (which have ms, not µs,
+      // precision) — completion/release match on this value as the
+      // claim guard.
+      `UPDATE groups
+       SET history_import_status = 'running',
+           history_import_started_at = date_trunc('milliseconds', now()),
+           updated_at = now()
+       WHERE id IN (
+         SELECT id FROM groups
+         WHERE history_import_status = 'pending'
+           AND monitored = true
+           AND chat_id IS NOT NULL
+         ORDER BY history_import_requested_at ASC NULLS LAST
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+       )
+       RETURNING id, chat_id, history_import_requested_at, history_import_started_at`,
+      [Math.max(1, Math.floor(limit))],
+    );
+    return result.rows.map((row) => ({
+      groupId: row.id,
+      chatJid: row.chat_id,
+      requestedAt: row.history_import_requested_at ?? row.history_import_started_at,
+      startedAt: row.history_import_started_at,
+    }));
+  }
+
+  async completeHistoryImport(
+    claim: Pick<HistoryImportClaim, "groupId" | "startedAt">,
+    outcome: HistoryImportOutcome,
+  ): Promise<boolean> {
+    // The started_at guard makes completion idempotent-safe against
+    // stale claims: a released/requeued import that was re-claimed has
+    // a newer started_at and this write becomes a no-op.
+    const result = await this.pool.query(
+      `UPDATE groups
+       SET history_import_status = $2,
+           history_import_finished_at = now(),
+           history_import_imported_count = $3,
+           history_import_error = $4,
+           updated_at = now()
+       WHERE id = $1
+         AND history_import_status = 'running'
+         AND history_import_started_at = $5`,
+      [
+        claim.groupId,
+        outcome.status,
+        Math.max(0, Math.floor(outcome.importedCount)),
+        outcome.error === null ? null : outcome.error.slice(0, 200),
+        claim.startedAt,
+      ],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async updateHistoryImportProgress(
+    claim: Pick<HistoryImportClaim, "groupId" | "startedAt">,
+    importedCount: number,
+  ): Promise<boolean> {
+    // Same fence as completion (CR-M2): stale claims never overwrite a
+    // newer import's progress.
+    const result = await this.pool.query(
+      `UPDATE groups
+       SET history_import_imported_count = $2,
+           updated_at = now()
+       WHERE id = $1
+         AND history_import_status = 'running'
+         AND history_import_started_at = $3`,
+      [
+        claim.groupId,
+        Math.max(0, Math.floor(importedCount)),
+        claim.startedAt,
+      ],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async requeueStaleHistoryImports(olderThanMs: number): Promise<number> {
+    // Crash recovery (ADR 0007): a 'running' claim whose worker died is
+    // re-claimable after the staleness threshold. The comparison runs
+    // against the DATABASE clock (make_interval + now(), SA-L1) so
+    // worker/DB clock skew can never requeue a live import.
+    const result = await this.pool.query(
+      `UPDATE groups
+       SET history_import_status = 'pending',
+           history_import_started_at = NULL,
+           updated_at = now()
+       WHERE history_import_status = 'running'
+         AND history_import_started_at < now() - make_interval(secs => $1::double precision)`,
+      [Math.max(0, olderThanMs) / 1000],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async releaseHistoryImport(
+    claim: Pick<HistoryImportClaim, "groupId" | "startedAt">,
+  ): Promise<boolean> {
+    // Graceful shutdown: hand the claim back immediately so the next
+    // start picks it up without waiting for the staleness threshold.
+    const result = await this.pool.query(
+      `UPDATE groups
+       SET history_import_status = 'pending',
+           history_import_started_at = NULL,
+           updated_at = now()
+       WHERE id = $1
+         AND history_import_status = 'running'
+         AND history_import_started_at = $2`,
+      [claim.groupId, claim.startedAt],
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 }

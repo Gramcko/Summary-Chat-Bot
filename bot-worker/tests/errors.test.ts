@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { errorReason, redactPaths } from "../src/lib/errors.js";
+import { errorReason, redactJids, redactPaths } from "../src/lib/errors.js";
 
 /**
  * Safe error summaries (audit L3): fs error codes are preferred over
@@ -25,6 +25,30 @@ describe("redactPaths", () => {
     expect(redactPaths("connection lost (attempt 2)")).toBe(
       "connection lost (attempt 2)",
     );
+  });
+});
+
+describe("redactJids (SA-L3)", () => {
+  it("redacts user JIDs with and without device suffixes", () => {
+    expect(redactJids("failed for 1234567890:12@s.whatsapp.net")).toBe(
+      "failed for <jid>",
+    );
+    expect(redactJids("failed for 1234567890@s.whatsapp.net")).toBe(
+      "failed for <jid>",
+    );
+  });
+
+  it("redacts group, LID, broadcast, and newsletter JIDs", () => {
+    expect(redactJids("chat 111111111111-2222@g.us")).toBe("chat <jid>");
+    expect(redactJids("from 987654321:34@lid")).toBe("from <jid>");
+    expect(redactJids("status@broadcast")).toBe("<jid>");
+    expect(redactJids("123456789@newsletter")).toBe("<jid>");
+  });
+
+  it("redacts several JIDs in one message", () => {
+    expect(
+      redactJids("a 1@s.whatsapp.net and 2@g.us and 3@lid"),
+    ).toBe("a <jid> and <jid> and <jid>");
   });
 });
 
@@ -62,6 +86,15 @@ describe("errorReason", () => {
       "failed to read /home/user/.summarly/wa-session/creds.json",
     );
     expect(errorReason(error)).toBe("failed to read <path>");
+  });
+
+  it("redacts JIDs from driver messages (SA-L3)", () => {
+    expect(
+      errorReason(new Error("decrypt failed for 1234567890:12@s.whatsapp.net")),
+    ).toBe("decrypt failed for <jid>");
+    expect(errorReason(new Error("stale batch for 111-222@g.us"))).toBe(
+      "stale batch for <jid>",
+    );
   });
 
   it("truncates long messages", () => {

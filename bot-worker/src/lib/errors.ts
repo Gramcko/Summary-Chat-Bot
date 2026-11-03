@@ -43,6 +43,16 @@ export function redactPaths(message: string): string {
     .replace(/(^|[\s"'(])\/[\w.@+-]+(?:\/[\w.@+-]+)+/g, "$1<path>");
 }
 
+/**
+ * Redacts WhatsApp JIDs and JID/email-like tokens (SA-L3): legacy JIDs
+ * embed phone numbers and device suffixes (`12345:12@s.whatsapp.net`,
+ * `…@lid`, `…@g.us`, `…@broadcast`, `…@newsletter`), so any
+ * `user@server` token in a message becomes `<jid>` before logging.
+ */
+export function redactJids(message: string): string {
+  return message.replace(/[\w.:+\-]+@[A-Za-z0-9.\-]+/g, "<jid>");
+}
+
 export function errorReason(error: unknown): string {
   if (typeof error === "object" && error !== null) {
     const candidate = error as {
@@ -60,8 +70,8 @@ export function errorReason(error: unknown): string {
       }
     }
     if (typeof candidate.message === "string") {
-      return redactPaths(candidate.message).slice(0, 200);
+      return redactJids(redactPaths(candidate.message)).slice(0, 200);
     }
   }
-  return redactPaths(String(error)).slice(0, 200);
+  return redactJids(redactPaths(String(error))).slice(0, 200);
 }

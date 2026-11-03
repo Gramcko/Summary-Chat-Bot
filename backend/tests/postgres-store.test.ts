@@ -8,7 +8,7 @@ import {
   it,
 } from "vitest";
 import { Pool } from "pg";
-import { ApiError, ProviderConfigPublic, Summary, type ConnectionStatus, type SummaryResult } from "@summarly/contracts";
+import { ApiError, Group, ProviderConfigPublic, Summary, type ConnectionStatus, type SummaryResult } from "@summarly/contracts";
 import { buildApp } from "../src/app.js";
 import { decryptSecret, parseEncryptionKey } from "../src/lib/crypto.js";
 import { hashPassword, verifyPassword } from "../src/lib/password.js";
@@ -88,6 +88,7 @@ async function seedGroupRow(store: Store): Promise<string> {
     monitored: true,
     timezone: "Europe/Madrid",
     summaryTime: null,
+    historyImport: null,
   });
   return id;
 }
@@ -513,6 +514,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
           monitored: false,
           timezone: "UTC",
           summaryTime: null,
+          historyImport: null,
         });
         // The admin opts in and configures the group — updateGroup is
         // the only admin-preference writer (ADR 0004 / audit M3).
@@ -532,6 +534,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
           monitored: false,
           timezone: "Europe/Madrid",
           summaryTime: "23:00",
+          historyImport: null,
         });
         expect(again.id).toBe(first.id);
         expect(again.name).toBe("Renamed");
@@ -556,6 +559,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
           monitored: true,
           timezone: "Europe/Madrid",
           summaryTime: null,
+          historyImport: null,
         });
         const updated = await store.upsertGroup({
           id,
@@ -564,6 +568,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
           monitored: true,
           timezone: "Europe/Madrid",
           summaryTime: null,
+          historyImport: null,
         });
         expect(updated.id).toBe(id);
         expect(updated.name).toBe("Second name");
@@ -580,6 +585,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
           monitored: true,
           timezone: "Europe/Madrid",
           summaryTime: null,
+          historyImport: null,
         });
         await expect(
           pool.query(
@@ -710,6 +716,245 @@ describe.skipIf(!process.env["DATABASE_URL"])(
         });
         expect(after.statusCode).toBe(200);
         expect(after.body).not.toContain("sk-new-secret");
+      });
+    });
+
+    describe("history import (system-managed columns, ADR 0007)", () => {
+      async function importRow(groupId: string) {
+        const result = await pool.query<{
+          history_import_status: string | null;
+          history_import_requested_at: Date | null;
+          history_import_started_at: Date | null;
+          history_import_finished_at: Date | null;
+          history_import_imported_count: number;
+          history_import_error: string | null;
+        }>(
+          "SELECT history_import_status, history_import_requested_at, " +
+            "history_import_started_at, history_import_finished_at, " +
+            "history_import_imported_count, history_import_error " +
+            "FROM groups WHERE id = $1",
+          [groupId],
+        );
+        return result.rows[0];
+      }
+
+      it("a request transitions the SQL row to pending with zeroed progress", async () => {
+        const store = new PostgresStore(pool);
+        const groupId = await seedGroupRow(store);
+
+        const requested = await store.requestHistoryImport(groupId);
+        expect(requested?.changed).toBe(true); // this call did it
+        expect(requested?.group.historyImport?.status).toBe("pending");
+
+        const row = await importRow(groupId);
+        expect(row?.history_import_status).toBe("pending");
+        expect(row?.history_import_requested_at).toBeInstanceOf(Date);
+        expect(row?.history_import_started_at).toBeNull();
+        expect(row?.history_import_finished_at).toBeNull();
+        expect(row?.history_import_imported_count).toBe(0);
+        expect(row?.history_import_error).toBeNull();
+
+        // Unknown groups report undefined (the route turns that into 404).
+        expect(await store.requestHistoryImport(randomUUID())).toBeUndefined();
+      });
+
+      it("is a no-op while pending/running and re-accepted after done", async () => {
+        const store = new PostgresStore(pool);
+        const groupId = await seedGroupRow(store);
+
+        await store.requestHistoryImport(groupId);
+        const pendingRow = await importRow(groupId);
+
+        // Running in flight: still a no-op (and does not even bump
+        // requested_at).
+        await pool.query(
+          "UPDATE groups SET history_import_status = 'running', " +
+            "history_import_started_at = now(), " +
+            "history_import_imported_count = 5 WHERE id = $1",
+          [groupId],
+        );
+        const whileRunning = await store.requestHistoryImport(groupId);
+        expect(whileRunning?.changed).toBe(false); // nothing transitioned
+        expect(whileRunning?.group.historyImport?.status).toBe("running");
+        expect(whileRunning?.group.historyImport?.importedCount).toBe(5);
+        expect(
+          (await importRow(groupId))?.history_import_requested_at?.toISOString(),
+        ).toBe(pendingRow?.history_import_requested_at?.toISOString());
+
+        // After done: a NEW request is accepted and resets everything.
+        await pool.query(
+          "UPDATE groups SET history_import_status = 'done', " +
+            "history_import_finished_at = now(), " +
+            "history_import_imported_count = 55, " +
+            "history_import_error = NULL WHERE id = $1",
+          [groupId],
+        );
+        const reRequested = await store.requestHistoryImport(groupId);
+        expect(reRequested?.changed).toBe(true);
+        expect(reRequested?.group.historyImport?.status).toBe("pending");
+        const resetRow = await importRow(groupId);
+        expect(resetRow?.history_import_status).toBe("pending");
+        expect(resetRow?.history_import_started_at).toBeNull();
+        expect(resetRow?.history_import_finished_at).toBeNull();
+        expect(resetRow?.history_import_imported_count).toBe(0);
+      });
+
+      it("updateGroup and discovery upsert never reset an import", async () => {
+        const store = new PostgresStore(pool, ENCRYPTION_KEY);
+        const chatId = `${randomUUID()}@g.us`;
+        const id = randomUUID();
+        await store.upsertGroup({
+          id,
+          chatId,
+          name: "Import Group",
+          monitored: true,
+          timezone: "Europe/Madrid",
+          summaryTime: null,
+          historyImport: null,
+        });
+        const requested = await store.requestHistoryImport(id);
+
+        // Admin prefs change (the only writer of mutable fields).
+        await store.updateGroup({
+          ...(requested as NonNullable<typeof requested>).group,
+          timezone: "America/Bogota",
+          summaryTime: "06:30",
+        });
+        expect((await importRow(id))?.history_import_status).toBe("pending");
+
+        // Discovery re-registration (chat-keyed): name only.
+        const renamed = await store.upsertGroup({
+          id: randomUUID(),
+          chatId,
+          name: "Renamed",
+          monitored: false,
+          timezone: "UTC",
+          summaryTime: null,
+          historyImport: null,
+        });
+        expect(renamed.id).toBe(id);
+        expect(renamed.historyImport).toEqual(requested?.group.historyImport);
+
+        // The id-keyed replace path also preserves the columns.
+        await store.upsertGroup({
+          id,
+          chatId,
+          name: "Replaced",
+          monitored: true,
+          timezone: "Europe/Madrid",
+          summaryTime: null,
+          historyImport: null,
+        });
+        expect((await importRow(id))?.history_import_status).toBe("pending");
+      });
+
+      it("routes: 404 unknown, 409 unmonitored, 202 accepted, 200 in flight", async () => {
+        const store = new PostgresStore(pool, ENCRYPTION_KEY);
+        const app = await buildApp({
+          store,
+          enqueue: noopEnqueuer,
+          cookieSecure: false,
+          logger: false,
+        });
+        await setupAdmin(app);
+        const session = await login(app);
+
+        // 404: unknown group.
+        const unknown = await app.inject({
+          method: "POST",
+          url: `/api/groups/${randomUUID()}/history-import`,
+          headers: { cookie: session },
+        });
+        expect(unknown.statusCode).toBe(404);
+
+        // 409: not monitored (privacy boundary).
+        const groupId = await seedGroupRow(store);
+        await store.updateGroup({
+          ...(await store.getGroup(groupId))!,
+          monitored: false,
+        });
+        const unmonitored = await app.inject({
+          method: "POST",
+          url: `/api/groups/${groupId}/history-import`,
+          headers: { cookie: session },
+        });
+        expect(unmonitored.statusCode).toBe(409);
+        expect(ApiError.parse(unmonitored.json()).error.message).toBe(
+          "Group must be monitored before importing history.",
+        );
+
+        // 202: accepted — and the SQL row proves the transition. (The
+        // admin opts the group back into monitoring first.)
+        await store.updateGroup({
+          ...(await store.getGroup(groupId))!,
+          monitored: true,
+        });
+        const accepted = await app.inject({
+          method: "POST",
+          url: `/api/groups/${groupId}/history-import`,
+          headers: { cookie: session },
+        });
+        expect(accepted.statusCode).toBe(202);
+        expect(Group.parse(accepted.json()).historyImport?.status).toBe(
+          "pending",
+        );
+        expect((await importRow(groupId))?.history_import_status).toBe(
+          "pending",
+        );
+
+        // 200: already in flight — idempotent, unchanged.
+        const again = await app.inject({
+          method: "POST",
+          url: `/api/groups/${groupId}/history-import`,
+          headers: { cookie: session },
+        });
+        expect(again.statusCode).toBe(200);
+        expect(Group.parse(again.json()).historyImport).toEqual(
+          Group.parse(accepted.json()).historyImport,
+        );
+      });
+
+      it("cancelPendingHistoryImport clears PENDING rows in SQL and nothing else (SA-M1)", async () => {
+        const store = new PostgresStore(pool, ENCRYPTION_KEY);
+        const pendingId = await seedGroupRow(store);
+        await store.requestHistoryImport(pendingId);
+
+        // Pending -> cleared atomically; every column resets.
+        expect(await store.cancelPendingHistoryImport(pendingId)).toBe(true);
+        const cleared = await importRow(pendingId);
+        expect(cleared?.history_import_status).toBeNull();
+        expect(cleared?.history_import_requested_at).toBeNull();
+        expect(cleared?.history_import_started_at).toBeNull();
+        expect(cleared?.history_import_finished_at).toBeNull();
+        expect(cleared?.history_import_imported_count).toBe(0);
+        expect(cleared?.history_import_error).toBeNull();
+        // Idempotent: nothing left to cancel.
+        expect(await store.cancelPendingHistoryImport(pendingId)).toBe(false);
+
+        // Running -> NOT touched (the bot-worker aborts its own work).
+        const runningId = await seedGroupRow(store);
+        await store.requestHistoryImport(runningId);
+        await pool.query(
+          "UPDATE groups SET history_import_status = 'running', " +
+            "history_import_started_at = now(), " +
+            "history_import_imported_count = 2 WHERE id = $1",
+          [runningId],
+        );
+        expect(await store.cancelPendingHistoryImport(runningId)).toBe(false);
+        const running = await importRow(runningId);
+        expect(running?.history_import_status).toBe("running");
+        expect(running?.history_import_imported_count).toBe(2);
+
+        // Un-monitoring mid-flight wires the same rule through PATCH:
+        // pending dies, running survives.
+        const wiredId = await seedGroupRow(store);
+        await store.requestHistoryImport(wiredId);
+        await store.updateGroup({
+          ...(await store.getGroup(wiredId))!,
+          monitored: false,
+        });
+        await store.cancelPendingHistoryImport(wiredId);
+        expect((await importRow(wiredId))?.history_import_status).toBeNull();
       });
     });
   },

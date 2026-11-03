@@ -1624,6 +1624,16 @@ async function scenarioScheduler() {
       // With the default BACKFILL_DAYS the fresh group also gets one
       // run per older missing window — one run per DAY, never two for
       // the same window.
+      // The scheduler creates the windows SEQUENTIALLY (one DB
+      // round-trip per window: identity check, create-or-find,
+      // enqueue), so a poll can legitimately observe a PARTIAL pass
+      // (e.g. 2 of 3 rows). Wait for the full expected set before
+      // asserting; breaking on the first non-empty snapshot made this
+      // check racy (caught in the Phase E.5 gate as "got 2 2 !== 3",
+      // while the pass afterwards always finished with 3 completed
+      // runs). The deadline still bounds the wait, and the assertions
+      // below report the actual count when it never arrives.
+      const EXPECTED_SCHEDULED_WINDOWS = 3; // DEFAULT_BACKFILL_DAYS
       const deadline = Date.now() + 30_000;
       let rows = [];
       for (;;) {
@@ -1633,11 +1643,12 @@ async function scenarioScheduler() {
           [groupId],
         );
         rows = result.rows;
-        if (rows.length > 0) break;
-        if (Date.now() > deadline) {
-          throw new Error("no scheduled run appeared within 30s");
-        }
+        if (rows.length >= EXPECTED_SCHEDULED_WINDOWS) break;
+        if (Date.now() > deadline) break;
         await delay(250);
+      }
+      if (rows.length === 0) {
+        throw new Error("no scheduled run appeared within 30s");
       }
       const windowRows = rows.filter(
         (row) =>
@@ -1665,7 +1676,8 @@ async function scenarioScheduler() {
       assert.equal(
         rows.length,
         3,
-        `expected one run per day in the backfill window, got ${rows.length}`,
+        `expected one run per day in the backfill window, got ${rows.length} ` +
+          `(${rows.map((row) => new Date(row.start_at).toISOString()).join(", ") || "none"})`,
       );
       assert.equal(
         new Set(rows.map((row) => row.start_at.toISOString())).size,

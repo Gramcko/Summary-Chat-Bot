@@ -241,14 +241,27 @@ message (the filter queries PostgreSQL per batch). Normalized into the
   fails is retried up to 3 attempts with small backoff (safe: the
   insert is idempotent) and only then dropped **whole**, with counted
   logs (`message_drain_failed` reports `captured: 0, lost: N`).
-- **History sync is disabled** (`syncFullHistory: false`,
-  `shouldSyncHistoryMessage: () => false`) and non-group JIDs are
-  dropped before decryption (`shouldIgnoreJid`): the MVP captures live
-  traffic only and does not backfill old conversations — data
-  minimization over completeness. Messages sent while the bot-worker is
-  offline are therefore **not** captured; do not promise otherwise.
-  Replays that WhatsApp may still deliver (`append` upserts) flow
-  through the same idempotent path and can never duplicate rows.
+- **Bulk history sync is disabled; on-demand backfill is opt-in (ADR
+  0007).** `syncFullHistory: false` and
+  `shouldSyncHistoryMessage: () => false` keep bulk history sync off:
+  the MVP captures live traffic only — data minimization over
+  completeness. Messages sent while the bot-worker is offline are
+  therefore **not** captured automatically; do not promise otherwise.
+  The one deliberate exception is the **on-demand** history import of
+  ADR 0007 (admin opt-in, monitored groups only, bounded budget).
+  Decryption eligibility (`shouldIgnoreJid`) matches that scope: `@g.us`
+  group chats **plus the account's own PN/LID identities** — WhatsApp
+  delivers the self-addressed on-demand history response as a
+  device-to-self message that must decrypt to be read. Everything else
+  (DMs, newsletters, other non-group JIDs) is still never decrypted.
+  Own-origin messages (`fromMe`) and non-group payloads are normalized
+  and DROPPED (`own-message`/`not-group` skips) — never persisted, not
+  even as the self-chat/DM echoes that come with the self-addressed
+  traffic. Residual trade-off, stated honestly: own-origin traffic
+  (including self-chat and DM echoes) is decrypted in memory only to
+  reach the history response. Replays that WhatsApp may still deliver
+  (`append` upserts) flow through the same idempotent path and can
+  never duplicate rows.
 
 ### 8. Logging rules (strict)
 
@@ -280,7 +293,9 @@ see them).
   restrictions (e.g. temporary blocks) are outside our control.
 - **No delivery guarantees.** Baileys event delivery is not a durable
   queue: messages exchanged while the bot-worker is disconnected are
-  lost for capture purposes (history sync is off). Duplicate deliveries
+  lost for capture purposes (bulk history sync is off — the bounded,
+  admin-requested backfill of ADR 0007 is the only recovery path and it
+  is partial by nature). Duplicate deliveries
   *are* handled.
 - **Bounded loss window during outages (CR-M2):** a message is durable
   only after its batch INSERT commits. Between reception and commit the
@@ -364,8 +379,9 @@ retention policy is productized (Phase E/F):
 - Dashboard QR/pairing-code linking over the authenticated API.
 - Productize retention (automatic expiry / per-group deletion API) and a
   purge UX; today only the CLI exists (ADR §11).
-- Revisit history sync (bounded backfill) if offline gaps become a real
-  product requirement.
+- ~~Revisit history sync (bounded backfill) if offline gaps become a
+  real product requirement.~~ Delivered as the opt-in, bounded history
+  import of ADR 0007 (monitored groups only, admin-triggered).
 - When upgrading Baileys: re-run the import smoke (mapping suite),
   re-read the changelog/advisories (e.g. the message-spoofing advisory
   GHSA-qvv5-jq5g-4cgg — 6.7.24 is unaffected), **re-verify the

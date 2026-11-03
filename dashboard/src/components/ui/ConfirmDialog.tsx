@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useId, useRef, type MouseEvent, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
 import { Button } from "./Button";
 
 export interface ConfirmDialogProps {
@@ -10,15 +17,28 @@ export interface ConfirmDialogProps {
   confirmLabel?: string;
   cancelLabel?: string;
   tone?: "danger" | "primary";
+  /** Spinner/disable state for the confirm action. */
   loading?: boolean;
+  /**
+   * Optional third choice rendered between "Cancel" and the confirm action
+   * (for example "Monitor only" next to "Monitor & import history").
+   */
+  alternativeLabel?: string;
+  onAlternative?: () => void;
+  alternativeLoading?: boolean;
   error?: string | null;
   onConfirm: () => void;
   onCancel: () => void;
 }
 
 /**
- * Confirmation for destructive actions. Uses a native `<dialog>` so focus
- * trapping, `Escape`, and the backdrop come from the platform.
+ * Confirmation dialog. Uses a native `<dialog>` so focus trapping, `Escape`,
+ * and the backdrop come from the platform.
+ *
+ * While an action is submitting (`loading`/`alternativeLoading`) the dialog
+ * cannot be dismissed: the cancel button is disabled, backdrop clicks are
+ * ignored, and the native `cancel` event (Escape) is prevented — this prevents
+ * a request from being fired twice or its error being lost with the dialog.
  */
 export function ConfirmDialog({
   open,
@@ -28,6 +48,9 @@ export function ConfirmDialog({
   cancelLabel = "Cancel",
   tone = "danger",
   loading = false,
+  alternativeLabel,
+  onAlternative,
+  alternativeLoading = false,
   error = null,
   onConfirm,
   onCancel,
@@ -36,6 +59,7 @@ export function ConfirmDialog({
   const openRef = useRef(open);
   const titleId = useId();
   const descriptionId = useId();
+  const busy = loading || alternativeLoading;
 
   useEffect(() => {
     openRef.current = open;
@@ -58,11 +82,22 @@ export function ConfirmDialog({
     return () => dialog.removeEventListener("close", handleClose);
   }, [onCancel]);
 
+  // Escape while submitting must not dismiss (and lose) the in-flight action.
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog === null) return;
+    const handleCancelEvent = (event: Event) => {
+      if (busy) event.preventDefault();
+    };
+    dialog.addEventListener("cancel", handleCancelEvent);
+    return () => dialog.removeEventListener("cancel", handleCancelEvent);
+  }, [busy]);
+
   const handleBackdropClick = useCallback(
     (event: MouseEvent<HTMLDialogElement>) => {
-      if (event.target === dialogRef.current) onCancel();
+      if (event.target === dialogRef.current && !busy) onCancel();
     },
-    [onCancel],
+    [busy, onCancel],
   );
 
   return (
@@ -86,13 +121,24 @@ export function ConfirmDialog({
           </p>
         )}
         <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-          <Button variant="secondary" onClick={onCancel} disabled={loading}>
+          <Button variant="secondary" onClick={onCancel} disabled={busy}>
             {cancelLabel}
           </Button>
+          {alternativeLabel === undefined || onAlternative === undefined ? null : (
+            <Button
+              variant="secondary"
+              onClick={onAlternative}
+              disabled={loading}
+              loading={alternativeLoading}
+            >
+              {alternativeLabel}
+            </Button>
+          )}
           <Button
             variant={tone === "danger" ? "danger" : "primary"}
             onClick={onConfirm}
             loading={loading}
+            disabled={alternativeLoading}
           >
             {confirmLabel}
           </Button>

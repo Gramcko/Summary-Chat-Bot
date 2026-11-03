@@ -1,10 +1,20 @@
 import { randomUUID } from "node:crypto";
-import type { BotDb, ConnectionState, ChatDefaults, InsertMessagesResult, UpsertChatsResult } from "../src/db.js";
+import type {
+  BotDb,
+  ChatDefaults,
+  HistoryImportClaim,
+  HistoryImportOutcome,
+  InsertMessagesOptions,
+  InsertMessagesResult,
+  ConnectionState,
+  UpsertChatsResult,
+} from "../src/db.js";
 import type { LogFields, LogLevel, Logger } from "../src/lib/log.js";
 import type { NewMessage } from "../src/normalize.js";
 import type {
   AdapterEvent,
   DiscoveredChat,
+  HistoryFetchRequest,
   RawInboundMessage,
   WhatsAppAdapter,
 } from "../src/whatsapp/adapter.js";
@@ -29,6 +39,14 @@ export class FakeAdapter implements WhatsAppAdapter {
   /** Groups returned by fetchChats(); may be mutated between calls. */
   fetchChatsResults: DiscoveredChat[] = [];
   fetchChatsError: Error | null = null;
+  /** Recorded history requests (ADR 0007). */
+  historyRequests: HistoryFetchRequest[] = [];
+  /** Makes requestHistory() throw. */
+  requestHistoryError: Error | null = null;
+  /** Hook for scripting responses to a history request. */
+  onRequestHistory?: (request: HistoryFetchRequest) => void;
+  /** Chats released via releaseHistoryChat(). */
+  releasedHistoryChats: string[] = [];
 
   private readonly handlers = new Set<(event: AdapterEvent) => void>();
 
@@ -49,6 +67,17 @@ export class FakeAdapter implements WhatsAppAdapter {
     return [...this.fetchChatsResults];
   }
 
+  async requestHistory(request: HistoryFetchRequest): Promise<string> {
+    this.historyRequests.push(request);
+    if (this.requestHistoryError !== null) throw this.requestHistoryError;
+    this.onRequestHistory?.(request);
+    return `req-${this.historyRequests.length}`;
+  }
+
+  releaseHistoryChat(chatJid: string): void {
+    this.releasedHistoryChats.push(chatJid);
+  }
+
   subscribe(handler: (event: AdapterEvent) => void): () => void {
     this.handlers.add(handler);
     return () => {
@@ -64,6 +93,21 @@ export class FakeAdapter implements WhatsAppAdapter {
   emitMessages(...messages: RawInboundMessage[]): void {
     this.emit({ type: "messages", messages });
   }
+
+  /** Emits one history batch (what a fetchMessageHistory round returns). */
+  emitHistory(
+    chatJid: string,
+    messages: RawInboundMessage[],
+    extra: { progress?: number | null; requestId?: string | null } = {},
+  ): void {
+    this.emit({
+      type: "history",
+      chatJid,
+      messages,
+      progress: extra.progress ?? null,
+      requestId: extra.requestId ?? null,
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +122,13 @@ export interface FakeStoredGroup {
   monitored: boolean;
   timezone: string;
   summaryTime: string | null;
+  /** History-import columns (migration 0003, ADR 0007); null/absent = never requested. */
+  historyStatus?: "pending" | "running" | "done" | "failed" | null;
+  historyRequestedAt?: Date | null;
+  historyStartedAt?: Date | null;
+  historyFinishedAt?: Date | null;
+  historyImportedCount?: number;
+  historyError?: string | null;
 }
 
 export class FakeDb implements BotDb {
@@ -86,6 +137,8 @@ export class FakeDb implements BotDb {
   readonly groups = new Map<string, FakeStoredGroup>();
   readonly messages: NewMessage[] = [];
   readonly insertCalls: NewMessage[][] = [];
+  /** How often insertMessages() touched last_message_at (ADR 0007). */
+  lastMessageTouches = 0;
   /**
    * Per-call insert failures (CR-M2 tests): each insertMessages() call
    * shifts one error and throws it when present.
@@ -114,7 +167,9 @@ export class FakeDb implements BotDb {
   async insertMessages(
     _connectionId: string,
     rows: NewMessage[],
+    options: InsertMessagesOptions = {},
   ): Promise<InsertMessagesResult> {
+    const touchLastMessage = options.touchLastMessage !== false;
     this.insertCalls.push([...rows]);
     const failure = this.insertFailures.shift();
     if (failure !== undefined) throw failure;
@@ -137,6 +192,7 @@ export class FakeDb implements BotDb {
       this.messages.push(row);
       inserted += 1;
     }
+    if (inserted > 0 && touchLastMessage) this.lastMessageTouches += 1;
     return { inserted, duplicates, droppedUnmonitored };
   }
 
@@ -162,11 +218,135 @@ export class FakeDb implements BotDb {
           monitored: false,
           timezone: defaults.timezone,
           summaryTime: null,
+          historyStatus: null,
+          historyRequestedAt: null,
+          historyStartedAt: null,
+          historyFinishedAt: null,
+          historyImportedCount: 0,
+          historyError: null,
         });
         inserted += 1;
       }
     }
     return { inserted, updated };
+  }
+
+  // ---- History imports (ADR 0007): mirror the SQL semantics ----
+
+  /** Simulates POST /api/groups/:id/history-import (backend behavior). */
+  requestHistoryImport(chatJid: string): void {
+    const group = this.requireGroup(chatJid);
+    group.historyStatus = "pending";
+    group.historyRequestedAt = new Date();
+    group.historyStartedAt = null;
+    group.historyFinishedAt = null;
+    group.historyImportedCount = 0;
+    group.historyError = null;
+  }
+
+  private requireGroup(chatJid: string): FakeStoredGroup {
+    const group = this.groups.get(chatJid);
+    if (group === undefined) throw new Error(`unknown chat ${chatJid}`);
+    return group;
+  }
+
+  async claimPendingHistoryImports(limit = 1): Promise<HistoryImportClaim[]> {
+    // Mirrors the SQL claim: pending + MONITORED + linked chat only.
+    const eligible = [...this.groups.entries()]
+      .filter(
+        ([, group]) => group.historyStatus === "pending" && group.monitored === true,
+      )
+      .sort(
+        ([, a], [, b]) =>
+          (a.historyRequestedAt?.getTime() ?? 0) -
+          (b.historyRequestedAt?.getTime() ?? 0),
+      )
+      .slice(0, Math.max(1, Math.floor(limit)));
+    return eligible.map(([chatJid, group]) => {
+      group.historyStatus = "running";
+      group.historyStartedAt = new Date();
+      return {
+        groupId: group.id,
+        chatJid,
+        requestedAt: group.historyRequestedAt ?? new Date(),
+        startedAt: group.historyStartedAt,
+      };
+    });
+  }
+
+  /** Recorded incremental progress writes (CR-M2). */
+  readonly historyProgressUpdates: Array<{ groupId: string; importedCount: number }> =
+    [];
+
+  async updateHistoryImportProgress(
+    claim: Pick<HistoryImportClaim, "groupId" | "startedAt">,
+    importedCount: number,
+  ): Promise<boolean> {
+    for (const group of this.groups.values()) {
+      if (group.id !== claim.groupId) continue;
+      // Same fence as completion (mirrors the SQL).
+      if (group.historyStatus !== "running") return false;
+      if ((group.historyStartedAt?.getTime() ?? -1) !== claim.startedAt.getTime()) {
+        return false;
+      }
+      group.historyImportedCount = importedCount;
+      this.historyProgressUpdates.push({
+        groupId: claim.groupId,
+        importedCount,
+      });
+      return true;
+    }
+    return false;
+  }
+
+  async completeHistoryImport(
+    claim: Pick<HistoryImportClaim, "groupId" | "startedAt">,
+    outcome: HistoryImportOutcome,
+  ): Promise<boolean> {
+    for (const group of this.groups.values()) {
+      if (group.id !== claim.groupId) continue;
+      // Guarded by status AND startedAt (mirrors the SQL): stale claims
+      // cannot overwrite a newer import.
+      if (group.historyStatus !== "running") return false;
+      if ((group.historyStartedAt?.getTime() ?? -1) !== claim.startedAt.getTime()) {
+        return false;
+      }
+      group.historyStatus = outcome.status;
+      group.historyFinishedAt = new Date();
+      group.historyImportedCount = outcome.importedCount;
+      group.historyError = outcome.error;
+      return true;
+    }
+    return false;
+  }
+
+  async requeueStaleHistoryImports(olderThanMs: number): Promise<number> {
+    const cutoff = Date.now() - Math.max(0, olderThanMs);
+    let requeued = 0;
+    for (const group of this.groups.values()) {
+      if (group.historyStatus !== "running") continue;
+      if ((group.historyStartedAt?.getTime() ?? Infinity) >= cutoff) continue;
+      group.historyStatus = "pending";
+      group.historyStartedAt = null;
+      requeued += 1;
+    }
+    return requeued;
+  }
+
+  async releaseHistoryImport(
+    claim: Pick<HistoryImportClaim, "groupId" | "startedAt">,
+  ): Promise<boolean> {
+    for (const group of this.groups.values()) {
+      if (group.id !== claim.groupId) continue;
+      if (group.historyStatus !== "running") return false;
+      if ((group.historyStartedAt?.getTime() ?? -1) !== claim.startedAt.getTime()) {
+        return false;
+      }
+      group.historyStatus = "pending";
+      group.historyStartedAt = null;
+      return true;
+    }
+    return false;
   }
 
   /** Simulates the admin changing preferences in the dashboard. */

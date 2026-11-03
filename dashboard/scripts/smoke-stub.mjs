@@ -40,6 +40,8 @@ function createState() {
         // Read-only field added to Group by the parallel contract change; the
         // dashboard ignores it, and the check confirms extra fields are safe.
         chatId: "120363000000000001@g.us",
+        // System-managed history-import state (ADR 0007); null = never asked.
+        historyImport: null,
       },
       {
         id: GROUP_PROJECT_ID,
@@ -48,6 +50,7 @@ function createState() {
         timezone: "America/Bogota",
         summaryTime: null,
         chatId: null,
+        historyImport: null,
       },
     ],
     runs: [
@@ -313,7 +316,40 @@ async function handle(req, res, state) {
     if (body.summaryTime === null || typeof body.summaryTime === "string") {
       group.summaryTime = body.summaryTime;
     }
+    // `historyImport` is system-managed: PATCH never alters it (ADR 0007).
     return sendJson(res, 200, group);
+  }
+
+  const historyImportMatch = /^\/api\/groups\/([^/]+)\/history-import$/.exec(path);
+  if (historyImportMatch && method === "POST") {
+    const group = state.groups.find(
+      (candidate) => candidate.id === historyImportMatch[1],
+    );
+    if (group === undefined) {
+      return sendError(res, 404, "not_found", "Group not found.");
+    }
+    if (!group.monitored) {
+      return sendError(
+        res,
+        409,
+        "conflict",
+        "Group must be monitored before importing history.",
+      );
+    }
+    const current = group.historyImport?.status;
+    const accepted = current !== "pending" && current !== "running";
+    if (accepted) {
+      // A new request resets the progress fields (ADR 0007).
+      group.historyImport = {
+        status: "pending",
+        requestedAt: new Date().toISOString(),
+        startedAt: null,
+        finishedAt: null,
+        importedCount: 0,
+        error: null,
+      };
+    }
+    return sendJson(res, accepted ? 202 : 200, group);
   }
 
   if (path === "/api/summary-runs" && method === "GET") {

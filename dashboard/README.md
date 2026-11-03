@@ -107,7 +107,9 @@ nothing is restored.
 - `/setup` — one-time administrator password + recovery codes (shown once).
 - `/login`, `/recover` — session sign-in and single-use recovery code flow.
 - `/` — connection status and the most recent summary runs.
-- `/groups` — monitored flag, IANA time zone, and daily cutoff per group.
+- `/groups` — monitored flag (with the opt-in WhatsApp history import), IANA
+  time zone, and daily cutoff per group; import progress is polled while an
+  import is pending or running (ADR 0007).
 - `/runs` — request a manual summary and browse run history.
 - `/runs/[id]` — run status, retry, and the generated summary.
 - `/settings` — AI provider configuration (the API key is write-only).

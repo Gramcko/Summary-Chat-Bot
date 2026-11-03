@@ -3,6 +3,7 @@ import makeWASocket, {
   getContentType,
   makeCacheableSignalKeyStore,
   normalizeMessageContent,
+  proto,
   useMultiFileAuthState,
   type ConnectionState as BaileysConnectionState,
   type GroupMetadata,
@@ -10,13 +11,13 @@ import makeWASocket, {
   type WAVersion,
   type WAMessage,
   type WASocket,
-  type proto,
 } from "@whiskeysockets/baileys";
 import { errorReason } from "../lib/errors.js";
 import type { Logger } from "../lib/log.js";
 import type {
   AdapterEvent,
   DiscoveredChat,
+  HistoryFetchRequest,
   RawContentKind,
   RawInboundMessage,
   WhatsAppAdapter,
@@ -359,6 +360,86 @@ function disconnectStatusCode(error: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * True when an incoming stanza from `jid` must be ignored (never
+ * decrypted, no events — ADR 0004): everything except group chats and
+ * the account's OWN JIDs (device-to-self traffic such as the on-demand
+ * history response; `selfUsers` holds the user part of the linked
+ * account's PN and LID). Pure and unit-testable (SA-L2); the adapter
+ * feeds it a live reading of `auth.state.creds.me`, which Baileys
+ * mutates in place on `creds.update` (Socket/socket.js), so a first
+ * ever link starts processing self traffic immediately.
+ */
+export function isIgnoredIncomingJid(
+  jid: string,
+  selfUsers: ReadonlySet<string>,
+): boolean {
+  if (jid.endsWith("@g.us")) return false;
+  const user = jid.split(/[:@]/)[0] ?? jid;
+  return !selfUsers.has(user);
+}
+
+/**
+ * Correlation check for history payloads (SA-M3): a
+ * `messaging-history.set` whose `peerDataRequestSessionId` is absent or
+ * is not one of OUR outstanding request ids is logged (fixed safe line)
+ * but still processed — ENFORCEMENT IS PENDING LIVE VERIFICATION
+ * because the session-id echo behavior is unverified against a real
+ * account (TODO(live-verify): enforce once confirmed).
+ */
+export function classifyHistoryCorrelation(
+  sessionId: string | null,
+  knownRequestIds: ReadonlySet<string>,
+): "match" | "missing-session-id" | "unknown-session-id" {
+  if (sessionId === null) return "missing-session-id";
+  return knownRequestIds.has(sessionId) ? "match" : "unknown-session-id";
+}
+
+/**
+ * The `messaging-history.set` payload as delivered by Baileys
+ * (Types/Events.d.ts, verified against the installed 6.7.24 sources):
+ * `{ chats, contacts, messages, isLatest?, progress?, syncType?,
+ * peerDataRequestSessionId? }`. Only the fields we use are typed here.
+ */
+export interface HistorySetPayload {
+  messages: WAMessage[];
+  progress?: number | null;
+  syncType?: number | undefined;
+  peerDataRequestSessionId?: string | null;
+}
+
+/**
+ * Translates one history batch into adapter `history` events
+ * (ADR 0007, verified against Baileys 6.7.24 process-message.js /
+ * Utils/history.js): messages are already reverse-chronological and may
+ * span MANY chats — only chats with an outstanding request are mapped,
+ * everything else is dropped BEFORE normalization (privacy boundary:
+ * history for other chats is never parsed or stored).
+ */
+export function mapHistorySet(
+  payload: HistorySetPayload,
+  requestedChats: ReadonlySet<string>,
+): Array<Extract<AdapterEvent, { type: "history" }>> {
+  const byChat = new Map<string, RawInboundMessage[]>();
+  for (const message of payload.messages) {
+    const chatJid = stringOrNull(message.key?.remoteJid);
+    if (chatJid === null || !requestedChats.has(chatJid)) continue;
+    const mapped = mapWAMessage(message);
+    if (mapped === null) continue;
+    const bucket = byChat.get(chatJid);
+    if (bucket === undefined) byChat.set(chatJid, [mapped]);
+    else bucket.push(mapped);
+  }
+  const requestId = stringOrNull(payload.peerDataRequestSessionId);
+  return [...byChat.entries()].map(([chatJid, messages]) => ({
+    type: "history",
+    chatJid,
+    messages,
+    progress: typeof payload.progress === "number" ? payload.progress : null,
+    requestId,
+  }));
+}
+
 export class BaileysAdapter implements WhatsAppAdapter {
   private socket: WASocket | null = null;
   private readonly handlers = new Set<(event: AdapterEvent) => void>();
@@ -366,6 +447,17 @@ export class BaileysAdapter implements WhatsAppAdapter {
   private pairingRequested = false;
   private pairingCodeFailed = false;
   private saveCreds: (() => Promise<void>) | null = null;
+  /**
+   * Chats with an outstanding history request (ADR 0007): history
+   * batches for any other chat are dropped before normalization.
+   * Bounded by the import service (one import at a time).
+   */
+  private readonly pendingHistoryChats = new Set<string>();
+  /**
+   * Outstanding request ids (SA-M3): request id -> chat, for
+   * log-only correlation of `messaging-history.set` payloads.
+   */
+  private readonly pendingHistoryRequestIds = new Map<string, string>();
   /**
    * Serializes auth-state writes (audit L3): concurrent writeFile calls
    * on creds.json can corrupt the session and force a re-link, so every
@@ -420,6 +512,23 @@ export class BaileysAdapter implements WhatsAppAdapter {
 
     const version = await this.resolveVersion();
     if (this.stopping) return;
+
+    // Own-account JIDs (user + LID forms) must be allowed through
+    // shouldIgnoreJid: WhatsApp delivers our on-demand history response
+    // as a device-to-self protocolMessage (historySyncNotification,
+    // verified in Baileys' process-message.js — it even drops spoofed
+    // non-self ones). Everything else non-group is still never
+    // decrypted (ADR 0004 privacy boundary). The self users are read
+    // LAZILY from the live creds object (Baileys mutates it in place on
+    // creds.update, Socket/socket.js:570), so a first-ever link starts
+    // processing self traffic as soon as `me` exists (SA-L2).
+    const readSelfUsers = (): Set<string> =>
+      new Set(
+        [auth.state.creds.me?.id, auth.state.creds.me?.lid]
+          .filter((jid): jid is string => typeof jid === "string" && jid !== "")
+          .map((jid) => jid.split(/[:@]/)[0] ?? jid),
+      );
+
     this.socket = makeWASocket({
       auth: {
         creds: auth.state.creds,
@@ -429,11 +538,19 @@ export class BaileysAdapter implements WhatsAppAdapter {
       ...(version !== undefined ? { version } : {}),
       emitOwnEvents: false,
       markOnlineOnConnect: false,
-      // Privacy-minimizing collection (ADR 0004): no history backfill,
-      // no decryption of non-group chats (DMs, status broadcasts, ...).
+      // Privacy-minimizing collection (ADR 0004): no bulk history sync
+      // (INITIAL_BOOTSTRAP/RECENT/FULL/PUSH_NAME are never processed —
+      // this also keeps the connect-time sync wait off), but the
+      // ON_DEMAND responses to OUR OWN history requests must be
+      // processed or fetchMessageHistory results would be dropped
+      // before delivery (Baileys gates processing on this predicate in
+      // Socket/chats.js; PROCESSABLE_HISTORY_TYPES includes ON_DEMAND).
       syncFullHistory: false,
-      shouldSyncHistoryMessage: () => false,
-      shouldIgnoreJid: (jid) => !jid.endsWith("@g.us"),
+      shouldSyncHistoryMessage: (historyMsg) =>
+        historyMsg.syncType === proto.HistorySync.HistorySyncType.ON_DEMAND,
+      // No decryption of non-group, non-self JIDs (DMs, newsletters,
+      // status broadcasts, ...).
+      shouldIgnoreJid: (jid) => isIgnoredIncomingJid(jid, readSelfUsers()),
       generateHighQualityLinkPreview: false,
     });
 
@@ -465,6 +582,9 @@ export class BaileysAdapter implements WhatsAppAdapter {
     this.socket.ev.on("groups.update", (updates) => {
       for (const update of updates) this.onGroupUpdate(update);
     });
+    this.socket.ev.on("messaging-history.set", (set) => {
+      this.onHistorySet(set);
+    });
   }
 
   async disconnect(): Promise<void> {
@@ -495,6 +615,85 @@ export class BaileysAdapter implements WhatsAppAdapter {
       chats.push({ chatJid: jid, name });
     }
     return chats;
+  }
+
+  /**
+   * Requests on-demand history for ONE chat (ADR 0007).
+   *
+   * Verified Baileys 6.7.24 surface (Socket/messages-recv.js:707):
+   *   fetchMessageHistory(
+   *     count: number,
+   *     oldestMsgKey: WAMessageKey,
+   *     oldestMsgTimestamp: number | Long,   // used as MILLISECONDS
+   *   ): Promise<string>                      // relayed request msg id
+   * It builds a `historySyncOnDemandRequest`
+   * `{ chatJid, oldestMsgFromMe, oldestMsgId, oldestMsgTimestampMs,
+   * onDemandMsgCount }` via a peer-data-operation message. Results come
+   * back asynchronously as `messaging-history.set` events (delivered as
+   * device-to-self historySyncNotification protocol messages, whose
+   * `peerDataRequestSessionId` is forwarded on our `history` events).
+   */
+  async requestHistory(request: HistoryFetchRequest): Promise<string> {
+    const socket = this.socket;
+    if (socket === null) throw new Error("not connected");
+    const cursor = request.cursor;
+    // Empty cursor (= first round) asks for the newest available
+    // history; subsequent rounds page backwards from the oldest message
+    // already received. Exact WhatsApp cursor semantics are documented
+    // as unverified in ADR 0007 (no live account in tests).
+    const oldestKey = {
+      remoteJid: request.chatJid,
+      fromMe: cursor?.fromMe ?? false,
+      id: cursor?.messageId ?? "",
+    };
+    const oldestTimestampMs = cursor !== null ? cursor.timestampSec * 1000 : 0;
+    this.pendingHistoryChats.add(request.chatJid);
+    try {
+      const requestId = await socket.fetchMessageHistory(
+        request.count,
+        oldestKey,
+        oldestTimestampMs,
+      );
+      // Kept for log-only correlation of the responses (SA-M3).
+      this.pendingHistoryRequestIds.set(requestId, request.chatJid);
+      return requestId;
+    } catch (error) {
+      this.pendingHistoryChats.delete(request.chatJid);
+      throw error;
+    }
+  }
+
+  /** Stops filtering for a chat's history batches (import finished). */
+  releaseHistoryChat(chatJid: string): void {
+    this.pendingHistoryChats.delete(chatJid);
+    for (const [requestId, chat] of this.pendingHistoryRequestIds) {
+      if (chat === chatJid) this.pendingHistoryRequestIds.delete(requestId);
+    }
+  }
+
+  private onHistorySet(set: HistorySetPayload): void {
+    if (this.stopping) return;
+    // Nothing requested: history arriving from bulk sync must never be
+    // surfaced (privacy). This also covers stale batches after an
+    // import completed (the chat was released).
+    if (this.pendingHistoryChats.size === 0) return;
+    // SA-M3 (LOG-ONLY for now): correlate to OUR request ids.
+    // TODO(live-verify): ENFORCEMENT is pending live verification — the
+    // peerDataRequestSessionId echo behavior is unverified against a
+    // real account, so an absent/differing id is logged but processed
+    // (ADR 0007).
+    const correlation = classifyHistoryCorrelation(
+      stringOrNull(set.peerDataRequestSessionId),
+      new Set(this.pendingHistoryRequestIds.keys()),
+    );
+    if (correlation !== "match") {
+      this.options.log("warn", "history_payload_unverified", {
+        reason: correlation,
+      });
+    }
+    for (const event of mapHistorySet(set, this.pendingHistoryChats)) {
+      this.emit(event);
+    }
   }
 
   // ------------------------------------------------------------------

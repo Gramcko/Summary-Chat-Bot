@@ -56,6 +56,26 @@ export interface DiscoveredChat {
   name: string;
 }
 
+/**
+ * History-import cursor (ADR 0007): the oldest message already held, so
+ * WhatsApp returns messages older than it. Null requests the newest
+ * history WhatsApp will provide.
+ */
+export interface HistoryCursor {
+  messageId: string;
+  fromMe: boolean;
+  /** Unix seconds (the adapter converts to milliseconds for WhatsApp). */
+  timestampSec: number;
+}
+
+export interface HistoryFetchRequest {
+  chatJid: string;
+  /** How many messages to request in this round (bounded budget). */
+  count: number;
+  /** Oldest message already held; null = no cursor (newest available). */
+  cursor: HistoryCursor | null;
+}
+
 export type AdapterEvent =
   /** The socket is being (re)established. */
   | { type: "connecting" }
@@ -74,7 +94,22 @@ export type AdapterEvent =
   /** Incoming messages (already adapter-filtered to what we handle). */
   | { type: "messages"; messages: RawInboundMessage[] }
   /** A group's metadata changed (e.g. subject renamed). */
-  | { type: "chat-updated"; chat: DiscoveredChat };
+  | { type: "chat-updated"; chat: DiscoveredChat }
+  /**
+   * Fetched history for ONE chat (ADR 0007). Emits only messages for
+   * chats with an outstanding history request — WhatsApp may return
+   * other chats' history in the same batch and it is dropped inside the
+   * adapter BEFORE normalization (privacy boundary).
+   */
+  | {
+      type: "history";
+      chatJid: string;
+      messages: RawInboundMessage[];
+      /** WhatsApp's batch progress hint (null when not provided). */
+      progress: number | null;
+      /** Peer-data request id when WhatsApp echoed one (correlation). */
+      requestId: string | null;
+    };
 
 /**
  * The WhatsApp integration as the rest of the service sees it.
@@ -88,6 +123,20 @@ export interface WhatsAppAdapter {
   disconnect(): Promise<void>;
   /** Lists group chats (`@g.us`) the account participates in. */
   fetchChats(): Promise<DiscoveredChat[]>;
+  /**
+   * Requests up to `count` history messages older than `cursor` for ONE
+   * chat (ADR 0007). Results arrive asynchronously as `history` events
+   * (possibly several batches). Returns the WhatsApp request id; the
+   * promise resolves when the request is RELAYED, not when the history
+   * arrives.
+   */
+  requestHistory(request: HistoryFetchRequest): Promise<string>;
+  /**
+   * Drops the chat from the adapter's history filter (import finished):
+   * late `messaging-history.set` batches for it are no longer emitted
+   * ("ignore stale history events", ADR 0007).
+   */
+  releaseHistoryChat(chatJid: string): void;
   /** Subscribes to adapter events; returns an unsubscribe function. */
   subscribe(handler: (event: AdapterEvent) => void): () => void;
 }

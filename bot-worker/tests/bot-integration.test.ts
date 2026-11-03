@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PostgresBotDb, type BotDb } from "../src/db.js";
+import { HistoryImportService } from "../src/history-import.js";
 import { CaptureService } from "../src/service.js";
 import type { NewMessage } from "../src/normalize.js";
 import { assertTestDatabaseName } from "../scripts/test-db-guard.js";
@@ -402,6 +403,293 @@ describe.skipIf(!shouldRun)(
 
       await service.stop();
       expect(logs.length).toBeGreaterThan(0);
+    });
+
+    // ---- History import (ADR 0007) ----
+
+    /** Seeds a group row with a pending history-import request. */
+    async function seedHistoryImport(
+      chatJid: string,
+      monitored: boolean,
+    ): Promise<string> {
+      const id = randomUUID();
+      await pool.query(
+        `INSERT INTO groups
+           (id, chat_id, name, monitored, timezone,
+            history_import_status, history_import_requested_at)
+         VALUES ($1, $2, 'Import Group', $3, 'UTC', 'pending', now())`,
+        [id, chatJid, monitored],
+      );
+      return id;
+    }
+
+    async function readHistoryRow(groupId: string): Promise<{
+      history_import_status: string | null;
+      history_import_started_at: Date | null;
+      history_import_finished_at: Date | null;
+      history_import_imported_count: number;
+      history_import_error: string | null;
+    }> {
+      const row = await pool.query<{
+        history_import_status: string | null;
+        history_import_started_at: Date | null;
+        history_import_finished_at: Date | null;
+        history_import_imported_count: number;
+        history_import_error: string | null;
+      }>(
+        `SELECT history_import_status, history_import_started_at,
+                history_import_finished_at, history_import_imported_count,
+                history_import_error
+         FROM groups WHERE id = $1`,
+        [groupId],
+      );
+      const result = row.rows[0];
+      if (result === undefined) throw new Error("group row missing");
+      return result;
+    }
+
+    it("claim SQL only claims pending+monitored rows (privacy boundary)", async () => {
+      const claimedId = await seedHistoryImport(GROUP_A, true);
+      const unmonitoredId = await seedHistoryImport(GROUP_B, false);
+      await pool.query(
+        `INSERT INTO groups (id, chat_id, name, monitored, timezone,
+                            history_import_status, history_import_requested_at,
+                            history_import_started_at, history_import_finished_at,
+                            history_import_imported_count)
+         VALUES ($1, 'done-group@g.us', 'Done', true, 'UTC', 'done', now(), now(), now(), 5)`,
+        [randomUUID()],
+      );
+
+      const claims = await db.claimPendingHistoryImports(5);
+      expect(claims.map((claim) => claim.groupId)).toEqual([claimedId]);
+      expect(claims[0]?.chatJid).toBe(GROUP_A);
+      expect(claims[0]?.startedAt).toBeInstanceOf(Date);
+
+      // The unmonitored request is NEVER claimed; the finished one is
+      // not claimable either.
+      expect((await readHistoryRow(unmonitoredId)).history_import_status).toBe(
+        "pending",
+      );
+      expect((await db.claimPendingHistoryImports(5))).toEqual([]);
+    });
+
+    it("concurrent claims never double-claim (FOR UPDATE SKIP LOCKED)", async () => {
+      const ids = [
+        await seedHistoryImport("c1@g.us", true),
+        await seedHistoryImport("c2@g.us", true),
+        await seedHistoryImport("c3@g.us", true),
+      ];
+      const results = await Promise.all([
+        db.claimPendingHistoryImports(1),
+        db.claimPendingHistoryImports(1),
+        db.claimPendingHistoryImports(1),
+      ]);
+      const claimed = results.flatMap((claims) => claims.map((c) => c.groupId));
+      // Every row claimed exactly once across the three concurrent calls.
+      expect(claimed.sort()).toEqual([...ids].sort());
+    });
+
+    it("completeHistoryImport writes the outcome and is idempotent-safe", async () => {
+      const groupId = await seedHistoryImport(GROUP_A, true);
+      const [claim] = await db.claimPendingHistoryImports(1);
+      if (claim === undefined) throw new Error("claim failed");
+
+      const completed = await db.completeHistoryImport(claim, {
+        status: "done",
+        importedCount: 42,
+        error: null,
+      });
+      expect(completed).toBe(true);
+      let row = await readHistoryRow(groupId);
+      expect(row.history_import_status).toBe("done");
+      expect(row.history_import_imported_count).toBe(42);
+      expect(row.history_import_finished_at).toBeInstanceOf(Date);
+      expect(row.history_import_error).toBeNull();
+
+      // Repeating the completion is a no-op (status no longer 'running').
+      const again = await db.completeHistoryImport(claim, {
+        status: "failed",
+        importedCount: 0,
+        error: "history_timeout",
+      });
+      expect(again).toBe(false);
+      row = await readHistoryRow(groupId);
+      expect(row.history_import_status).toBe("done");
+      expect(row.history_import_error).toBeNull();
+    });
+
+    it("a stale claim cannot overwrite a newer import's outcome", async () => {
+      const groupId = await seedHistoryImport(GROUP_A, true);
+      const [staleClaim] = await db.claimPendingHistoryImports(1);
+      if (staleClaim === undefined) throw new Error("claim failed");
+      // The stale claim is released and the import re-claimed later.
+      expect(
+        await db.releaseHistoryImport({
+          groupId: staleClaim.groupId,
+          startedAt: staleClaim.startedAt,
+        }),
+      ).toBe(true);
+      expect((await readHistoryRow(groupId)).history_import_status).toBe("pending");
+
+      const [freshClaim] = await db.claimPendingHistoryImports(1);
+      if (freshClaim === undefined) throw new Error("re-claim failed");
+      // The old worker's completion must NOT touch the newer import.
+      expect(
+        await db.completeHistoryImport(
+          { groupId: staleClaim.groupId, startedAt: staleClaim.startedAt },
+          { status: "failed", importedCount: 0, error: "history_internal" },
+        ),
+      ).toBe(false);
+      expect((await readHistoryRow(groupId)).history_import_status).toBe("running");
+
+      expect(
+        await db.completeHistoryImport(freshClaim, {
+          status: "done",
+          importedCount: 1,
+          error: null,
+        }),
+      ).toBe(true);
+      expect((await readHistoryRow(groupId)).history_import_status).toBe("done");
+    });
+
+    it("requeueStaleHistoryImports requeues only stale running claims", async () => {
+      const staleId = await seedHistoryImport(GROUP_A, true);
+      const freshChat = "fresh-claim@g.us";
+      const freshId = await seedHistoryImport(freshChat, true);
+      await pool.query(
+        `UPDATE groups SET history_import_status = 'running',
+                           history_import_started_at = now() - interval '20 minutes'
+         WHERE id = $1`,
+        [staleId],
+      );
+      await pool.query(
+        `UPDATE groups SET history_import_status = 'running',
+                           history_import_started_at = now()
+         WHERE id = $1`,
+        [freshId],
+      );
+
+      const requeued = await db.requeueStaleHistoryImports(600_000);
+      expect(requeued).toBe(1);
+      const staleRow = await readHistoryRow(staleId);
+      expect(staleRow.history_import_status).toBe("pending");
+      expect(staleRow.history_import_started_at).toBeNull();
+      expect((await readHistoryRow(freshId)).history_import_status).toBe("running");
+    });
+
+    it("staleness compares against the DATABASE clock (SA-L1)", async () => {
+      // The comparison must not use the worker clock: only started_at
+      // values older than now() - threshold (in DB time) move back.
+      const oldId = await seedHistoryImport("old-claim@g.us", true);
+      const futureId = await seedHistoryImport("future-claim@g.us", true);
+      await pool.query(
+        `UPDATE groups SET history_import_status = 'running',
+                           history_import_started_at = now() - interval '30 minutes'
+         WHERE id = $1`,
+        [oldId],
+      );
+      // A started_at in the future (odd clock value) must NEVER look
+      // stale, regardless of the threshold arithmetic.
+      await pool.query(
+        `UPDATE groups SET history_import_status = 'running',
+                           history_import_started_at = now() + interval '10 minutes'
+         WHERE id = $1`,
+        [futureId],
+      );
+
+      expect(await db.requeueStaleHistoryImports(600_000)).toBe(1);
+      expect((await readHistoryRow(oldId)).history_import_status).toBe("pending");
+      expect((await readHistoryRow(futureId)).history_import_status).toBe("running");
+    });
+
+    it("updateHistoryImportProgress is fenced like completion (CR-M2)", async () => {
+      const groupId = await seedHistoryImport(GROUP_A, true);
+      const [claim] = await db.claimPendingHistoryImports(1);
+      if (claim === undefined) throw new Error("claim failed");
+
+      // Incremental write while running: the dashboard can render it.
+      expect(
+        await db.updateHistoryImportProgress(
+          { groupId: claim.groupId, startedAt: claim.startedAt },
+          5,
+        ),
+      ).toBe(true);
+      expect((await readHistoryRow(groupId)).history_import_imported_count).toBe(5);
+
+      // A STALE claim (older started_at) can never overwrite progress.
+      const stale = { groupId: claim.groupId, startedAt: new Date(0) };
+      expect(await db.updateHistoryImportProgress(stale, 99)).toBe(false);
+      expect((await readHistoryRow(groupId)).history_import_imported_count).toBe(5);
+
+      // After completion the progress write is a no-op too; the exact
+      // terminal count stands.
+      expect(
+        await db.completeHistoryImport(
+          { groupId: claim.groupId, startedAt: claim.startedAt },
+          { status: "done", importedCount: 7, error: null },
+        ),
+      ).toBe(true);
+      expect(
+        await db.updateHistoryImportProgress(
+          { groupId: claim.groupId, startedAt: claim.startedAt },
+          99,
+        ),
+      ).toBe(false);
+      expect((await readHistoryRow(groupId)).history_import_imported_count).toBe(7);
+    });
+
+    it("full import flow: rows land exactly once, count = inserts, no last_message_at", async () => {
+      const groupId = await seedHistoryImport(GROUP_A, true);
+      const adapter = new FakeAdapter();
+      const logs: LogEntry[] = [];
+      const imports = new HistoryImportService({
+        adapter,
+        db,
+        log: recordingLogger(logs),
+        budgets: { roundSettleMs: 20, roundTimeoutMs: 120, pollMs: 5 },
+      });
+
+      // Round 1: two new; round 2: one duplicate + one new; round 3: a
+      // duplicate only (no progress → the import stops).
+      const script: Array<() => void> = [
+        () =>
+          adapter.emitHistory(GROUP_A, [
+            rawMessage({ messageId: "H1", timestampSec: 300 }),
+            rawMessage({ messageId: "H2", timestampSec: 200 }),
+          ]),
+        () =>
+          adapter.emitHistory(GROUP_A, [
+            rawMessage({ messageId: "H2", timestampSec: 200 }),
+            rawMessage({ messageId: "H3", timestampSec: 100 }),
+          ]),
+        () => adapter.emitHistory(GROUP_A, [rawMessage({ messageId: "H3", timestampSec: 100 })]),
+      ];
+      adapter.onRequestHistory = () => {
+        const respond = script.shift();
+        if (respond !== undefined) setTimeout(respond, 1);
+      };
+
+      await imports.runOnce();
+
+      const rows = await pool.query<{ whatsapp_message_id: string }>(
+        "SELECT whatsapp_message_id FROM messages ORDER BY whatsapp_message_id",
+      );
+      expect(rows.rows.map((row) => row.whatsapp_message_id)).toEqual([
+        "H1",
+        "H2",
+        "H3",
+      ]);
+      const row = await readHistoryRow(groupId);
+      expect(row.history_import_status).toBe("done");
+      expect(row.history_import_imported_count).toBe(3); // inserted, not received
+      expect(row.history_import_error).toBeNull();
+
+      // Historical imports must NOT masquerade as live traffic (ADR
+      // 0007): last_message_at stays untouched.
+      const connection = await pool.query<{ last_message_at: Date | null }>(
+        "SELECT last_message_at FROM whatsapp_connections",
+      );
+      expect(connection.rows[0]?.last_message_at).toBeNull();
     });
   },
 );

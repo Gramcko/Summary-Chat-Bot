@@ -103,6 +103,86 @@ describe("loadConfig: session directory resolution and containment", () => {
   });
 });
 
+describe("loadConfig: history-import budgets (ADR 0007)", () => {
+  it("uses the documented defaults", () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      WA_SESSION_ALLOW_INSECURE: "yes",
+    });
+    expect(config.historyImport).toEqual({
+      pollMs: 5000,
+      batchCount: 100,
+      maxRounds: 20,
+      maxMessages: 2000,
+      timeBudgetMs: 120000,
+    });
+  });
+
+  it("parses overrides and floors the poll interval at 1000ms", () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      WA_SESSION_ALLOW_INSECURE: "yes",
+      HISTORY_IMPORT_POLL_MS: "500",
+      HISTORY_IMPORT_BATCH_COUNT: "25",
+      HISTORY_IMPORT_MAX_ROUNDS: "5",
+      HISTORY_IMPORT_MAX_MESSAGES: "600",
+      HISTORY_IMPORT_TIME_BUDGET_MS: "30000",
+    });
+    expect(config.historyImport).toEqual({
+      pollMs: 1000,
+      batchCount: 25,
+      maxRounds: 5,
+      maxMessages: 600,
+      timeBudgetMs: 30000,
+    });
+  });
+
+  it("rejects invalid budget values", () => {
+    const withEnv = (name: string, value: string) => () =>
+      loadConfig({
+        ...BASE_ENV,
+        WA_SESSION_ALLOW_INSECURE: "yes",
+        [name]: value,
+      });
+    expect(withEnv("HISTORY_IMPORT_MAX_ROUNDS", "many")).toThrow(ConfigError);
+    expect(withEnv("HISTORY_IMPORT_BATCH_COUNT", "0")).toThrow(ConfigError);
+    expect(withEnv("HISTORY_IMPORT_TIME_BUDGET_MS", "-5")).toThrow(ConfigError);
+  });
+
+  it("enforces the effort bounds (SA-L1)", () => {
+    const withEnv = (name: string, value: string) => () =>
+      loadConfig({
+        ...BASE_ENV,
+        WA_SESSION_ALLOW_INSECURE: "yes",
+        [name]: value,
+      });
+    expect(withEnv("HISTORY_IMPORT_BATCH_COUNT", "501")).toThrow(/between 1 and 500/);
+    expect(withEnv("HISTORY_IMPORT_MAX_ROUNDS", "101")).toThrow(/between 1 and 100/);
+    expect(withEnv("HISTORY_IMPORT_MAX_MESSAGES", "20001")).toThrow(
+      /between 1 and 20000/,
+    );
+  });
+
+  it("enforces the staleness invariant (SA-L1)", () => {
+    // timeBudget (580000) + roundTimeout (30000) would reach the stale
+    // threshold (600000): fail fast with a clear message.
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        WA_SESSION_ALLOW_INSECURE: "yes",
+        HISTORY_IMPORT_TIME_BUDGET_MS: "580000",
+      }),
+    ).toThrow(/staleness invariant/);
+    // 500000 + 30000 < 600000: fine.
+    const ok = loadConfig({
+      ...BASE_ENV,
+      WA_SESSION_ALLOW_INSECURE: "yes",
+      HISTORY_IMPORT_TIME_BUDGET_MS: "500000",
+    });
+    expect(ok.historyImport.timeBudgetMs).toBe(500000);
+  });
+});
+
 describe("isInsideRoot", () => {
   it("detects the root itself and nested paths", () => {
     expect(isInsideRoot(REPO_ROOT, REPO_ROOT)).toBe(true);
