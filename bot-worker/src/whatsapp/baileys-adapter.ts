@@ -14,14 +14,18 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { errorReason } from "../lib/errors.js";
 import type { Logger } from "../lib/log.js";
+import { safeChatRef } from "../lib/privacy.js";
 import type {
   AdapterEvent,
   DiscoveredChat,
+  GroupMemberInfo,
   HistoryFetchRequest,
+  ParticipantsAction,
   RawContentKind,
   RawInboundMessage,
   WhatsAppAdapter,
 } from "./adapter.js";
+import { PAIRING_CODE_TTL_MS } from "./adapter.js";
 
 /**
  * The ONLY module that imports `@whiskeysockets/baileys` (architecture
@@ -53,6 +57,13 @@ export interface BaileysAdapterOptions {
    * used instead (no third-party influence on the protocol version).
    */
   checkForUpdates?: boolean;
+  /**
+   * How long a requested pairing code stays latched before a FRESH
+   * pairing flow may start (CR#6). Defaults to the published payload
+   * TTL: once the dashboard shows the code as expired, the adapter must
+   * not dead-end linking on the stale latch.
+   */
+  pairingCodeTtlMs?: number;
   log: Logger;
 }
 
@@ -193,6 +204,8 @@ export function mapWAMessage(message: WAMessage): RawInboundMessage | null {
     chatJid,
     messageId: stringOrNull(key?.id),
     senderJid: stringOrNull(key?.participant),
+    // WhatsApp push name of the sender (PII, display only; ADR 0008).
+    senderName: stringOrNull(message.pushName),
     timestampSec: toUnixSeconds(message.messageTimestamp),
     fromMe: key?.fromMe === true,
     text: null,
@@ -346,6 +359,42 @@ export function classifyClose(statusCode: number | undefined): {
   }
 }
 
+/**
+ * Maps one GroupMetadata participants list to roster entries (ADR
+ * 0008). Names prefer the participant's own push name (`notify`), then
+ * the locally saved name, then the verified business name; missing
+ * names stay null (a sync must never fail because of a name). Admin =
+ * the `admin` role field or the legacy `isAdmin` flag.
+ */
+export function mapGroupParticipants(
+  participants: ReadonlyArray<{
+    id?: string | null;
+    name?: string | null;
+    notify?: string | null;
+    verifiedName?: string | null;
+    admin?: string | null;
+    isAdmin?: boolean;
+  }>,
+): GroupMemberInfo[] {
+  const members: GroupMemberInfo[] = [];
+  for (const participant of participants) {
+    const userId = stringOrNull(participant.id);
+    if (userId === null) continue;
+    members.push({
+      userId,
+      name:
+        stringOrNull(participant.notify) ??
+        stringOrNull(participant.name) ??
+        stringOrNull(participant.verifiedName),
+      isAdmin:
+        participant.admin === "admin" ||
+        participant.admin === "superadmin" ||
+        participant.isAdmin === true,
+    });
+  }
+  return members;
+}
+
 /** Best-effort status code from a Boom-wrapped disconnect error. */
 function disconnectStatusCode(error: unknown): number | undefined {
   if (typeof error !== "object" || error === null) return undefined;
@@ -393,6 +442,41 @@ export function classifyHistoryCorrelation(
 ): "match" | "missing-session-id" | "unknown-session-id" {
   if (sessionId === null) return "missing-session-id";
   return knownRequestIds.has(sessionId) ? "match" : "unknown-session-id";
+}
+
+/**
+ * True when a previously requested pairing code is older than its TTL
+ * (CR#6): the published payload has expired, so the latch must release
+ * and a fresh pairing flow may start. `requestedAt === null` means no
+ * pairing code was requested yet — never "expired".
+ */
+export function pairingFlowExpired(
+  requestedAt: number | null,
+  now: number,
+  ttlMs: number,
+): boolean {
+  return requestedAt !== null && now - requestedAt >= ttlMs;
+}
+
+/**
+ * Maps the WhatsApp participant-action taxonomy
+ * (`add|remove|promote|demote|modify`, verified in
+ * Types/GroupMetadata.d.ts) onto the internal one; unknown values fall
+ * back to "modify" (the service refreshes the roster for every action,
+ * so an unknown action is safe).
+ */
+export function normalizeParticipantsAction(
+  action: string | null | undefined,
+): ParticipantsAction {
+  switch (action) {
+    case "add":
+    case "remove":
+    case "promote":
+    case "demote":
+      return action;
+    default:
+      return "modify";
+  }
 }
 
 /**
@@ -445,6 +529,7 @@ export class BaileysAdapter implements WhatsAppAdapter {
   private readonly handlers = new Set<(event: AdapterEvent) => void>();
   private stopping = false;
   private pairingRequested = false;
+  private pairingRequestedAt: number | null = null;
   private pairingCodeFailed = false;
   private saveCreds: (() => Promise<void>) | null = null;
   /**
@@ -494,6 +579,7 @@ export class BaileysAdapter implements WhatsAppAdapter {
   async connect(): Promise<void> {
     this.stopping = false;
     this.pairingRequested = false;
+    this.pairingRequestedAt = null;
     this.pairingCodeFailed = false;
     const silentLogger = createSilentLogger();
 
@@ -582,6 +668,9 @@ export class BaileysAdapter implements WhatsAppAdapter {
     this.socket.ev.on("groups.update", (updates) => {
       for (const update of updates) this.onGroupUpdate(update);
     });
+    this.socket.ev.on("group-participants.update", (update) => {
+      this.onParticipantsUpdate(update);
+    });
     this.socket.ev.on("messaging-history.set", (set) => {
       this.onHistorySet(set);
     });
@@ -607,14 +696,39 @@ export class BaileysAdapter implements WhatsAppAdapter {
   async fetchChats(): Promise<DiscoveredChat[]> {
     const socket = this.socket;
     if (socket === null) throw new Error("not connected");
+    // groupFetchAllParticipating returns full GroupMetadata per chat —
+    // including the participants roster (verified in the installed
+    // 6.7.24 types: GroupMetadata.participants: GroupParticipant[]).
     const participating = await socket.groupFetchAllParticipating();
     const chats: DiscoveredChat[] = [];
     for (const [jid, metadata] of Object.entries(participating)) {
       if (!jid.endsWith("@g.us")) continue;
       const name = stringOrNull(metadata?.subject) ?? jid;
-      chats.push({ chatJid: jid, name });
+      const members = mapGroupParticipants(metadata?.participants ?? []);
+      chats.push({ chatJid: jid, name, members });
     }
     return chats;
+  }
+
+  /**
+   * Current roster for ONE chat via `groupMetadata(jid)`
+   * (verified: `(jid: string) => Promise<GroupMetadata>`). Best-effort:
+   * an unavailable metadata yields [] (never an error) so roster syncs
+   * can never fail the surrounding flows (ADR 0008).
+   */
+  async fetchRoster(chatJid: string): Promise<GroupMemberInfo[]> {
+    const socket = this.socket;
+    if (socket === null) return [];
+    try {
+      const metadata = await socket.groupMetadata(chatJid);
+      return mapGroupParticipants(metadata?.participants ?? []);
+    } catch (error) {
+      this.options.log("warn", "roster_fetch_failed", {
+        chatRef: safeChatRef(chatJid),
+        reason: errorReason(error),
+      });
+      return [];
+    }
   }
 
   /**
@@ -671,6 +785,39 @@ export class BaileysAdapter implements WhatsAppAdapter {
     }
   }
 
+  /**
+   * Admin logout (ADR 0008). Verified Baileys surface:
+   * `logout(msg?: string) => Promise<void>` (Socket/socket.js:327) sends
+   * `remove-companion-device` — revoking the linked device server-side —
+   * then ends the socket with a `loggedOut` close. It does NOT delete
+   * the local auth state: the CALLER purges the session files after this
+   * resolves or times out (session-control, M-1), so a stalled network
+   * can never retain credentials. Idempotent.
+   */
+  async logout(): Promise<void> {
+    this.stopping = true;
+    const socket = this.socket;
+    this.socket = null;
+    if (socket !== null) {
+      try {
+        await socket.logout();
+      } catch (error) {
+        this.options.log("warn", "remote_logout_failed", {
+          reason: errorReason(error),
+        });
+        try {
+          socket.end(undefined);
+        } catch {
+          // Already closed; nothing to release.
+        }
+      }
+    }
+    // Disable credential saves so a late creds.update cannot re-create
+    // auth files while the caller purges them.
+    this.saveCreds = null;
+    await this.saveChain;
+  }
+
   private onHistorySet(set: HistorySetPayload): void {
     if (this.stopping) return;
     // Nothing requested: history arriving from bulk sync must never be
@@ -724,10 +871,18 @@ export class BaileysAdapter implements WhatsAppAdapter {
       phoneNumber !== "" &&
       !this.pairingCodeFailed
     ) {
-      // Pairing-code linking (stretch, ADR 0004): request the code once
-      // and show it instead of the QR.
+      // Pairing-code linking (stretch, ADR 0004): request the code and
+      // show it instead of the QR. CR#6: the latch expires with the
+      // published code — a QR arriving past the TTL starts a FRESH
+      // pairing flow instead of dead-ending on a stale one.
+      const ttlMs = this.options.pairingCodeTtlMs ?? PAIRING_CODE_TTL_MS;
+      if (pairingFlowExpired(this.pairingRequestedAt, Date.now(), ttlMs)) {
+        this.pairingRequested = false;
+        this.pairingRequestedAt = null;
+      }
       if (this.pairingRequested) return;
       this.pairingRequested = true;
+      this.pairingRequestedAt = Date.now();
       void this.requestPairingCode(phoneNumber, qr);
       return;
     }
@@ -782,7 +937,26 @@ export class BaileysAdapter implements WhatsAppAdapter {
     if (chatJid === null || name === null || !chatJid.endsWith("@g.us")) {
       return;
     }
-    this.emit({ type: "chat-updated", chat: { chatJid, name } });
+    this.emit({ type: "chat-updated", chat: { chatJid, name, members: [] } });
+  }
+
+  private onParticipantsUpdate(update: {
+    id?: string | null;
+    participants?: string[] | null;
+    action?: string | null;
+  }): void {
+    if (this.stopping) return;
+    const chatJid = stringOrNull(update.id);
+    if (chatJid === null || !chatJid.endsWith("@g.us")) return;
+    const participants = (update.participants ?? [])
+      .map((jid) => stringOrNull(jid))
+      .filter((jid): jid is string => jid !== null);
+    this.emit({
+      type: "participants",
+      chatJid,
+      action: normalizeParticipantsAction(update.action),
+      participants,
+    });
   }
 
   private async resolveVersion(): Promise<WAVersion | undefined> {

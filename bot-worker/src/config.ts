@@ -77,6 +77,11 @@ export interface BotConfig {
   linkingDisplay: "tty" | "none";
   /** History-import budget knobs (ADR 0007); bounded best-effort. */
   historyImport: HistoryImportSettings;
+  /**
+   * Session-control poll interval (SESSION_CONTROL_POLL_MS, default
+   * 3000, floor 1000): how often the admin logout flag is checked.
+   */
+  sessionControlPollMs: number;
   logLevel: LogLevel;
   backoff: BackoffPolicy;
 }
@@ -284,6 +289,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
     );
   }
 
+  // ---- Session control (ADR 0008): admin logout flag polling ----
+  let sessionControlPollMs = parseBudgetInt(
+    env,
+    "SESSION_CONTROL_POLL_MS",
+    3_000,
+  );
+  // Same hard floor as the other pollers: below 1000ms the database is
+  // polled pointlessly.
+  if (sessionControlPollMs < 1_000) sessionControlPollMs = 1_000;
+
   return {
     databaseUrl,
     sessionDir,
@@ -293,6 +308,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
     checkForUpdates,
     linkingDisplay,
     historyImport,
+    sessionControlPollMs,
     logLevel,
     backoff: DEFAULT_BACKOFF,
   };

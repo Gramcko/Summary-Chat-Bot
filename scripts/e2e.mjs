@@ -571,6 +571,10 @@ function backendEnv(port, trustedProxies, extraEnv = {}) {
     // (their run-count assertions must not race a background pass);
     // scenarioScheduler() restarts the backend with it enabled.
     SCHEDULER_ENABLED: "false",
+    // Worker supervision is OFF: this script starts its own summary-worker
+    // child for determinism (and never runs bot-worker), so the backend
+    // must not spawn either (docs/decisions/0008 round 3).
+    SUPERVISE_WORKERS: "false",
     ENCRYPTION_KEY: encryptionKey,
     TRUSTED_PROXIES: trustedProxies,
     ...extraEnv,

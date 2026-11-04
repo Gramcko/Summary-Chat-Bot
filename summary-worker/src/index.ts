@@ -18,6 +18,7 @@ import { PostgresWorkerDb } from "./db.js";
 import { CryptoError, parseEncryptionKey } from "./lib/crypto.js";
 import { loadRepoEnv } from "./lib/load-env.js";
 import { createLogger } from "./lib/log.js";
+import { startParentWatchdog } from "./lib/parent-watchdog.js";
 import {
   DEFAULT_MAX_CHUNKS_PER_RUN,
   DEFAULT_MAX_MESSAGES_PER_RUN,
@@ -247,5 +248,23 @@ async function shutdown(signal: string): Promise<void> {
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     void shutdown(signal);
+  });
+}
+
+// Parent-PID watchdog (fix round A): when the backend supervises us
+// (SUMMARLY_PARENT_PID), a vanished parent — e.g. a force-killed
+// backend on Windows, where nothing cascades to children — triggers
+// our graceful shutdown instead of an orphaned worker. Standalone runs
+// (no env var) are unaffected. The bot-worker adopts the same watchdog
+// in round B.
+const parentPidRaw = process.env["SUMMARLY_PARENT_PID"]?.trim();
+const parentPid =
+  parentPidRaw === undefined || parentPidRaw === ""
+    ? Number.NaN
+    : Number(parentPidRaw);
+if (Number.isInteger(parentPid) && parentPid > 0) {
+  startParentWatchdog({
+    pid: parentPid,
+    onParentGone: () => void shutdown("parent_gone"),
   });
 }

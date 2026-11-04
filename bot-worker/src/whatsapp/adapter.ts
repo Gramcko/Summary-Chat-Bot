@@ -36,6 +36,11 @@ export interface RawInboundMessage {
   messageId: string | null;
   /** Sender participant JID; null when WhatsApp did not provide one. */
   senderJid: string | null;
+  /**
+   * Sender's WhatsApp push name when the message carried one (PII,
+   * display only — persisted as messages.sender_name). Null when absent.
+   */
+  senderName: string | null;
   /** Unix seconds (WhatsApp messageTimestamp); null when absent/invalid. */
   timestampSec: number | null;
   /** True for messages sent by the linked account itself. */
@@ -49,12 +54,50 @@ export interface RawInboundMessage {
   linkPreview: boolean;
 }
 
+/**
+ * Linking-payload TTLs published to `whatsapp_connections` (ADR 0008).
+ * A Baileys QR rotates roughly every 20 s but may stay valid longer, so
+ * the published expiry is a conservative ~60 s; pairing codes live a
+ * few minutes (documented as such by WhatsApp) and get 5 minutes. The
+ * pairing TTL also bounds how long the adapter waits before starting a
+ * FRESH pairing flow (CR#6): an expired code must not dead-end linking.
+ */
+export const LINKING_QR_TTL_MS = 60_000;
+export const PAIRING_CODE_TTL_MS = 300_000;
+
+/**
+ * One roster entry of a group chat (ADR 0008): participant JID + push
+ * name when known + admin flag. Best-effort data — WhatsApp does not
+ * replay membership history.
+ */
+export interface GroupMemberInfo {
+  /** Participant JID (may be an `@lid` or `@s.whatsapp.net` form). */
+  userId: string;
+  /** Push name when WhatsApp provided one; null otherwise. */
+  name: string | null;
+  isAdmin: boolean;
+}
+
 /** A group chat the linked account participates in. */
 export interface DiscoveredChat {
   chatJid: string;
   /** Group subject (name). May fall back to the JID when unset. */
   name: string;
+  /**
+   * Roster snapshot from the group metadata (ADR 0008, best-effort).
+   * Empty when the metadata carried no participants — never treated as
+   * "this group has no members" (see db.syncGroupMembers).
+   */
+  members: GroupMemberInfo[];
 }
+
+/** Participant-change actions (mirror of the WhatsApp event taxonomy). */
+export type ParticipantsAction =
+  | "add"
+  | "remove"
+  | "promote"
+  | "demote"
+  | "modify";
 
 /**
  * History-import cursor (ADR 0007): the oldest message already held, so
@@ -95,6 +138,17 @@ export type AdapterEvent =
   | { type: "messages"; messages: RawInboundMessage[] }
   /** A group's metadata changed (e.g. subject renamed). */
   | { type: "chat-updated"; chat: DiscoveredChat }
+  /**
+   * A group's roster changed (join/leave/promote/demote). The service
+   * refreshes that chat's roster via `fetchRoster` (ADR 0008).
+   */
+  | {
+      type: "participants";
+      chatJid: string;
+      action: ParticipantsAction;
+      /** Affected participant JIDs (identifiers; never logged). */
+      participants: string[];
+    }
   /**
    * Fetched history for ONE chat (ADR 0007). Emits only messages for
    * chats with an outstanding history request — WhatsApp may return
@@ -137,6 +191,21 @@ export interface WhatsAppAdapter {
    * ("ignore stale history events", ADR 0007).
    */
   releaseHistoryChat(chatJid: string): void;
+  /**
+   * Full current roster for ONE chat (group metadata). Best-effort:
+   * returns [] when the metadata is unavailable; callers must treat an
+   * empty roster as "no data", never as "the group is empty" (ADR 0008).
+   */
+  fetchRoster(chatJid: string): Promise<GroupMemberInfo[]>;
+  /**
+   * Ends the session (admin logout control, ADR 0008): revokes the
+   * linked device remotely when connected and closes the socket. The
+   * CALLER purges the local auth-state files (`purgeSessionDir`) — it
+   * owns that step so it always runs even when this call stalls (M-1
+   * bounds it with a timeout). Idempotent — a missing socket is not an
+   * error.
+   */
+  logout(): Promise<void>;
   /** Subscribes to adapter events; returns an unsubscribe function. */
   subscribe(handler: (event: AdapterEvent) => void): () => void;
 }

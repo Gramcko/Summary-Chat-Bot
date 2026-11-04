@@ -4,8 +4,11 @@ import {
   classifyClose,
   classifyHistoryCorrelation,
   isIgnoredIncomingJid,
+  mapGroupParticipants,
   mapHistorySet,
   mapWAMessage,
+  normalizeParticipantsAction,
+  pairingFlowExpired,
 } from "../src/whatsapp/baileys-adapter.js";
 
 /**
@@ -72,6 +75,7 @@ describe("mapWAMessage (content classification)", () => {
       chatJid: KEY.remoteJid,
       messageId: "MSG-ID-1",
       senderJid: "sender@s.whatsapp.net",
+      senderName: null,
       timestampSec: 1_772_000_000,
       fromMe: false,
       kind: "text",
@@ -79,6 +83,18 @@ describe("mapWAMessage (content classification)", () => {
       caption: null,
       linkPreview: false,
     });
+  });
+
+  it("maps the WhatsApp push name into senderName (ADR 0008)", () => {
+    const mapped = mapWAMessage(
+      wa({
+        key: KEY,
+        messageTimestamp: 1_772_000_000,
+        pushName: "Alice",
+        message: { conversation: "hello" },
+      }),
+    );
+    expect(mapped?.senderName).toBe("Alice");
   });
 
   it("maps extendedTextMessage without preview to kind text", () => {
@@ -484,5 +500,77 @@ describe("classifyHistoryCorrelation (SA-M3, log-only)", () => {
     expect(classifyHistoryCorrelation("req-1", new Set())).toBe(
       "unknown-session-id",
     );
+  });
+});
+
+describe("mapGroupParticipants (ADR 0008 roster mapping)", () => {
+  it("prefers the push name, then the saved name, then the verified name", () => {
+    expect(
+      mapGroupParticipants([
+        {
+          id: "1@s.whatsapp.net",
+          notify: "Push",
+          name: "Saved",
+          verifiedName: "Biz",
+        },
+        { id: "2@s.whatsapp.net", name: "Saved", verifiedName: "Biz" },
+        { id: "3@s.whatsapp.net", verifiedName: "Biz" },
+        { id: "4@s.whatsapp.net" },
+      ]),
+    ).toEqual([
+      { userId: "1@s.whatsapp.net", name: "Push", isAdmin: false },
+      { userId: "2@s.whatsapp.net", name: "Saved", isAdmin: false },
+      { userId: "3@s.whatsapp.net", name: "Biz", isAdmin: false },
+      { userId: "4@s.whatsapp.net", name: null, isAdmin: false },
+    ]);
+  });
+
+  it("maps admin flags from the role field and the legacy flag", () => {
+    expect(
+      mapGroupParticipants([
+        { id: "1@g.us", admin: "admin" },
+        { id: "2@g.us", admin: "superadmin" },
+        { id: "3@g.us", isAdmin: true },
+        { id: "4@g.us", admin: null },
+      ]).map((member) => member.isAdmin),
+    ).toEqual([true, true, true, false]);
+  });
+
+  it("skips participants without an id and tolerates missing names", () => {
+    expect(mapGroupParticipants([{ name: "Anon" }])).toEqual([]);
+    expect(mapGroupParticipants([])).toEqual([]);
+  });
+});
+
+describe("normalizeParticipantsAction", () => {
+  it("maps the WhatsApp taxonomy and defaults to modify", () => {
+    expect(normalizeParticipantsAction("add")).toBe("add");
+    expect(normalizeParticipantsAction("remove")).toBe("remove");
+    expect(normalizeParticipantsAction("promote")).toBe("promote");
+    expect(normalizeParticipantsAction("demote")).toBe("demote");
+    expect(normalizeParticipantsAction("modify")).toBe("modify");
+    expect(normalizeParticipantsAction("something-new")).toBe("modify");
+    expect(normalizeParticipantsAction(undefined)).toBe("modify");
+    expect(normalizeParticipantsAction(null)).toBe("modify");
+  });
+});
+
+describe("pairingFlowExpired (CR#6 pairing-code re-arm)", () => {
+  const now = 1_000_000;
+  const ttl = 300_000;
+
+  it("is never expired before a pairing code was requested", () => {
+    expect(pairingFlowExpired(null, now, ttl)).toBe(false);
+  });
+
+  it("stays latched while the code is fresh", () => {
+    expect(pairingFlowExpired(now - 299_000, now, ttl)).toBe(false);
+    expect(pairingFlowExpired(now - 1, now, ttl)).toBe(false);
+    expect(pairingFlowExpired(now, now, ttl)).toBe(false);
+  });
+
+  it("releases the latch once the code is older than its TTL", () => {
+    expect(pairingFlowExpired(now - 300_000, now, ttl)).toBe(true);
+    expect(pairingFlowExpired(now - 400_000, now, ttl)).toBe(true);
   });
 });

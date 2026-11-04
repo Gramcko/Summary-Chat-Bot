@@ -1,20 +1,145 @@
 import type { FastifyInstance } from "fastify";
 import {
+  ApiMessagePage,
   Group,
+  GroupMember,
   Id,
+  IsoDateTime,
   UpdateGroupRequest,
 } from "@summarly/contracts";
 import { z } from "zod";
 import { HttpError } from "../lib/errors.js";
-import type { Store } from "../lib/store.js";
+import {
+  decodeMessageCursor,
+  encodeMessageCursor,
+  type Store,
+} from "../lib/store.js";
 
 const GroupParams = z.object({ id: Id });
+
+/** Messages query (ADR 0008): optional half-open date range + paging. */
+const MessagesQuery = z.object({
+  from: IsoDateTime.optional(),
+  to: IsoDateTime.optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  cursor: z.string().max(400).optional(),
+});
+
+const SummariesQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+});
+
+const DEFAULT_MESSAGES_LIMIT = 50;
+const DEFAULT_SUMMARIES_LIMIT = 20;
 
 export function registerGroupRoutes(
   app: FastifyInstance,
   store: Store,
 ): void {
   app.get("/api/groups", async () => store.listGroups());
+
+  /** Single group (the group detail screen). */
+  app.get("/api/groups/:id", async (request) => {
+    const { id } = GroupParams.parse(request.params);
+    const group = await store.getGroup(id);
+    if (group === undefined) {
+      throw new HttpError(404, "not_found", "Group not found.");
+    }
+    return group;
+  });
+
+  /**
+   * Members of the group's chat (ADR 0008): best-effort roster
+   * snapshots maintained by the bot-worker. Names/JIDs are PII — this
+   * is the authenticated API, the same one that already serves
+   * messages. MONITORED GROUPS ONLY (fix round B, audit H-1): a roster
+   * is only ever collected for a group the admin opted in, so only a
+   * monitored group can serve one — same privacy boundary and same 409
+   * style as the history import below.
+   */
+  app.get("/api/groups/:id/members", async (request) => {
+    const { id } = GroupParams.parse(request.params);
+    const group = await store.getGroup(id);
+    if (group === undefined) {
+      throw new HttpError(404, "not_found", "Group not found.");
+    }
+    if (!group.monitored) {
+      throw new HttpError(409, "conflict", "Group is not monitored.");
+    }
+    if (group.chatId === null) {
+      // No discovered chat yet: an empty roster, not an error.
+      return [] satisfies GroupMember[];
+    }
+    return store.listGroupMembers(group.chatId);
+  });
+
+  /**
+   * Chat history as a paginated, newest-first message list (ADR 0008).
+   * The dashboard renders it like a chat; `from`/`to` filter the
+   * half-open instant range [from, to). `cursor` is the previous
+   * page's `nextCursor`. The envelope is `ApiMessagePage`.
+   */
+  app.get("/api/groups/:id/messages", async (request) => {
+    const { id } = GroupParams.parse(request.params);
+    const query = MessagesQuery.parse(request.query);
+    const group = await store.getGroup(id);
+    if (group === undefined) {
+      throw new HttpError(404, "not_found", "Group not found.");
+    }
+    if (
+      query.from !== undefined &&
+      query.to !== undefined &&
+      Date.parse(query.from) >= Date.parse(query.to)
+    ) {
+      throw new HttpError(
+        400,
+        "validation_error",
+        "Invalid range: `from` must be an instant before `to`.",
+      );
+    }
+    if (query.cursor !== undefined && decodeMessageCursor(query.cursor) === undefined) {
+      throw new HttpError(400, "validation_error", "Invalid cursor.");
+    }
+    if (group.chatId === null) {
+      return { items: [], nextCursor: null } satisfies ApiMessagePage;
+    }
+    const limit = query.limit ?? DEFAULT_MESSAGES_LIMIT;
+    // Fetch one extra row (fix round A, m1): `nextCursor` must be
+    // emitted ONLY when another page truly exists — an exact-multiple
+    // page size must not produce a dangling cursor that resolves to an
+    // empty page.
+    const fetched = await store.listGroupMessages(group.chatId, {
+      from: query.from,
+      to: query.to,
+      limit: limit + 1,
+      cursor: query.cursor,
+    });
+    const items = fetched.slice(0, limit);
+    const hasMore = fetched.length > limit;
+    const last = items[items.length - 1];
+    return {
+      items,
+      nextCursor:
+        hasMore && last !== undefined
+          ? encodeMessageCursor({ sentAt: last.sentAt, id: last.id })
+          : null,
+    } satisfies ApiMessagePage;
+  });
+
+  /** Past summaries of the group, newest first (period + provider/model). */
+  app.get("/api/groups/:id/summaries", async (request) => {
+    const { id } = GroupParams.parse(request.params);
+    const query = SummariesQuery.parse(request.query);
+    const group = await store.getGroup(id);
+    if (group === undefined) {
+      throw new HttpError(404, "not_found", "Group not found.");
+    }
+    // Summaries join by GROUP id (runs belong to groups): a group with
+    // no discovered chat can still have scheduled runs.
+    return store.listGroupSummaries(id, {
+      limit: query.limit ?? DEFAULT_SUMMARIES_LIMIT,
+    });
+  });
 
   app.patch("/api/groups/:id", async (request) => {
     const { id } = GroupParams.parse(request.params);

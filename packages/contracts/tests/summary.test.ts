@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SummaryResult } from "../src/index.js";
+import { GroupSummary, SummaryResult } from "../src/index.js";
 
 const valid = {
   overview: "The group planned the launch.",
@@ -80,5 +80,33 @@ describe("SummaryResult (validated provider output)", () => {
     const bad = { ...valid } as Record<string, unknown>;
     delete bad["overview"];
     expect(SummaryResult.safeParse(bad).success).toBe(false);
+  });
+});
+
+
+describe("GroupSummary (past summaries list, ADR 0008)", () => {
+  const item = {
+    id: "4f9d2b6a-1c31-4a2f-9a3e-9c0a1b2c3d4e",
+    runId: "9a2b7c60-2f44-4a63-9c31-7b1f0d8e5a21",
+    provider: "mock",
+    model: "mock-1",
+    result: valid,
+    createdAt: "2026-11-01T10:00:00Z",
+    interval: {
+      start: "2026-10-31T23:00:00.000Z",
+      end: "2026-11-01T23:00:00.000Z",
+      timezone: "Europe/Madrid",
+    },
+  };
+
+  it("carries the run interval alongside the summary", () => {
+    const parsed = GroupSummary.parse(item);
+    expect(parsed.interval.timezone).toBe("Europe/Madrid");
+    expect(parsed.provider).toBe("mock");
+    expect(parsed.model).toBe("mock-1");
+  });
+
+  it("requires the interval", () => {
+    expect(GroupSummary.safeParse({ ...item, interval: undefined }).success).toBe(false);
   });
 });

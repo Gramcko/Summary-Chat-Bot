@@ -183,6 +183,47 @@ describe("loadConfig: history-import budgets (ADR 0007)", () => {
   });
 });
 
+describe("loadConfig: session-control poll (ADR 0008)", () => {
+  it("defaults to 3000ms and floors at 1000ms", () => {
+    const defaults = loadConfig({
+      ...BASE_ENV,
+      WA_SESSION_ALLOW_INSECURE: "yes",
+    });
+    expect(defaults.sessionControlPollMs).toBe(3000);
+
+    const floored = loadConfig({
+      ...BASE_ENV,
+      WA_SESSION_ALLOW_INSECURE: "yes",
+      SESSION_CONTROL_POLL_MS: "500",
+    });
+    expect(floored.sessionControlPollMs).toBe(1000);
+
+    const custom = loadConfig({
+      ...BASE_ENV,
+      WA_SESSION_ALLOW_INSECURE: "yes",
+      SESSION_CONTROL_POLL_MS: "7000",
+    });
+    expect(custom.sessionControlPollMs).toBe(7000);
+  });
+
+  it("rejects invalid values", () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        WA_SESSION_ALLOW_INSECURE: "yes",
+        SESSION_CONTROL_POLL_MS: "often",
+      }),
+    ).toThrow(ConfigError);
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        WA_SESSION_ALLOW_INSECURE: "yes",
+        SESSION_CONTROL_POLL_MS: "0",
+      }),
+    ).toThrow(ConfigError);
+  });
+});
+
 describe("isInsideRoot", () => {
   it("detects the root itself and nested paths", () => {
     expect(isInsideRoot(REPO_ROOT, REPO_ROOT)).toBe(true);

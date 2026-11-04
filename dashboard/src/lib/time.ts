@@ -204,6 +204,41 @@ export function formatDateTime(iso: string, timeZone?: string): string {
   }
 }
 
+/** Day heading for the chat view (`Mon, 3 Nov 2026`), optionally in a zone. */
+export function formatDayHeading(iso: string, timeZone?: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const options: Intl.DateTimeFormatOptions = {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  };
+  try {
+    return new Intl.DateTimeFormat(
+      undefined,
+      timeZone === undefined ? options : { ...options, timeZone },
+    ).format(date);
+  } catch {
+    return new Intl.DateTimeFormat(undefined, options).format(date);
+  }
+}
+
+/** Clock time (`14:05`), optionally in a zone, for chat timestamps. */
+export function formatTimeOnly(iso: string, timeZone?: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  const options: Intl.DateTimeFormatOptions = { timeStyle: "short" };
+  try {
+    return new Intl.DateTimeFormat(
+      undefined,
+      timeZone === undefined ? options : { ...options, timeZone },
+    ).format(date);
+  } catch {
+    return new Intl.DateTimeFormat(undefined, options).format(date);
+  }
+}
+
 /** Human readable half-open interval, rendered in the run's own time zone. */
 export function formatInterval(interval: {
   start: string;

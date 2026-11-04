@@ -25,7 +25,11 @@ import {
 /** A message row as needed for summarization (never logged). */
 export interface StoredMessage {
   id: string;
-  /** sender_id, or "unknown" when WhatsApp did not provide one. */
+  /**
+   * Sender DISPLAY NAME (WhatsApp push name), or "unknown" when the
+   * message carried none — NEVER the phone-bearing JID (fix round A,
+   * audit M-5: identity for attribution travels in sourceRefs only).
+   */
   sender: string;
   /** ISO 8601 timestamp with offset. */
   sentAt: string;
@@ -113,6 +117,7 @@ type RunRow = QueryResultRow & {
   end_at: Date;
   timezone: string;
   attempts: number;
+  instructions: string | null;
   error_code: string | null;
   error_message: string | null;
   created_at: Date;
@@ -123,7 +128,8 @@ type RunWithGroupRow = RunRow & { group_name: string };
 
 type MessageRow = QueryResultRow & {
   id: string;
-  sender_id: string | null;
+  /** COALESCE(sender_name, 'unknown') — display name, never the JID. */
+  sender: string;
   sent_at: Date;
   body: string;
 };
@@ -146,12 +152,12 @@ type ProviderConfigRow = QueryResultRow & {
 
 const RUN_COLUMNS =
   "id, group_id, kind, status, start_at, end_at, timezone, " +
-  "attempts, error_code, error_message, created_at, updated_at";
+  "attempts, instructions, error_code, error_message, created_at, updated_at";
 
 /** Same columns qualified for queries that alias summary_runs as `r`. */
 const RUN_COLUMNS_R =
   "r.id, r.group_id, r.kind, r.status, r.start_at, r.end_at, r.timezone, " +
-  "r.attempts, r.error_code, r.error_message, r.created_at, r.updated_at";
+  "r.attempts, r.instructions, r.error_code, r.error_message, r.created_at, r.updated_at";
 
 const SUMMARY_COLUMNS = "id, run_id, provider, model, result, created_at";
 
@@ -167,6 +173,7 @@ function toSummaryRun(row: RunRow): SummaryRun {
       timezone: row.timezone,
     },
     attempts: row.attempts,
+    instructions: row.instructions,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
     error:
@@ -179,7 +186,8 @@ function toSummaryRun(row: RunRow): SummaryRun {
 function toStoredMessage(row: MessageRow): StoredMessage {
   return {
     id: row.id,
-    sender: row.sender_id ?? "unknown",
+    // Already COALESCE'd in SQL (display name, never the JID).
+    sender: row.sender,
     sentAt: row.sent_at.toISOString(),
     text: row.body,
   };
@@ -223,7 +231,12 @@ export class PostgresWorkerDb implements WorkerDb {
     // insertion/visibility timing. LIMIT $4 bounds the rows returned
     // (LIMIT NULL = unbounded) — audit M3/E-4.
     const result = await this.pool.query<MessageRow>(
-      `SELECT m.id, m.sender_id, m.sent_at, m.body
+      // Sender as DISPLAY NAME (fix round A, audit M-5): the phone-
+      // bearing JID (sender_id) never reaches the AI provider —
+      // attribution happens through sourceRefs (message ids) instead.
+      // A captured message without a push name becomes "unknown".
+      `SELECT m.id, COALESCE(m.sender_name, 'unknown') AS sender,
+              m.sent_at, m.body
        FROM messages m
        JOIN groups g ON g.chat_id = m.chat_id
        WHERE g.id = $1 AND m.sent_at >= $2 AND m.sent_at < $3

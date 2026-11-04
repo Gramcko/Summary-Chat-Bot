@@ -23,6 +23,8 @@ const FIELD_NAMES = ["timezone", "summaryTime"] as const;
 interface GroupSettingsCardProps {
   group: Group;
   onSaved: (group: Group) => void;
+  /** Render the card's own header (name, id, monitored badge). */
+  showHeader?: boolean;
 }
 
 interface ActionError {
@@ -32,7 +34,11 @@ interface ActionError {
   retryImport: boolean;
 }
 
-export function GroupSettingsCard({ group, onSaved }: GroupSettingsCardProps) {
+export function GroupSettingsCard({
+  group,
+  onSaved,
+  showHeader = true,
+}: GroupSettingsCardProps) {
   const baseId = `group-${group.id}`;
   const [timezone, setTimezone] = useState(group.timezone);
   const [summaryTime, setSummaryTime] = useState<string | null>(group.summaryTime);
@@ -201,19 +207,21 @@ export function GroupSettingsCard({ group, onSaved }: GroupSettingsCardProps) {
 
   return (
     <Card>
-      <CardHeader
-        title={group.name}
-        description={
-          <span className="break-all font-mono text-xs text-slate-500">
-            {group.id}
-          </span>
-        }
-        actions={
-          <Badge tone={group.monitored ? "success" : "neutral"} dot>
-            {group.monitored ? "Monitored" : "Not monitored"}
-          </Badge>
-        }
-      />
+      {showHeader ? (
+        <CardHeader
+          title={group.name}
+          description={
+            <span className="break-all font-mono text-xs text-slate-500">
+              {group.id}
+            </span>
+          }
+          actions={
+            <Badge tone={group.monitored ? "success" : "neutral"} dot>
+              {group.monitored ? "Monitored" : "Not monitored"}
+            </Badge>
+          }
+        />
+      ) : null}
       <CardBody>
         <div className="space-y-4">
           <form noValidate onSubmit={handleSubmit} className="space-y-4">

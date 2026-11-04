@@ -86,14 +86,18 @@ export async function seedRun(
     messageIds.push(id);
     await pool.query(
       `INSERT INTO messages
-         (id, connection_id, chat_id, whatsapp_message_id, sender_id, sent_at, body)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+         (id, connection_id, chat_id, whatsapp_message_id, sender_id,
+          sender_name, sent_at, body)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         id,
         connectionId,
         chatId,
         `wa-${index}-${id}`,
-        message.sender ?? "unknown",
+        // Phone-bearing JID (M-5): seeded on purpose so tests can prove
+        // it NEVER reaches the AI input — display names do.
+        `123456789${index}@s.whatsapp.net`,
+        message.sender ?? null,
         new Date(message.sentAt),
         message.text,
       ],

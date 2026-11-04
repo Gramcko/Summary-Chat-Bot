@@ -22,6 +22,7 @@ const INPUT = {
     timezone: "Europe/Madrid",
   },
   messages: [MESSAGE],
+  instructions: null,
 };
 
 const OUTPUT = {
@@ -128,5 +129,37 @@ describe("AiProvider interface", () => {
     };
     const result = await provider.generate(AiSummaryInput.parse(INPUT));
     expect(result.overview).toBe(OUTPUT.overview);
+  });
+});
+
+describe("AiSummaryInput.instructions (custom prompt channel, ADR 0008)", () => {
+  it("is required-but-nullable: null when absent, string when given", () => {
+    // Absent in the parsed sense is not allowed: the field must be
+    // present and null (providers should never guess).
+    expect(AiSummaryInput.safeParse({ ...INPUT, instructions: undefined }).success).toBe(false);
+    expect(AiSummaryInput.safeParse(INPUT).success).toBe(true);
+    const withInstructions = AiSummaryInput.parse({
+      ...INPUT,
+      instructions: "Focus on decisions and ignore chit-chat.",
+    });
+    expect(withInstructions.instructions).toBe(
+      "Focus on decisions and ignore chit-chat.",
+    );
+  });
+
+  it("caps instructions at 2000 characters", () => {
+    expect(
+      AiSummaryInput.safeParse({ ...INPUT, instructions: "x".repeat(2000) })
+        .success,
+    ).toBe(true);
+    expect(
+      AiSummaryInput.safeParse({ ...INPUT, instructions: "x".repeat(2001) })
+        .success,
+    ).toBe(false);
+    // Empty string is allowed at the schema level (the writer trims);
+    // null is the "absent" marker.
+    expect(AiSummaryInput.safeParse({ ...INPUT, instructions: "" }).success).toBe(
+      true,
+    );
   });
 });

@@ -499,6 +499,90 @@ async function main() {
     assert.equal(payload.historyImport.status, "pending");
   });
 
+  await check("GET /api/groups/:id returns the group", async () => {
+    const response = await request(`/api/groups/${groupId}`);
+    assert.equal(response.status, 200, response.text);
+    assert.match(response.text, /"name":"Family Chat"/);
+    assert.match(response.text, /"chatId":/);
+  });
+
+  await check("GET /api/groups/:id returns 404 for an unknown group", async () => {
+    const response = await request(
+      "/api/groups/00000000-0000-4000-8000-000000000000",
+    );
+    assert.equal(response.status, 404, response.text);
+    assert.match(response.text, /"code":"not_found"/);
+  });
+
+  await check("GET /api/groups/:id/members returns the roster", async () => {
+    const response = await request(`/api/groups/${groupId}/members`);
+    assert.equal(response.status, 200, response.text);
+    const members = parseList(response.text);
+    assert.equal(members.length, 3);
+    assert.equal(members[0].isAdmin, true);
+    assert.ok(members.some((member) => member.active === false));
+  });
+
+  await check("member rosters require a monitored group (409)", async () => {
+    const response = await request(`/api/groups/${projectGroupId}/members`);
+    assert.equal(response.status, 409, response.text);
+    assert.match(response.text, /"code":"conflict"/);
+  });
+
+  await check("GET messages returns the newest page with a cursor", async () => {
+    const response = await request(
+      `/api/groups/${groupId}/messages?limit=2`,
+    );
+    assert.equal(response.status, 200, response.text);
+    const page = JSON.parse(response.text);
+    assert.equal(page.items.length, 2);
+    assert.equal(page.items[0].id, "11111111-1111-4111-8111-111111111111");
+    assert.equal(page.nextCursor, "cursor-2");
+  });
+
+  await check("following the message cursor loads older messages", async () => {
+    const response = await request(
+      `/api/groups/${groupId}/messages?limit=2&cursor=cursor-2`,
+    );
+    assert.equal(response.status, 200, response.text);
+    const page = JSON.parse(response.text);
+    assert.equal(page.items.length, 2);
+    assert.equal(page.items[0].id, "33333333-3333-4333-8333-333333333333");
+    assert.equal(page.nextCursor, null);
+  });
+
+  await check("the message range filters on half-open instants", async () => {
+    const response = await request(
+      `/api/groups/${groupId}/messages?from=2026-11-04T00:00:00.000Z&to=2026-11-05T00:00:00.000Z`,
+    );
+    assert.equal(response.status, 200, response.text);
+    assert.equal(JSON.parse(response.text).items.length, 2);
+  });
+
+  await check("an invalid message range is rejected", async () => {
+    const response = await request(
+      `/api/groups/${groupId}/messages?from=2026-11-05T00:00:00.000Z&to=2026-11-04T00:00:00.000Z`,
+    );
+    assert.equal(response.status, 400, response.text);
+    assert.match(response.text, /"code":"validation_error"/);
+  });
+
+  await check("an invalid message cursor is rejected", async () => {
+    const response = await request(
+      `/api/groups/${groupId}/messages?cursor=not-a-cursor`,
+    );
+    assert.equal(response.status, 400, response.text);
+  });
+
+  await check("GET /api/groups/:id/summaries returns past summaries", async () => {
+    const response = await request(`/api/groups/${groupId}/summaries`);
+    assert.equal(response.status, 200, response.text);
+    const summaries = parseList(response.text);
+    assert.equal(summaries.length, 1);
+    assert.match(response.text, /"provider":"openai"/);
+    assert.match(response.text, /"interval":/);
+  });
+
   await check("run request surfaces interval errors", async () => {
     const response = await request("/api/summary-runs", {
       method: "POST",
@@ -535,6 +619,40 @@ async function main() {
       body: { groupId, interval },
     });
     assert.equal(response.status, 200, response.text);
+  });
+
+  await check("run create accepts custom instructions", async () => {
+    const response = await request("/api/summary-runs", {
+      method: "POST",
+      body: {
+        groupId,
+        interval: {
+          start: "2026-10-22T00:00:00.000Z",
+          end: "2026-10-23T00:00:00.000Z",
+          timezone: "Europe/Madrid",
+        },
+        instructions: "Focus on decisions and deadlines; ignore small talk.",
+      },
+    });
+    assert.equal(response.status, 201, response.text);
+    assert.match(response.text, /"instructions":"Focus on decisions/);
+  });
+
+  await check("run create rejects instructions over 2000 characters", async () => {
+    const response = await request("/api/summary-runs", {
+      method: "POST",
+      body: {
+        groupId,
+        interval: {
+          start: "2026-10-24T00:00:00.000Z",
+          end: "2026-10-25T00:00:00.000Z",
+          timezone: "Europe/Madrid",
+        },
+        instructions: "x".repeat(2001),
+      },
+    });
+    assert.equal(response.status, 400, response.text);
+    assert.match(response.text, /"path":"instructions"/);
   });
 
   await check("run list returns items", async () => {
@@ -610,6 +728,8 @@ async function main() {
   const pages = [
     ["/", 200],
     ["/groups", 200],
+    ["/groups/4f9d2b6a-1c31-4a2f-9a3e-9c0a1b2c3d4e", 200],
+    ["/connection", 200],
     ["/runs", 200],
     ["/runs/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", 200],
     ["/settings", 200],
@@ -665,6 +785,33 @@ async function main() {
 
   await check("no backend origin in client bundles", async () => {
     await assertNoBackendOriginInClientBundles();
+  });
+
+  await check("GET /api/connection includes the linking field", async () => {
+    const response = await request("/api/connection");
+    assert.equal(response.status, 200, response.text);
+    const payload = JSON.parse(response.text);
+    assert.ok("linking" in payload, "linking is missing");
+    assert.equal(payload.state, "connected");
+    assert.equal(payload.linking, null);
+  });
+
+  await check("connection unlink returns 202 and is idempotent", async () => {
+    const first = await request("/api/connection/logout", { method: "POST" });
+    assert.equal(first.status, 202, first.text);
+    const second = await request("/api/connection/logout", { method: "POST" });
+    assert.equal(second.status, 202, second.text);
+  });
+
+  await check("the connection publishes a pairing ticket after unlink", async () => {
+    const response = await request("/api/connection");
+    assert.equal(response.status, 200, response.text);
+    const payload = JSON.parse(response.text);
+    assert.equal(payload.state, "connecting");
+    assert.equal(typeof payload.linking.qr, "string");
+    assert.equal(payload.linking.kind, "qr");
+    assert.ok(payload.linking.qr.length > 0);
+    assert.ok(!Number.isNaN(Date.parse(payload.linking.expiresAt)));
   });
 
   await check("logout succeeds", async () => {

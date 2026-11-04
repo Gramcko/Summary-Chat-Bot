@@ -57,6 +57,31 @@ export interface HistoryImportOutcome {
   error: string | null;
 }
 
+/**
+ * The current linking payload (QR or pairing code) with its expiry and
+ * KIND (ADR 0008, CR#6). `qr` is a LIVE PAIRING TICKET: stored for the
+ * authenticated API only and never logged.
+ */
+export interface LinkingPayload {
+  qr: string;
+  expiresAt: Date;
+  kind: "qr" | "pairing-code";
+}
+
+/** One roster entry to upsert (ADR 0008, best-effort). */
+export interface GroupMemberUpsert {
+  userId: string;
+  /** Push name when known; null keeps any previously stored name. */
+  name: string | null;
+  isAdmin: boolean;
+}
+
+export interface SyncMembersResult {
+  upserted: number;
+  /** Members marked inactive because they left the roster. */
+  deactivated: number;
+}
+
 export interface UpsertChatsResult {
   inserted: number;
   updated: number;
@@ -148,6 +173,50 @@ export interface BotDb {
   releaseHistoryImport(
     claim: Pick<HistoryImportClaim, "groupId" | "startedAt">,
   ): Promise<boolean>;
+
+  // ---- Session control and roster (ADR 0008) ----
+
+  /**
+   * Publishes the current linking QR/pairing payload on the single
+   * connection row, REPLACING any previous one (a new QR always
+   * supersedes the old). The value is a live pairing ticket: stored for
+   * the authenticated API, never logged. The payload's `kind`
+   * (`qr` | `pairing-code`) is published alongside it (CR#6).
+   */
+  setLinkingQr(connectionId: string, payload: LinkingPayload): Promise<void>;
+  /** Clears the linking payload (connected / logged out / session lost). */
+  clearLinkingQr(connectionId: string): Promise<void>;
+  /**
+   * Opportunistic cleanup of EXPIRED linking payloads (CR#7): rows
+   * whose `linking_qr_expires_at` is in the past lose the payload and
+   * kind. Returns how many rows were cleared.
+   */
+  clearExpiredLinking(): Promise<number>;
+  /**
+   * Best-effort roster sync for ONE chat (ADR 0008): upserts the given
+   * members as active (keeping a previously stored name when the new
+   * one is missing) and marks members ABSENT from `members` as
+   * active=false — never deletes. An EMPTY `members` list is a no-op:
+   * missing metadata must never deactivate everyone. The MONITORED
+   * boundary is enforced INSIDE the statement (EXISTS guard, H-1): a
+   * chat that is not in `groups` with `monitored = true` syncs nothing.
+   */
+  syncGroupMembers(
+    chatId: string,
+    members: GroupMemberUpsert[],
+  ): Promise<SyncMembersResult>;
+  /**
+   * Atomically consumes the admin logout request (reads and clears
+   * `logout_requested_at`); returns the request time, or null when no
+   * request is pending.
+   */
+  consumeLogoutRequest(): Promise<Date | null>;
+  /**
+   * Terminal logout state (ADR 0008): state `unavailable` and linking
+   * payload cleared. `last_message_at` is deliberately KEPT (it is
+   * historical fact) and `logout_requested_at` is already consumed.
+   */
+  finalizeLogout(connectionId: string): Promise<void>;
 }
 
 type ConnectionRow = QueryResultRow & { id: string };
@@ -236,17 +305,18 @@ export class PostgresBotDb implements BotDb {
         let param = 2;
         for (const row of chunk) {
           tuples.push(
-            `($1::uuid, $${param}::text, $${param + 1}::text, $${param + 2}::text, $${param + 3}::timestamptz, $${param + 4}::text, $${param + 5}::text)`,
+            `($1::uuid, $${param}::text, $${param + 1}::text, $${param + 2}::text, $${param + 3}::text, $${param + 4}::timestamptz, $${param + 5}::text, $${param + 6}::text)`,
           );
           values.push(
             row.chatJid,
             row.whatsappMessageId,
             row.senderJid,
+            row.senderName,
             row.sentAt,
             row.body,
             row.messageType,
           );
-          param += 6;
+          param += 7;
         }
         // Privacy boundary INSIDE the write (audit M4): a row is only
         // inserted when its chat is currently monitored — even if the
@@ -254,11 +324,11 @@ export class PostgresBotDb implements BotDb {
         // between filter and insert is never written).
         const result = await client.query(
           `INSERT INTO messages
-             (connection_id, chat_id, whatsapp_message_id, sender_id, sent_at, body, message_type)
+             (connection_id, chat_id, whatsapp_message_id, sender_id, sender_name, sent_at, body, message_type)
            SELECT t.connection_id, t.chat_id, t.whatsapp_message_id,
-                  t.sender_id, t.sent_at, t.body, t.message_type
+                  t.sender_id, t.sender_name, t.sent_at, t.body, t.message_type
            FROM (VALUES ${tuples.join(", ")}) AS t
-             (connection_id, chat_id, whatsapp_message_id, sender_id, sent_at, body, message_type)
+             (connection_id, chat_id, whatsapp_message_id, sender_id, sender_name, sent_at, body, message_type)
            WHERE EXISTS (
              SELECT 1 FROM groups g
              WHERE g.chat_id = t.chat_id AND g.monitored = true
@@ -475,5 +545,156 @@ export class PostgresBotDb implements BotDb {
       [claim.groupId, claim.startedAt],
     );
     return (result.rowCount ?? 0) > 0;
+  }
+
+  // ---- Session control and roster (ADR 0008) ----
+
+  async setLinkingQr(
+    connectionId: string,
+    payload: LinkingPayload,
+  ): Promise<void> {
+    // A new payload REPLACES any previous one (a fresh QR supersedes an
+    // expired one). The value is a live pairing ticket — it is written
+    // for the authenticated API and must never be logged.
+    await this.pool.query(
+      `UPDATE whatsapp_connections
+       SET linking_qr = $2, linking_qr_expires_at = $3, linking_kind = $4,
+           updated_at = now()
+       WHERE id = $1`,
+      [connectionId, payload.qr, payload.expiresAt, payload.kind],
+    );
+  }
+
+  async clearLinkingQr(connectionId: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE whatsapp_connections
+       SET linking_qr = NULL, linking_qr_expires_at = NULL,
+           linking_kind = NULL, updated_at = now()
+       WHERE id = $1`,
+      [connectionId],
+    );
+  }
+
+  async clearExpiredLinking(): Promise<number> {
+    // Opportunistic cleanup on the session-control tick (CR#7): a
+    // payload past its expiry must not linger as a stale ticket.
+    const result = await this.pool.query(
+      `UPDATE whatsapp_connections
+       SET linking_qr = NULL, linking_qr_expires_at = NULL,
+           linking_kind = NULL, updated_at = now()
+       WHERE linking_qr_expires_at IS NOT NULL
+         AND linking_qr_expires_at < now()`,
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async syncGroupMembers(
+    chatId: string,
+    members: GroupMemberUpsert[],
+  ): Promise<SyncMembersResult> {
+    // Dedupe by user id (last wins): ON CONFLICT DO UPDATE cannot
+    // touch the same row twice in one statement.
+    const byUser = new Map<string, GroupMemberUpsert>();
+    for (const member of members) {
+      if (member.userId !== "") byUser.set(member.userId, member);
+    }
+    // An EMPTY roster is "no data", never "the group is empty" (ADR
+    // 0008): skip the sync entirely so missing metadata can never
+    // deactivate every member.
+    if (byUser.size === 0) return { upserted: 0, deactivated: 0 };
+
+    const userIds = [...byUser.keys()];
+    const values: unknown[] = [chatId, userIds];
+    const tuples: string[] = [];
+    let param = 3;
+    for (const [userId, member] of byUser) {
+      tuples.push(`($${param}::text, $${param + 1}::text, $${param + 2}::boolean)`);
+      values.push(userId, member.name, member.isAdmin);
+      param += 3;
+    }
+    // ONE statement (CR#8): upsert and deactivation share a snapshot,
+    // so no observer can see the transient "everyone active" window the
+    // two-statement version exposed (and a crash between them could
+    // leave a half-synced roster).
+    //
+    // The MONITORED boundary is enforced INSIDE the statement (H-1):
+    // both halves only run when the chat is currently in `groups` with
+    // monitored = true — unmonitored (or unknown) chats sync nothing,
+    // whatever the caller believed.
+    const result = await this.pool.query<{
+      upserted: number;
+      deactivated: number;
+    }>(
+      `WITH guarded AS (
+         SELECT 1 AS ok
+         WHERE EXISTS (
+           SELECT 1 FROM groups g WHERE g.chat_id = $1 AND g.monitored = true
+         )
+       ),
+       upserted AS (
+         INSERT INTO group_members (id, chat_id, user_id, name, is_admin, active, updated_at)
+         SELECT gen_random_uuid(), $1, v.user_id, v.name, v.is_admin, true, now()
+         FROM (VALUES ${tuples.join(", ")}) AS v(user_id, name, is_admin)
+         WHERE EXISTS (SELECT 1 FROM guarded)
+         ON CONFLICT (chat_id, user_id) DO UPDATE SET
+           name = COALESCE(EXCLUDED.name, group_members.name),
+           is_admin = EXCLUDED.is_admin,
+           active = true,
+           updated_at = now()
+         RETURNING 1
+       ),
+       deactivated AS (
+         UPDATE group_members gm
+         SET active = false, updated_at = now()
+         WHERE gm.chat_id = $1
+           AND gm.active = true
+           AND NOT (gm.user_id = ANY($2::text[]))
+           AND EXISTS (SELECT 1 FROM guarded)
+         RETURNING 1
+       )
+       SELECT
+         (SELECT count(*)::int FROM upserted) AS upserted,
+         (SELECT count(*)::int FROM deactivated) AS deactivated`,
+      values,
+    );
+    return {
+      upserted: result.rows[0]?.upserted ?? 0,
+      deactivated: result.rows[0]?.deactivated ?? 0,
+    };
+  }
+
+  async consumeLogoutRequest(): Promise<Date | null> {
+    // Atomic read-and-clear: the request is consumed exactly once even
+    // if the logout work below crashes (the admin can re-request; the
+    // flow is idempotent). RETURNING may reference the FROM-list's
+    // pre-update value to report when the request was made.
+    const result = await this.pool.query<{ requested_at: Date }>(
+      `WITH prev AS (
+         SELECT id, logout_requested_at AS requested_at
+         FROM whatsapp_connections
+         WHERE logout_requested_at IS NOT NULL
+         LIMIT 1
+       )
+       UPDATE whatsapp_connections w
+       SET logout_requested_at = NULL, updated_at = now()
+       FROM prev
+       WHERE w.id = prev.id
+       RETURNING prev.requested_at`,
+    );
+    return result.rows[0]?.requested_at ?? null;
+  }
+
+  async finalizeLogout(connectionId: string): Promise<void> {
+    // Terminal logout state: `unavailable`, linking payload (and kind)
+    // gone. last_message_at is deliberately KEPT — it is historical fact.
+    await this.pool.query(
+      `UPDATE whatsapp_connections
+       SET state = 'unavailable', since = now(),
+           linking_qr = NULL, linking_qr_expires_at = NULL,
+           linking_kind = NULL,
+           updated_at = now()
+       WHERE id = $1`,
+      [connectionId],
+    );
   }
 }

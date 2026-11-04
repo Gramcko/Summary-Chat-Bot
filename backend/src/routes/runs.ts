@@ -55,6 +55,11 @@ export function registerRunRoutes(
       // API-created runs are always manual; scheduled runs are owned by
       // the scheduler (architecture A5.3) and created internally.
       kind: "manual",
+      // Custom summary instructions (ADR 0008): stored on the run and
+      // carried to the AI adapter via the dedicated instructions
+      // channel. On a repeated request the FIRST run's instructions
+      // win (run identity excludes them).
+      instructions: body.instructions ?? null,
     });
     // Queue the work once the durable run exists (A6: durable-run-first;
     // the enqueue is recoverable). Non-terminal runs may legitimately be

@@ -36,6 +36,7 @@ function makeRun(
       timezone: "Europe/Madrid",
     },
     attempts: 1,
+    instructions: null,
     createdAt: new Date(updatedAtMs).toISOString(),
     updatedAt: new Date(updatedAtMs).toISOString(),
     error: null,

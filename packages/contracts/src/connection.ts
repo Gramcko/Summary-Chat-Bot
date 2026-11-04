@@ -8,12 +8,36 @@ export const ConnectionState = z.enum([
   "unavailable",
 ]);
 
-/** Non-secret connection status. Never includes authentication material. */
+/**
+ * The pairing QR / pairing payload currently displayed by the
+ * bot-worker, with its expiry and its KIND: `qr` renders as a QR code,
+ * `pairing-code` is the typed pairing-code flow (WA_PHONE_NUMBER). The
+ * bot-worker publishes the kind alongside the payload; a stored payload
+ * without a kind (rows written before the column existed) is served as
+ * `qr` — the documented default for QR payloads.
+ * `qr` is a LIVE PAIRING TICKET: it is only ever served on the
+ * authenticated API and must never be logged (same class of secret as
+ * WhatsApp session state, ADR 0004/0008).
+ */
+export const ConnectionLinking = z.object({
+  kind: z.enum(["qr", "pairing-code"]).default("qr"),
+  qr: z.string().min(1),
+  expiresAt: IsoDateTime,
+});
+
+/**
+ * Non-secret connection status. Never includes authentication
+ * material. `linking` is non-null only while the session is being
+ * linked (QR/pairing payload available); it is null once connected (or
+ * when no linking is in progress).
+ */
 export const ConnectionStatus = z.object({
   state: ConnectionState,
   since: IsoDateTime,
   lastMessageAt: IsoDateTime.nullable(),
+  linking: ConnectionLinking.nullable(),
 });
 
 export type ConnectionState = z.infer<typeof ConnectionState>;
+export type ConnectionLinking = z.infer<typeof ConnectionLinking>;
 export type ConnectionStatus = z.infer<typeof ConnectionStatus>;

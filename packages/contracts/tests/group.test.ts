@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   Group,
   GroupHistoryImport,
+  GroupMember,
   HistoryImportStatus,
   UpdateGroupRequest,
 } from "../src/index.js";
@@ -90,5 +91,33 @@ describe("UpdateGroupRequest (admin prefs only)", () => {
     });
     expect(parsed).toEqual({ monitored: true });
     expect("historyImport" in parsed).toBe(false);
+  });
+});
+
+describe("GroupMember (roster snapshot, ADR 0008)", () => {
+  const MEMBER = {
+    userId: "123456789@s.whatsapp.net",
+    name: "Ana",
+    isAdmin: true,
+    active: true,
+    updatedAt: "2026-11-01T10:00:00Z",
+  };
+
+  it("validates a member and allows a null name and inactive state", () => {
+    expect(GroupMember.parse(MEMBER)).toEqual(MEMBER);
+    expect(
+      GroupMember.safeParse({ ...MEMBER, name: null, isAdmin: false, active: false })
+        .success,
+    ).toBe(true);
+  });
+
+  it("requires the WhatsApp identity and the system fields", () => {
+    expect(GroupMember.safeParse({ ...MEMBER, userId: "" }).success).toBe(false);
+    expect(GroupMember.safeParse({ ...MEMBER, updatedAt: "yesterday" }).success).toBe(
+      false,
+    );
+    expect(GroupMember.safeParse({ ...MEMBER, active: undefined }).success).toBe(
+      false,
+    );
   });
 });

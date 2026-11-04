@@ -6,10 +6,15 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Alert } from "@/components/ui/Alert";
 import { Button } from "@/components/ui/Button";
 import { Card, CardBody, CardHeader } from "@/components/ui/Card";
-import { SelectField, TextField } from "@/components/ui/Field";
+import { SelectField, TextAreaField, TextField } from "@/components/ui/Field";
 import { IanaTimeZoneOptions, TIME_ZONE_LIST_ID } from "@/components/TimeZones";
 import { api, toApiError, type ApiError } from "@/lib/api";
 import { mapFieldErrors } from "@/lib/form-errors";
+import {
+  INSTRUCTIONS_MAX_LENGTH,
+  normalizeInstructions,
+  validateInstructions,
+} from "@/lib/instructions";
 import { defaultRunWindow, wallTimeInZoneToInstant } from "@/lib/time";
 import {
   hasErrors,
@@ -33,6 +38,7 @@ export function RequestRunForm({ groups, onCreated }: RequestRunFormProps) {
   const [timezone, setTimezone] = useState("");
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
+  const [instructions, setInstructions] = useState("");
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [failure, setFailure] = useState<ApiError | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -65,6 +71,9 @@ export function RequestRunForm({ groups, onCreated }: RequestRunFormProps) {
 
     const timezoneError = validateIanaTimeZone(timezone);
     if (timezoneError !== null) errors.timezone = timezoneError;
+
+    const instructionsError = validateInstructions(instructions);
+    if (instructionsError !== null) errors.instructions = instructionsError;
 
     if (start === "") errors.start = "Choose a start date and time.";
     if (end === "") errors.end = "Choose an end date and time.";
@@ -102,6 +111,10 @@ export function RequestRunForm({ groups, onCreated }: RequestRunFormProps) {
         timezone: tz,
       },
     };
+    const normalizedInstructions = normalizeInstructions(instructions);
+    if (normalizedInstructions !== undefined) {
+      body.instructions = normalizedInstructions;
+    }
 
     setSubmitting(true);
     try {
@@ -112,7 +125,14 @@ export function RequestRunForm({ groups, onCreated }: RequestRunFormProps) {
       const error = toApiError(cause);
       const mapped = mapFieldErrors(error.details);
       const relevant: FieldErrors = {};
-      for (const name of ["groupId", "timezone", "start", "end", "interval"]) {
+      for (const name of [
+        "groupId",
+        "timezone",
+        "start",
+        "end",
+        "interval",
+        "instructions",
+      ]) {
         const message = mapped[name];
         if (message !== undefined) relevant[name] = message;
       }
@@ -187,6 +207,20 @@ export function RequestRunForm({ groups, onCreated }: RequestRunFormProps) {
               disabled={submitting}
             />
           </div>
+
+          <TextAreaField
+            id="run-instructions"
+            label="Custom instructions (optional)"
+            value={instructions}
+            onChange={setInstructions}
+            rows={3}
+            counterMax={INSTRUCTIONS_MAX_LENGTH}
+            showCounter
+            placeholder="Focus on decisions and deadlines; ignore small talk."
+            hint="Guidance for this summary only. It is sent to the AI provider as instructions, not as conversation content."
+            error={fieldErrors.instructions}
+            disabled={submitting}
+          />
 
           {fieldErrors.interval === undefined ? null : (
             <Alert tone="error" title="Check the requested period">

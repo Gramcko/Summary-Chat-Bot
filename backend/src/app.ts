@@ -93,6 +93,19 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     reply.status(404).send(apiError("not_found", "Route not found.")),
   );
 
+  // Security (fix round A, audit M-4): API responses are user-specific
+  // and may carry a live pairing ticket (ConnectionStatus.linking) —
+  // never cache them anywhere along the chain, and make any cache vary
+  // on the session cookie. Scoped to /api/* (the audit's minimum is
+  // GET /api/connection; the whole API surface gets the same rule).
+  app.addHook("onSend", async (request, reply, payload) => {
+    if (request.url === "/api" || request.url.startsWith("/api/")) {
+      void reply.header("Cache-Control", "no-store, private");
+      void reply.header("Vary", "Cookie");
+    }
+    return payload;
+  });
+
   // Public routes: health, first-run setup, login, and recovery.
   registerHealthRoutes(app);
   registerSetupRoutes(app, options.store);

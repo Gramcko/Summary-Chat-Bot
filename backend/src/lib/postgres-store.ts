@@ -2,15 +2,23 @@ import type { Pool, QueryResultRow } from "pg";
 import {
   ConnectionStatus,
   Group,
+  GroupSummary,
   Summary,
   SummaryRun,
+  type ApiMessage,
+  type ConnectionLinking,
+  type GroupMember,
 } from "@summarly/contracts";
 import { decryptSecret, encryptSecret } from "./crypto.js";
 import {
+  decodeMessageCursor,
   hashSessionToken,
   nowIso,
+  servedLinking,
   type AdminRecord,
   type CreateRunInput,
+  type GroupMemberInput,
+  type ListMessagesOptions,
   type ProviderRecord,
   type Store,
 } from "./store.js";
@@ -56,6 +64,7 @@ type RunRow = QueryResultRow & {
   end_at: Date;
   timezone: string;
   attempts: number;
+  instructions: string | null;
   error_code: string | null;
   error_message: string | null;
   created_at: Date;
@@ -84,11 +93,32 @@ type ConnectionRow = QueryResultRow & {
   state: string;
   since: Date;
   last_message_at: Date | null;
+  linking_qr: string | null;
+  linking_qr_expires_at: Date | null;
+  linking_kind: string | null;
+  logout_requested_at: Date | null;
+};
+
+type MemberRow = QueryResultRow & {
+  user_id: string;
+  name: string | null;
+  is_admin: boolean;
+  active: boolean;
+  updated_at: Date;
+};
+
+type MessageRow = QueryResultRow & {
+  id: string;
+  sent_at: Date;
+  sender_id: string;
+  sender_name: string | null;
+  body: string;
+  message_type: string;
 };
 
 const RUN_COLUMNS =
   "id, group_id, kind, status, start_at, end_at, timezone, attempts, " +
-  "error_code, error_message, created_at, updated_at";
+  "instructions, error_code, error_message, created_at, updated_at";
 
 const SUMMARY_COLUMNS = "id, run_id, provider, model, result, created_at";
 
@@ -143,6 +173,7 @@ function toSummaryRun(row: RunRow): SummaryRun {
       timezone: row.timezone,
     },
     attempts: row.attempts,
+    instructions: row.instructions,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
     error:
@@ -471,8 +502,8 @@ export class PostgresStore implements Store {
     // write amplification for simpler, provably-correct semantics. If
     // measurement ever shows bloat here, switch to DO NOTHING + SELECT.
     const result = await this.pool.query<CreatedRunRow>(
-      `INSERT INTO summary_runs (group_id, kind, status, start_at, end_at, timezone, attempts)
-       VALUES ($1, $2, 'pending', $3, $4, $5, 0)
+      `INSERT INTO summary_runs (group_id, kind, status, start_at, end_at, timezone, attempts, instructions)
+       VALUES ($1, $2, 'pending', $3, $4, $5, 0, $6)
        ON CONFLICT (group_id, start_at, end_at, kind)
        DO UPDATE SET group_id = summary_runs.group_id
        RETURNING ${RUN_COLUMNS}, (xmax = 0) AS created`,
@@ -482,6 +513,9 @@ export class PostgresStore implements Store {
         new Date(input.interval.start),
         new Date(input.interval.end),
         input.interval.timezone,
+        // First request's instructions win on a repeated create-or-find
+        // (the conflict branch is a no-op update) — ADR 0008.
+        input.instructions ?? null,
       ],
     );
     const row = result.rows[0];
@@ -637,7 +671,9 @@ export class PostgresStore implements Store {
 
   async getConnectionStatus(): Promise<ConnectionStatus> {
     const result = await this.pool.query<ConnectionRow>(
-      "SELECT state, since, last_message_at FROM whatsapp_connections LIMIT 1",
+      "SELECT state, since, last_message_at, linking_qr, " +
+        "linking_qr_expires_at, linking_kind, logout_requested_at " +
+        "FROM whatsapp_connections LIMIT 1",
     );
     const row = result.rows[0];
     if (row === undefined) {
@@ -646,18 +682,39 @@ export class PostgresStore implements Store {
         state: "unavailable",
         since: nowIso(),
         lastMessageAt: null,
+        linking: null,
       });
     }
+    // The RAW pairing payload (ADR 0008: `qr` is a live pairing ticket
+    // — served on the authenticated API only, never logged). A NULL
+    // kind means the bot-worker has not published one yet: it is a QR
+    // payload (the documented default). The kind is narrowed, not
+    // parsed: the column CHECK bounds its domain and a read-path throw
+    // would turn a bad row into a 500 for the whole endpoint.
+    const rawLinking: ConnectionLinking | null =
+      row.linking_qr === null || row.linking_qr_expires_at === null
+        ? null
+        : {
+            kind: row.linking_kind === "pairing-code" ? "pairing-code" : "qr",
+            qr: row.linking_qr,
+            expiresAt: row.linking_qr_expires_at.toISOString(),
+          };
+    // Visibility gate (fix round A, audit M-4): served ONLY while the
+    // session is being linked (connecting/disconnected) AND unexpired —
+    // shared rule, InMemoryStore parity.
     return ConnectionStatus.parse({
       state: row.state,
       since: row.since.toISOString(),
       lastMessageAt:
         row.last_message_at === null ? null : row.last_message_at.toISOString(),
+      linking: servedLinking(row.state, rawLinking),
     });
   }
 
   async setConnectionStatus(status: ConnectionStatus): Promise<void> {
     // Validate before writing (M7), mirroring the read-path validation.
+    // Only the state columns are written: linking and logout are owned
+    // by their dedicated writers (ADR 0008).
     const valid = ConnectionStatus.parse(status);
     await this.pool.query(
       `INSERT INTO whatsapp_connections (state, since, last_message_at)
@@ -668,6 +725,201 @@ export class PostgresStore implements Store {
          last_message_at = EXCLUDED.last_message_at,
          updated_at = now()`,
       [valid.state, new Date(valid.since), valid.lastMessageAt],
+    );
+  }
+
+  async updateConnectionLinking(
+    linking: {
+      qr: string;
+      expiresAt: string;
+      kind?: ConnectionLinking["kind"];
+    } | null,
+  ): Promise<void> {
+    // Single-row invariant (migration 0001: UNIQUE index on (true)):
+    // this UPDATE targets THE whatsapp_connections row — a no-op when
+    // the bot-worker has never reported (no row), the exact row
+    // otherwise. It must never gain a WHERE clause that could match
+    // more than that one row.
+    // Row created by bot-worker reporting; no row = nothing to update.
+    await this.pool.query(
+      `UPDATE whatsapp_connections
+       SET linking_qr = $1, linking_qr_expires_at = $2, linking_kind = $3,
+           updated_at = now()`,
+      [
+        linking === null ? null : linking.qr,
+        linking === null ? null : new Date(linking.expiresAt),
+        // NULL kind = "not published yet": served as qr (default).
+        linking === null ? null : (linking.kind ?? "qr"),
+      ],
+    );
+  }
+
+  async requestLogout(): Promise<void> {
+    // Single-row invariant (see updateConnectionLinking): updates THE
+    // connection row only, and only when one exists.
+    // Idempotent: an already-pending request keeps its original
+    // timestamp (COALESCE) so the bot-worker sees a stable request.
+    await this.pool.query(
+      `UPDATE whatsapp_connections
+       SET logout_requested_at = COALESCE(logout_requested_at, now()),
+           updated_at = now()`,
+    );
+  }
+
+  async clearLogoutRequest(): Promise<void> {
+    // Single-row invariant (see updateConnectionLinking). This is the
+    // bot-worker's consume path for the admin's logout request.
+    await this.pool.query(
+      "UPDATE whatsapp_connections SET logout_requested_at = NULL, updated_at = now()",
+    );
+  }
+
+  // ---- Group detail data (ADR 0008) ----
+
+  async upsertGroupMembers(
+    chatId: string,
+    members: GroupMemberInput[],
+  ): Promise<void> {
+    if (members.length === 0) return;
+    const values: string[] = [];
+    const params: unknown[] = [chatId];
+    members.forEach((member, index) => {
+      const base = index * 4 + 2;
+      values.push(`($1, $${base}, $${base + 1}, $${base + 2}, $${base + 3}, now())`);
+      params.push(member.userId, member.name, member.isAdmin, member.active);
+    });
+    // Roster refresh semantics (fix round A, m9): a refresh without a
+    // display name (Baileys group metadata carries only JIDs) must
+    // never wipe a name learned from a message pushName — hence
+    // COALESCE on name. This is the REFERENCE writer the bot-worker's
+    // roster capture must match (COALESCE parity).
+    await this.pool.query(
+      `INSERT INTO group_members (chat_id, user_id, name, is_admin, active, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (chat_id, user_id) DO UPDATE SET
+         name = COALESCE(EXCLUDED.name, group_members.name),
+         is_admin = EXCLUDED.is_admin,
+         active = EXCLUDED.active,
+         updated_at = now()`,
+      params,
+    );
+  }
+
+  async listGroupMembers(chatId: string): Promise<GroupMember[]> {
+    const result = await this.pool.query<MemberRow>(
+      `SELECT user_id, name, is_admin, active, updated_at
+       FROM group_members
+       WHERE chat_id = $1
+       ORDER BY is_admin DESC, name ASC NULLS LAST, user_id ASC`,
+      [chatId],
+    );
+    return result.rows.map((row) => ({
+      userId: row.user_id,
+      name: row.name,
+      isAdmin: row.is_admin,
+      active: row.active,
+      updatedAt: row.updated_at.toISOString(),
+    }));
+  }
+
+  async listGroupMessages(
+    chatId: string,
+    options: ListMessagesOptions,
+  ): Promise<ApiMessage[]> {
+    const cursor =
+      options.cursor === undefined
+        ? undefined
+        : decodeMessageCursor(options.cursor);
+    // A provided cursor that does not decode (fix round A, audit L-4 —
+    // a non-UUID id used to reach the `::uuid` cast and 500) is a
+    // caller bug: throw instead of silently returning page 1. The
+    // route validates first and answers 400; this is the backstop.
+    if (options.cursor !== undefined && cursor === undefined) {
+      throw new Error("invalid message cursor");
+    }
+    // Keyset predicate (sent_at, id) < (cursor, id). Precision note
+    // (fix round A, m3): sent_at is written from JavaScript Date values
+    // (millisecond precision) and the cursor round-trips ms-precision
+    // ISO strings, so the row-wise comparison is exact for every row
+    // our writers produce. If microsecond-precision rows ever appear
+    // (e.g. raw SQL imports), change the predicate to
+    // (date_trunc('milliseconds', sent_at), id) < (...) — and widen the
+    // (chat_id, sent_at) index accordingly.
+    const result = await this.pool.query<MessageRow>(
+      `SELECT id, sent_at, sender_id, sender_name, body, message_type
+       FROM messages
+       WHERE chat_id = $1
+         AND ($2::timestamptz IS NULL OR sent_at >= $2)
+         AND ($3::timestamptz IS NULL OR sent_at < $3)
+         AND ($4::timestamptz IS NULL OR
+              (sent_at, id) < ($4::timestamptz, $5::uuid))
+       ORDER BY sent_at DESC, id DESC
+       LIMIT $6`,
+      [
+        chatId,
+        options.from === undefined ? null : new Date(options.from),
+        options.to === undefined ? null : new Date(options.to),
+        cursor === undefined ? null : new Date(cursor.sentAt),
+        cursor === undefined ? null : cursor.id,
+        options.limit,
+      ],
+    );
+    // Row mapping is a CAST, deliberately (fix round A, m4): these rows
+    // are written by the capture path, whose clamping to the contract
+    // bounds is the bot-worker's job (round B). Running ApiMessage.parse
+    // here would turn ONE out-of-bound row (e.g. an over-long push name)
+    // into a 500 for the whole page; instead the read path trusts the
+    // writer and only the REQUEST boundary (cursor/range/limit) is
+    // validated. chatId is deliberately omitted from the rows: the
+    // caller asked for one group and the ApiMessage contract keeps it
+    // optional.
+    return result.rows.map((row) => ({
+      id: row.id,
+      sentAt: row.sent_at.toISOString(),
+      // sender_id is nullable in the schema; the contract requires a
+      // value, so the gap is filled here (writer-side clamping follows
+      // in round B).
+      senderId: row.sender_id ?? "unknown",
+      senderName: row.sender_name,
+      body: row.body,
+      messageType: row.message_type,
+    })) as ApiMessage[];
+  }
+
+  async listGroupSummaries(
+    groupId: string,
+    options: { limit: number },
+  ): Promise<GroupSummary[]> {
+    const result = await this.pool.query<
+      SummaryRow & {
+        start_at: Date;
+        end_at: Date;
+        timezone: string;
+      }
+    >(
+      `SELECT s.id, s.run_id, s.provider, s.model, s.result, s.created_at,
+              r.start_at, r.end_at, r.timezone
+       FROM summaries s
+       JOIN summary_runs r ON r.id = s.run_id
+       WHERE r.group_id = $1
+       ORDER BY s.created_at DESC, s.id DESC
+       LIMIT $2`,
+      [groupId, options.limit],
+    );
+    return result.rows.map((row) =>
+      GroupSummary.parse({
+        id: row.id,
+        runId: row.run_id,
+        provider: row.provider,
+        model: row.model,
+        result: row.result,
+        createdAt: row.created_at.toISOString(),
+        interval: {
+          start: row.start_at.toISOString(),
+          end: row.end_at.toISOString(),
+          timezone: row.timezone,
+        },
+      }),
     );
   }
 }

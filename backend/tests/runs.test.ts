@@ -354,3 +354,81 @@ describe("summary run enqueue wiring (queue contract, architecture A6)", () => {
     expect(SummaryRun.parse(retriedAgain.json()).status).toBe("pending");
   });
 });
+
+describe("summary run instructions (custom prompt, ADR 0008)", () => {
+  it("persists the instructions and echoes them on the run", async () => {
+    const { app, session } = await authedApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload: {
+        groupId: GROUP_ID,
+        interval: INTERVAL,
+        instructions: "Focus on decisions and ignore chit-chat.",
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const run = SummaryRun.parse(res.json());
+    expect(run.instructions).toBe("Focus on decisions and ignore chit-chat.");
+
+    const fetched = await app.inject({
+      method: "GET",
+      url: `/api/summary-runs/${run.id}`,
+      headers: { cookie: session },
+    });
+    expect(SummaryRun.parse(fetched.json()).instructions).toBe(
+      "Focus on decisions and ignore chit-chat.",
+    );
+  });
+
+  it("stores NULL when the request carries none", async () => {
+    const { app, session } = await authedApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload: { groupId: GROUP_ID, interval: INTERVAL },
+    });
+    expect(SummaryRun.parse(res.json()).instructions).toBeNull();
+  });
+
+  it("keeps the FIRST request's instructions on a repeated request", async () => {
+    const { app, session } = await authedApp();
+    const payload = { groupId: GROUP_ID, interval: INTERVAL };
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload: { ...payload, instructions: "Original instructions." },
+    });
+    const repeat = await app.inject({
+      method: "POST",
+      url: "/api/summary-runs",
+      headers: { cookie: session },
+      payload: { ...payload, instructions: "Different instructions." },
+    });
+    expect(repeat.statusCode).toBe(200);
+    // Run identity excludes instructions: the existing run (and its
+    // instructions) is returned unchanged.
+    expect(SummaryRun.parse(repeat.json()).id).toBe(
+      SummaryRun.parse(first.json()).id,
+    );
+    expect(SummaryRun.parse(repeat.json()).instructions).toBe(
+      "Original instructions.",
+    );
+  });
+
+  it("rejects empty or oversized instructions with the standard envelope", async () => {
+    const { app, session } = await authedApp();
+    for (const instructions of ["", "   ", "x".repeat(2001)]) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/summary-runs",
+        headers: { cookie: session },
+        payload: { groupId: GROUP_ID, interval: INTERVAL, instructions },
+      });
+      expect(res.statusCode, `instructions length ${instructions.length}`).toBe(400);
+    }
+  });
+});

@@ -9,4 +9,16 @@ export function registerConnectionRoutes(
   app.get("/api/connection", async () =>
     ConnectionStatus.parse(await store.getConnectionStatus()),
   );
+
+  /**
+   * End / unlink the WhatsApp session (ADR 0008): records the admin
+   * request (`logout_requested_at`) for the bot-worker to consume —
+   * the API never reaches into the session itself. Idempotent: a
+   * request that is already pending keeps its original timestamp and
+   * the answer stays 202.
+   */
+  app.post("/api/connection/logout", async (_request, reply) => {
+    await store.requestLogout();
+    return reply.status(202).send({ ok: true });
+  });
 }

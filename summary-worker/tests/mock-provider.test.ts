@@ -33,6 +33,7 @@ function makeInput(messages: AiMessage[]): AiSummaryInput {
       timezone: "Europe/Madrid",
     },
     messages,
+    instructions: null,
   };
 }
 
@@ -254,5 +255,38 @@ describe("snippet truncation (audit L4: no split surrogate pairs)", () => {
     expect(quoted.startsWith('Eve: "')).toBe(true);
     expect(quoted).toContain("…");
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(quoted)).toBe(false);
+  });
+});
+
+describe("custom instructions (deterministic mention, ADR 0008)", () => {
+  it("records that instructions were provided without following them", () => {
+    const plain = makeInput(RICH_MESSAGES);
+    const instructed = makeInput(RICH_MESSAGES);
+    instructed.instructions = "Focus on decisions and ignore chit-chat.";
+    const a = generateMockSummary(plain);
+    const b = generateMockSummary(instructed);
+
+    // Minimal and deterministic: only the overview mentions them ...
+    expect(a.overview).not.toContain("Custom instructions");
+    expect(b.overview).toBe(`${a.overview} Custom instructions were provided.`);
+    // ... nothing else about the summary changes (the mock never
+    // "follows" instructions — real providers do).
+    expect({ ...b, overview: "" }).toEqual({ ...a, overview: "" });
+  });
+
+  it("mentions instructions in the empty-period overview too", () => {
+    const input = makeInput([]);
+    input.instructions = "Ignore chit-chat.";
+    expect(generateMockSummary(input).overview).toBe(
+      "No messages were found in this period. Custom instructions were provided.",
+    );
+  });
+
+  it("treats blank instructions as absent", () => {
+    const blank = makeInput(RICH_MESSAGES);
+    blank.instructions = "   ";
+    expect(generateMockSummary(blank).overview).toBe(
+      generateMockSummary(makeInput(RICH_MESSAGES)).overview,
+    );
   });
 });

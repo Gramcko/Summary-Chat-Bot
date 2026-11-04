@@ -12,8 +12,13 @@ import {
 } from "./normalize.js";
 import type {
   AdapterEvent,
+  GroupMemberInfo,
   RawInboundMessage,
   WhatsAppAdapter,
+} from "./whatsapp/adapter.js";
+import {
+  LINKING_QR_TTL_MS,
+  PAIRING_CODE_TTL_MS,
 } from "./whatsapp/adapter.js";
 
 /**
@@ -68,6 +73,13 @@ export interface CaptureServiceOptions {
 /** Safe error summary for logs: truncated driver text, nothing else. */
 export const safeReason = errorReason;
 
+/**
+ * Linking-payload TTLs (defined on the adapter contract so the Baileys
+ * adapter's pairing-flow re-arm uses the same expiry as the published
+ * payload, CR#6). Re-exported here for the service's callers/tests.
+ */
+export { LINKING_QR_TTL_MS, PAIRING_CODE_TTL_MS };
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -107,6 +119,8 @@ export class CaptureService {
   private attempt = 0;
   private stopped = true;
   private sessionLost = false;
+  /** Admin logout in progress: no state writes, no reconnects (ADR 0008). */
+  private loggingOut = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Serializes async event processing (ordering: open before close...). */
@@ -178,6 +192,37 @@ export class CaptureService {
     }
   }
 
+  /**
+   * Admin logout in progress (ADR 0008): stops reconnect attempts and
+   * freezes connection-state writes so the session-control flow's final
+   * `unavailable` write is the last word. Idempotent.
+   */
+  beginLogout(): void {
+    this.loggingOut = true;
+    this.sessionLost = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.log("info", "logout_beginning", {});
+  }
+
+  /**
+   * Re-arms linking after an admin logout (CR-M1): the teardown latches
+   * must not make "link a device again" a lie — reset them, reconnect
+   * the adapter (a fresh session state presents a new QR through the
+   * normal flow within one poll), and let state writes flow again.
+   * Idempotent; a stopped service stays stopped.
+   */
+  async rearm(): Promise<void> {
+    if (this.stopped) return;
+    this.loggingOut = false;
+    this.sessionLost = false;
+    this.attempt = 0;
+    this.log("info", "session_rearmed", {});
+    await this.doConnect();
+  }
+
   // ------------------------------------------------------------------
   // Event routing
   // ------------------------------------------------------------------
@@ -221,16 +266,21 @@ export class CaptureService {
       case "open":
         this.attempt = 0;
         await this.setStatus("connected");
+        // Linking finished: the pairing ticket must not linger (ADR 0008).
+        await this.clearLinking();
         await this.runDiscovery();
         break;
       case "qr":
         // The QR / pairing code is linkable authentication material: it
-        // is shown by the presenter, never passed to the logger.
+        // is shown by the presenter and PUBLISHED for the authenticated
+        // dashboard, never passed to the logger (ADR 0008).
         this.log("info", "linking_qr_pending", {});
+        await this.publishLinking(event.qr, LINKING_QR_TTL_MS, "qr");
         this.onLinking?.({ kind: "qr", qr: event.qr });
         break;
       case "pairing-code":
         this.log("info", "linking_pairing_code_pending", {});
+        await this.publishLinking(event.code, PAIRING_CODE_TTL_MS, "pairing-code");
         this.onLinking?.({ kind: "pairing-code", code: event.code });
         break;
       case "close":
@@ -240,6 +290,9 @@ export class CaptureService {
         await this.db.upsertDiscoveredChats([event.chat], {
           timezone: this.defaultTimezone,
         });
+        break;
+      case "participants":
+        await this.refreshRoster(event.chatJid);
         break;
       case "messages":
         break; // routed through the message queue; never reaches here
@@ -255,9 +308,10 @@ export class CaptureService {
       // Session revoked, replaced, corrupt, or the account restricted
       // (ADR 0004): stop retrying, mark the connection "unavailable",
       // and require a manual re-link. Session files are NEVER deleted
-      // automatically.
+      // automatically here (the ADMIN logout control may delete them).
       this.sessionLost = true;
       await this.setStatus("lost-logged-out");
+      await this.clearLinking();
       this.log("error", "session_lost_relink_required", {
         reason: event.reason,
         note:
@@ -315,6 +369,9 @@ export class CaptureService {
   }
 
   private async setStatus(status: SessionStatus): Promise<void> {
+    // During an admin logout the session-control flow owns the final
+    // state write (`unavailable`); nothing here may clobber it (0008).
+    if (this.loggingOut) return;
     if (this.status === status) return;
     this.status = status;
     this.log("info", "connection_status", {
@@ -341,8 +398,9 @@ export class CaptureService {
   // ------------------------------------------------------------------
 
   private async runDiscovery(): Promise<void> {
+    let chats: Array<{ chatJid: string; name: string; members: GroupMemberInfo[] }> = [];
     try {
-      const chats = await this.adapter.fetchChats();
+      chats = await this.adapter.fetchChats();
       const result = await this.db.upsertDiscoveredChats(chats, {
         timezone: this.defaultTimezone,
       });
@@ -353,6 +411,96 @@ export class CaptureService {
       });
     } catch (error) {
       this.log("error", "discovery_failed", { reason: safeReason(error) });
+      return;
+    }
+    // Roster sync (ADR 0008, best-effort): upsert the participants of
+    // the discovered chats from the SAME metadata snapshot; members
+    // absent from it are marked inactive (kept as history). Never fatal,
+    // names optional. PRIVACY BOUNDARY (H-1): rosters sync only for
+    // MONITORED groups — a group the admin has not opted in never has
+    // its members collected (the SQL enforces the same rule).
+    const chatJids = chats.map((chat) => chat.chatJid);
+    const monitored =
+      chatJids.length > 0 ? await this.db.filterMonitoredChatIds(chatJids) : new Set<string>();
+    for (const chat of chats) {
+      if (!monitored.has(chat.chatJid)) continue;
+      await this.syncRoster(chat.chatJid, chat.members);
+    }
+  }
+
+  /** Upserts ONE chat's roster; empty rosters are "no data" (skipped). */
+  private async syncRoster(
+    chatJid: string,
+    members: GroupMemberInfo[],
+  ): Promise<void> {
+    if (members.length === 0) return;
+    try {
+      const result = await this.db.syncGroupMembers(chatJid, members);
+      this.log("debug", "members_synced", {
+        chatRef: safeChatRef(chatJid),
+        members: members.length,
+        upserted: result.upserted,
+        deactivated: result.deactivated,
+      });
+    } catch (error) {
+      this.log("error", "roster_sync_failed", {
+        chatRef: safeChatRef(chatJid),
+        reason: safeReason(error),
+      });
+    }
+  }
+
+  /** A participant event: refresh that chat's roster from metadata. */
+  private async refreshRoster(chatJid: string): Promise<void> {
+    // PRIVACY BOUNDARY (H-1): only MONITORED groups have their rosters
+    // tracked — for an unmonitored chat there is nothing to sync and
+    // nothing to fetch (the SQL would refuse it anyway).
+    const monitored = await this.db.filterMonitoredChatIds([chatJid]);
+    if (!monitored.has(chatJid)) return;
+    let members: GroupMemberInfo[];
+    try {
+      members = await this.adapter.fetchRoster(chatJid);
+    } catch (error) {
+      // The contract says fetchRoster is best-effort; still guard so a
+      // throwing implementation can never break the event chain.
+      this.log("error", "roster_sync_failed", {
+        chatRef: safeChatRef(chatJid),
+        reason: safeReason(error),
+      });
+      return;
+    }
+    await this.syncRoster(chatJid, members);
+  }
+
+  /**
+   * Publishes the linking payload for the authenticated dashboard
+   * (ADR 0008). The value is a live pairing ticket — it is stored in
+   * the DB row and NEVER logged (tests assert both sides). The `kind`
+   * (qr | pairing-code) is published alongside it (CR#6).
+   */
+  private async publishLinking(
+    payload: string,
+    ttlMs: number,
+    kind: "qr" | "pairing-code",
+  ): Promise<void> {
+    if (this.connectionId === null) return;
+    try {
+      await this.db.setLinkingQr(this.connectionId, {
+        qr: payload,
+        expiresAt: new Date(Date.now() + ttlMs),
+        kind,
+      });
+    } catch (error) {
+      this.log("error", "linking_publish_failed", { reason: safeReason(error) });
+    }
+  }
+
+  private async clearLinking(): Promise<void> {
+    if (this.connectionId === null) return;
+    try {
+      await this.db.clearLinkingQr(this.connectionId);
+    } catch (error) {
+      this.log("error", "linking_clear_failed", { reason: safeReason(error) });
     }
   }
 

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { safeChatRef } from "../src/lib/privacy.js";
 import {
   CaptureService,
+  LINKING_QR_TTL_MS,
+  PAIRING_CODE_TTL_MS,
   STATUS_TO_DB,
   type CaptureLimits,
   type LinkingInfo,
@@ -170,7 +172,7 @@ describe("connection status state machine", () => {
 describe("group discovery (privacy-first opt-in)", () => {
   it("registers discovered groups unmonitored with the default time zone", async () => {
     const h = harness({ defaultTimezone: "Europe/Berlin" });
-    h.adapter.fetchChatsResults = [{ chatJid: GROUP_A, name: "Team" }];
+    h.adapter.fetchChatsResults = [{ chatJid: GROUP_A, name: "Team", members: [] }];
     await h.service.start();
     h.adapter.emit({ type: "open" });
     await h.service.idle();
@@ -190,7 +192,7 @@ describe("group discovery (privacy-first opt-in)", () => {
 
   it("NEVER clobbers admin preferences on rename or re-discovery (regression)", async () => {
     const h = harness();
-    h.adapter.fetchChatsResults = [{ chatJid: GROUP_A, name: "Team" }];
+    h.adapter.fetchChatsResults = [{ chatJid: GROUP_A, name: "Team", members: [] }];
     await h.service.start();
     h.adapter.emit({ type: "open" });
     await h.service.idle();
@@ -206,7 +208,7 @@ describe("group discovery (privacy-first opt-in)", () => {
     // A subject rename (live event) updates ONLY the name.
     h.adapter.emit({
       type: "chat-updated",
-      chat: { chatJid: GROUP_A, name: "Team Renamed" },
+      chat: { chatJid: GROUP_A, name: "Team Renamed", members: [] },
     });
     await h.service.idle();
     let group = h.db.groups.get(GROUP_A);
@@ -217,7 +219,7 @@ describe("group discovery (privacy-first opt-in)", () => {
     expect(group?.id).toBe(configuredId);
 
     // A full re-discovery (reconnect) must also keep the preferences.
-    h.adapter.fetchChatsResults = [{ chatJid: GROUP_A, name: "Team v3" }];
+    h.adapter.fetchChatsResults = [{ chatJid: GROUP_A, name: "Team v3", members: [] }];
     h.adapter.emit({ type: "close", retryable: true, reason: "connection_lost" });
     await h.service.idle();
     await waitFor("reconnect", () =>
@@ -237,14 +239,14 @@ describe("group discovery (privacy-first opt-in)", () => {
 
   it("adds newly discovered groups next to existing ones", async () => {
     const h = harness();
-    h.adapter.fetchChatsResults = [{ chatJid: GROUP_A, name: "A" }];
+    h.adapter.fetchChatsResults = [{ chatJid: GROUP_A, name: "A", members: [] }];
     await h.service.start();
     h.adapter.emit({ type: "open" });
     await h.service.idle();
 
     h.adapter.fetchChatsResults = [
-      { chatJid: GROUP_A, name: "A" },
-      { chatJid: GROUP_B, name: "B" },
+      { chatJid: GROUP_A, name: "A", members: [] },
+      { chatJid: GROUP_B, name: "B", members: [] },
     ];
     h.adapter.emit({ type: "close", retryable: true, reason: "connection_lost" });
     await h.service.idle();
@@ -584,5 +586,313 @@ describe("linking UX and shutdown", () => {
     expect(h.service.sessionStatus).toBe("disconnected");
     await sleep(30);
     expect(h.adapter.connectCalls).toBe(1); // never reconnects after stop
+  });
+});
+
+describe("linking state publication (ADR 0008)", () => {
+  it("publishes the QR to the DB row with a TTL and never logs it", async () => {
+    const h = harness();
+    await h.service.start();
+    const before = Date.now();
+
+    h.adapter.emit({ type: "qr", qr: "SECRET-QR-VALUE" });
+    await h.service.idle();
+
+    // The row MAY hold the QR (auth-only API reads it) …
+    expect(h.db.linking?.qr).toBe("SECRET-QR-VALUE");
+    expect(h.db.linking?.kind).toBe("qr"); // kind published (CR#6)
+    const ttl = h.db.linking!.expiresAt.getTime();
+    expect(ttl).toBeGreaterThanOrEqual(before + LINKING_QR_TTL_MS - 100);
+    expect(ttl).toBeLessThanOrEqual(Date.now() + LINKING_QR_TTL_MS + 100);
+    // … but the logs must NEVER contain it (existing guarantee, now
+    // covering the DB path too).
+    expect(logsContain(h.logs, "SECRET-QR-VALUE")).toBe(false);
+    expect(h.linking).toEqual([{ kind: "qr", qr: "SECRET-QR-VALUE" }]);
+    await h.service.stop();
+  });
+
+  it("a new QR replaces the old one; connecting clears it", async () => {
+    const h = harness();
+    await h.service.start();
+    h.adapter.emit({ type: "qr", qr: "QR-ONE" });
+    await h.service.idle();
+    h.adapter.emit({ type: "qr", qr: "QR-TWO" });
+    await h.service.idle();
+    expect(h.db.linking?.qr).toBe("QR-TWO"); // replaced, not appended
+
+    h.adapter.emit({ type: "open" });
+    await h.service.idle();
+    expect(h.db.linking).toBeNull(); // linked: the ticket is gone
+    await h.service.stop();
+  });
+
+  it("publishes pairing codes with the pairing TTL", async () => {
+    const h = harness();
+    await h.service.start();
+    const before = Date.now();
+    h.adapter.emit({ type: "pairing-code", code: "ABCD1234" });
+    await h.service.idle();
+
+    expect(h.db.linking?.qr).toBe("ABCD1234");
+    expect(h.db.linking?.kind).toBe("pairing-code"); // kind published (CR#6)
+    const ttl = h.db.linking!.expiresAt.getTime();
+    expect(ttl).toBeGreaterThanOrEqual(before + PAIRING_CODE_TTL_MS - 100);
+    expect(logsContain(h.logs, "ABCD1234")).toBe(false);
+    await h.service.stop();
+  });
+
+  it("clears the ticket when the session is lost", async () => {
+    const h = harness();
+    await h.service.start();
+    h.adapter.emit({ type: "qr", qr: "STALE-QR" });
+    await h.service.idle();
+    h.adapter.emit({ type: "close", retryable: false, reason: "logged_out" });
+    await h.service.idle();
+    expect(h.db.linking).toBeNull(); // no stale pairing ticket lingers
+    await h.service.stop();
+  });
+});
+
+describe("group members sync (ADR 0008)", () => {
+  const ALICE = { userId: "111@s.whatsapp.net", name: "Alice", isAdmin: true };
+  const BOB = { userId: "222@lid", name: null, isAdmin: false };
+
+  /** Rosters sync ONLY for monitored groups (H-1 privacy boundary). */
+  function seedMonitored(h: Harness, chatJid = GROUP_A): void {
+    h.db.groups.set(chatJid, {
+      id: "g-monitored",
+      name: "Group",
+      monitored: true,
+      timezone: "UTC",
+      summaryTime: null,
+    });
+  }
+
+  it("upserts the roster of monitored discovered groups at connect", async () => {
+    const h = harness();
+    seedMonitored(h);
+    h.adapter.fetchChatsResults = [
+      { chatJid: GROUP_A, name: "Team", members: [ALICE, BOB] },
+    ];
+    await h.service.start();
+    h.adapter.emit({ type: "open" });
+    await h.service.idle();
+
+    const roster = h.db.membersByChat.get(GROUP_A);
+    expect(roster?.get(ALICE.userId)).toMatchObject({
+      name: "Alice",
+      isAdmin: true,
+      active: true,
+    });
+    expect(roster?.get(BOB.userId)).toMatchObject({
+      name: null,
+      isAdmin: false,
+      active: true,
+    });
+    await h.service.stop();
+  });
+
+  it("NEVER syncs rosters for unmonitored chats (H-1)", async () => {
+    const h = harness();
+    // GROUP_B is discovered but stays unmonitored (the opt-in default).
+    h.adapter.fetchChatsResults = [
+      { chatJid: GROUP_A, name: "Monitored", members: [ALICE] },
+      { chatJid: GROUP_B, name: "Private", members: [BOB] },
+    ];
+    seedMonitored(h); // only GROUP_A is opted in
+    await h.service.start();
+    h.adapter.emit({ type: "open" });
+    await h.service.idle();
+
+    expect(h.db.membersByChat.get(GROUP_A)?.size).toBe(1); // synced
+    expect(h.db.membersByChat.has(GROUP_B)).toBe(false); // never synced
+
+    // A participant event for the unmonitored chat syncs nothing — and
+    // never even fetches its roster.
+    h.adapter.emit({
+      type: "participants",
+      chatJid: GROUP_B,
+      action: "add",
+      participants: [BOB.userId],
+    });
+    await h.service.idle();
+    expect(h.adapter.rosterRequests).not.toContain(GROUP_B);
+    expect(h.db.membersByChat.has(GROUP_B)).toBe(false);
+    await h.service.stop();
+  });
+
+  it("mid-way unmonitor stops future syncs (H-1)", async () => {
+    const h = harness();
+    seedMonitored(h);
+    h.adapter.rosterResults.set(GROUP_A, [ALICE]);
+    await h.service.start();
+    h.adapter.emit({ type: "open" });
+    await h.service.idle();
+    h.adapter.emit({
+      type: "participants",
+      chatJid: GROUP_A,
+      action: "add",
+      participants: [ALICE.userId],
+    });
+    await h.service.idle();
+    expect(h.db.membersByChat.get(GROUP_A)?.size).toBe(1);
+
+    // The admin opts the group OUT between syncs.
+    h.db.adminConfigure(GROUP_A, { monitored: false });
+    h.adapter.rosterResults.set(GROUP_A, [ALICE, BOB]);
+    h.adapter.emit({
+      type: "participants",
+      chatJid: GROUP_A,
+      action: "add",
+      participants: [BOB.userId],
+    });
+    await h.service.idle();
+
+    // The second sync never happens: the roster stays as it was.
+    expect(h.db.membersByChat.get(GROUP_A)?.size).toBe(1);
+    expect(h.db.membersByChat.get(GROUP_A)?.has(BOB.userId)).toBe(false);
+    await h.service.stop();
+  });
+
+  it("marks absent members inactive but keeps them as history", async () => {
+    const h = harness();
+    seedMonitored(h);
+    h.adapter.fetchChatsResults = [
+      { chatJid: GROUP_A, name: "Team", members: [ALICE, BOB] },
+    ];
+    await h.service.start();
+    h.adapter.emit({ type: "open" });
+    await h.service.idle();
+
+    // Bob left: the next roster snapshot only carries Alice.
+    h.adapter.fetchChatsResults = [
+      { chatJid: GROUP_A, name: "Team", members: [ALICE] },
+    ];
+    h.adapter.emit({ type: "close", retryable: true, reason: "connection_lost" });
+    await h.service.idle();
+    await waitFor("the reconnect", () =>
+      h.adapter.connectCalls >= 2 ? true : undefined,
+    );
+    h.adapter.emit({ type: "open" });
+    await h.service.idle();
+
+    const roster = h.db.membersByChat.get(GROUP_A);
+    expect(roster?.get(BOB.userId)?.active).toBe(false); // kept, not deleted
+    expect(roster?.get(ALICE.userId)?.active).toBe(true);
+    expect(roster?.size).toBe(2);
+    await h.service.stop();
+  });
+
+  it("keeps the stored name when a sync has none (names never fail a sync)", async () => {
+    const h = harness();
+    seedMonitored(h);
+    h.db.membersByChat.set(
+      GROUP_A,
+      new Map([
+        [ALICE.userId, { ...ALICE, active: true }],
+      ]),
+    );
+    await h.service.start();
+    // The participant event refreshes with a nameless snapshot.
+    h.adapter.rosterResults.set(GROUP_A, [
+      { userId: ALICE.userId, name: null, isAdmin: false },
+    ]);
+    h.adapter.emit({
+      type: "participants",
+      chatJid: GROUP_A,
+      action: "promote",
+      participants: [ALICE.userId],
+    });
+    await h.service.idle();
+
+    const row = h.db.membersByChat.get(GROUP_A)?.get(ALICE.userId);
+    expect(row?.name).toBe("Alice"); // kept
+    expect(row?.isAdmin).toBe(false); // refreshed
+    expect(h.adapter.rosterRequests).toContain(GROUP_A);
+    await h.service.stop();
+  });
+
+  it("treats an empty roster as no data — never deactivates everyone", async () => {
+    const h = harness();
+    seedMonitored(h);
+    h.db.membersByChat.set(
+      GROUP_A,
+      new Map([[ALICE.userId, { ...ALICE, active: true }]]),
+    );
+    await h.service.start();
+    h.adapter.rosterResults.set(GROUP_A, []); // metadata unavailable
+    h.adapter.emit({
+      type: "participants",
+      chatJid: GROUP_A,
+      action: "remove",
+      participants: [BOB.userId],
+    });
+    await h.service.idle();
+
+    expect(h.db.membersByChat.get(GROUP_A)?.get(ALICE.userId)?.active).toBe(true);
+    await h.service.stop();
+  });
+
+  it("ignores a roster fetch failure without breaking the service", async () => {
+    const h = harness();
+    seedMonitored(h);
+    await h.service.start();
+    h.adapter.emit({ type: "open" });
+    await h.service.idle();
+    h.adapter.rosterError = new Error("metadata unavailable");
+    h.adapter.emit({
+      type: "participants",
+      chatJid: GROUP_A,
+      action: "add",
+      participants: [ALICE.userId],
+    });
+    await h.service.idle();
+    expect(h.service.sessionStatus).toBe("connected");
+    expect(findEvents(h.logs, "roster_sync_failed")).toHaveLength(1);
+    await h.service.stop();
+  });
+});
+
+describe("sender names at ingestion (ADR 0008)", () => {
+  it("persists the push name on the live capture path", async () => {
+    const h = harness();
+    await h.service.start();
+    h.db.groups.set(GROUP_A, {
+      id: "g-a",
+      name: "A",
+      monitored: true,
+      timezone: "UTC",
+      summaryTime: null,
+    });
+    h.adapter.emitMessages(
+      rawMessage({ messageId: "M1", chatJid: GROUP_A, senderName: "Alice" }),
+      rawMessage({ messageId: "M2", chatJid: GROUP_A, senderName: null }),
+    );
+    await h.service.idle();
+
+    expect(h.db.messages.map((row) => row.senderName)).toEqual(["Alice", null]);
+    // Names are PII: the logs must not carry them.
+    expect(logsContain(h.logs, "Alice")).toBe(false);
+    await h.service.stop();
+  });
+
+  it("clamps sender names to the 300-char contract maximum (CR#5)", async () => {
+    const h = harness();
+    await h.service.start();
+    h.db.groups.set(GROUP_A, {
+      id: "g-a",
+      name: "A",
+      monitored: true,
+      timezone: "UTC",
+      summaryTime: null,
+    });
+    const longName = "N".repeat(400);
+    h.adapter.emitMessages(
+      rawMessage({ messageId: "M1", chatJid: GROUP_A, senderName: longName }),
+    );
+    await h.service.idle();
+
+    expect(h.db.messages[0]?.senderName).toBe("N".repeat(300));
+    await h.service.stop();
   });
 });

@@ -8,11 +8,15 @@ export default function AuthLayout({ children }: { children: ReactNode }) {
   return (
     <div className="flex min-h-dvh flex-col items-center justify-center px-4 py-10">
       <div className="w-full max-w-md">
-        <div className="mb-6 text-center">
-          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brand-700">
-            Summarly
-          </p>
-          <p className="mt-1 text-sm text-slate-600">
+        <div className="mb-7 flex flex-col items-center text-center">
+          <span
+            aria-hidden="true"
+            className="mb-3 inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-brand-600 text-base font-bold text-white shadow-sm"
+          >
+            S
+          </span>
+          <p className="text-sm font-semibold text-slate-900">Summarly</p>
+          <p className="mt-0.5 text-sm text-slate-600">
             Self-hosted WhatsApp group summaries
           </p>
         </div>

@@ -133,6 +133,7 @@ describe("createProviderResolver (adapter selection)", () => {
         timezone: "Europe/Madrid",
       },
       messages: [],
+      instructions: null,
     }).catch(() => undefined);
     expect(headersSeen[0]?.["x-goog-api-key"]).toBe(API_KEY);
   });
@@ -298,6 +299,7 @@ describe("base-URL policy (audit E-2: credential-bearing endpoint)", () => {
         timezone: "Europe/Madrid",
       },
       messages: [],
+      instructions: null,
     }).catch(() => undefined);
     expect(seen[0]).toContain("https://proxy.example/v1beta/models/");
   });

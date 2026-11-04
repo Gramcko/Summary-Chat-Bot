@@ -11,7 +11,9 @@ import { HistoryImportService } from "./history-import.js";
 import { errorReason } from "./lib/errors.js";
 import { loadRepoEnv } from "./lib/load-env.js";
 import { createLogger, isLogLevel, type Logger } from "./lib/log.js";
+import { startParentWatchdog } from "./lib/parent-watchdog.js";
 import { CaptureService, type LinkingInfo } from "./service.js";
+import { SessionControlService } from "./session-control.js";
 import { BaileysAdapter } from "./whatsapp/baileys-adapter.js";
 
 /**
@@ -144,6 +146,18 @@ const historyImports = new HistoryImportService({
   budgets: config.historyImport,
 });
 
+// Session control (ADR 0008): polls the admin logout flag and tears
+// the session down (remote revoke + local auth-state purge), then
+// re-arms linking so the account can be linked again without a restart.
+const sessionControl = new SessionControlService({
+  adapter,
+  db,
+  log,
+  capture: service,
+  sessionDir: config.sessionDir,
+  pollMs: config.sessionControlPollMs,
+});
+
 log("info", "bot_worker_starting", {
   defaultTimezone: config.defaultTimezone,
   pairingCodeLinking: config.phoneNumber !== null,
@@ -165,6 +179,7 @@ try {
 
 log("info", "bot_worker_started", { status: service.sessionStatus });
 historyImports.start();
+sessionControl.start();
 
 let shuttingDown = false;
 async function shutdown(signal: string): Promise<void> {
@@ -172,13 +187,19 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   log("info", "shutdown_started", { signal });
   let failed = false;
-  // Order matters: stop the history-import poller first (it releases an
-  // active claim back to 'pending' and issues no further WhatsApp
-  // requests), then close the WhatsApp socket (the adapter saves its
-  // auth state) and let in-flight message batches commit BEFORE the
-  // database pool goes away (architecture §5.1/§6, ADR 0007).
+  // Order matters: stop the pollers first (history import releases an
+  // active claim back to 'pending'; session control finishes or leaves
+  // a pending logout flag for the next start), then close the WhatsApp
+  // socket (the adapter saves its auth state) and let in-flight message
+  // batches commit BEFORE the database pool goes away (architecture
+  // §5.1/§6, ADR 0007/0008).
   try {
     await historyImports.stop();
+  } catch {
+    failed = true;
+  }
+  try {
+    await sessionControl.stop();
   } catch {
     failed = true;
   }
@@ -199,5 +220,22 @@ async function shutdown(signal: string): Promise<void> {
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     void shutdown(signal);
+  });
+}
+
+// Parent-PID watchdog (fix round B, risk): when the backend supervises
+// us (SUMMARLY_PARENT_PID), a vanished parent — e.g. a force-killed
+// backend on Windows, where nothing cascades to children — triggers
+// our graceful shutdown instead of an orphaned live WhatsApp session.
+// Standalone runs (no env var) are unaffected.
+const parentPidRaw = process.env["SUMMARLY_PARENT_PID"]?.trim();
+const parentPid =
+  parentPidRaw === undefined || parentPidRaw === ""
+    ? Number.NaN
+    : Number(parentPidRaw);
+if (Number.isInteger(parentPid) && parentPid > 0) {
+  startParentWatchdog({
+    pid: parentPid,
+    onParentGone: () => void shutdown("parent_gone"),
   });
 }

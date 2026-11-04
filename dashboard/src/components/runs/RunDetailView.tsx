@@ -1,6 +1,7 @@
 "use client";
 
 import type { RunStatus } from "@summarly/contracts";
+import Link from "next/link";
 import { useEffect, useState, type ReactNode } from "react";
 import { SummaryView } from "@/components/SummaryView";
 import { Alert } from "@/components/ui/Alert";
@@ -144,8 +145,13 @@ export function RunDetailView({ runId }: { runId: string }) {
         <CardBody>
           <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <DetailItem label="Group">
-              {groups.data?.find((group) => group.id === current.groupId)?.name ??
-                current.groupId}
+              <Link
+                href={`/groups/${current.groupId}`}
+                className="font-medium text-brand-700 hover:underline"
+              >
+                {groups.data?.find((group) => group.id === current.groupId)?.name ??
+                  current.groupId}
+              </Link>
             </DetailItem>
             <DetailItem label="Kind">
               {current.kind === "manual" ? "Manual request" : "Scheduled"}
@@ -171,6 +177,20 @@ export function RunDetailView({ runId }: { runId: string }) {
             {current.error.message}
           </p>
         </Alert>
+      )}
+
+      {current.instructions === null ? null : (
+        <Card>
+          <CardHeader
+            title="Custom instructions"
+            description="Requested for this run and passed to the AI provider as instructions, never merged into the conversation content."
+          />
+          <CardBody>
+            <p className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-800">
+              {current.instructions}
+            </p>
+          </CardBody>
+        </Card>
       )}
 
       {retryFailure === null ? null : (

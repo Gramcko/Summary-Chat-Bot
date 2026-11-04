@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 import type {
   BotDb,
   ChatDefaults,
+  GroupMemberUpsert,
   HistoryImportClaim,
   HistoryImportOutcome,
   InsertMessagesOptions,
   InsertMessagesResult,
+  LinkingPayload,
   ConnectionState,
+  SyncMembersResult,
   UpsertChatsResult,
 } from "../src/db.js";
 import type { LogFields, LogLevel, Logger } from "../src/lib/log.js";
@@ -14,6 +17,7 @@ import type { NewMessage } from "../src/normalize.js";
 import type {
   AdapterEvent,
   DiscoveredChat,
+  GroupMemberInfo,
   HistoryFetchRequest,
   RawInboundMessage,
   WhatsAppAdapter,
@@ -47,6 +51,15 @@ export class FakeAdapter implements WhatsAppAdapter {
   onRequestHistory?: (request: HistoryFetchRequest) => void;
   /** Chats released via releaseHistoryChat(). */
   releasedHistoryChats: string[] = [];
+  /** Rosters returned by fetchRoster(); may be mutated between calls. */
+  rosterResults = new Map<string, GroupMemberInfo[]>();
+  rosterError: Error | null = null;
+  /** Recorded fetchRoster() calls. */
+  rosterRequests: string[] = [];
+  /** logout() call count (ADR 0008). */
+  logoutCalls = 0;
+  /** Makes logout() hang (M-1 timeout tests) or throw. */
+  logoutBehavior: "ok" | "hang" | "throw" = "ok";
 
   private readonly handlers = new Set<(event: AdapterEvent) => void>();
 
@@ -65,6 +78,25 @@ export class FakeAdapter implements WhatsAppAdapter {
   async fetchChats(): Promise<DiscoveredChat[]> {
     if (this.fetchChatsError !== null) throw this.fetchChatsError;
     return [...this.fetchChatsResults];
+  }
+
+  async fetchRoster(chatJid: string): Promise<GroupMemberInfo[]> {
+    this.rosterRequests.push(chatJid);
+    if (this.rosterError !== null) throw this.rosterError;
+    return [...(this.rosterResults.get(chatJid) ?? [])];
+  }
+
+  async logout(): Promise<void> {
+    this.logoutCalls += 1;
+    // Mirrors the real adapter: the remote revoke + socket teardown;
+    // the CALLER owns the local session purge (M-1 guarantees it runs
+    // even when this call stalls).
+    if (this.logoutBehavior === "hang") {
+      return new Promise<never>(() => {});
+    }
+    if (this.logoutBehavior === "throw") {
+      throw new Error("not connected");
+    }
   }
 
   async requestHistory(request: HistoryFetchRequest): Promise<string> {
@@ -139,6 +171,17 @@ export class FakeDb implements BotDb {
   readonly insertCalls: NewMessage[][] = [];
   /** How often insertMessages() touched last_message_at (ADR 0007). */
   lastMessageTouches = 0;
+  /** Current linking payload on the connection row (ADR 0008). */
+  linking: LinkingPayload | null = null;
+  /** Roster rows by chat: userId -> row (name/is_admin/active). */
+  readonly membersByChat = new Map<
+    string,
+    Map<string, { userId: string; name: string | null; isAdmin: boolean; active: boolean }>
+  >();
+  /** Pending admin logout request (ADR 0008). */
+  logoutRequestedAt: Date | null = null;
+  /** finalizeLogout() call count. */
+  finalizeLogoutCalls = 0;
   /**
    * Per-call insert failures (CR-M2 tests): each insertMessages() call
    * shifts one error and throws it when present.
@@ -349,6 +392,88 @@ export class FakeDb implements BotDb {
     return false;
   }
 
+  // ---- Session control and roster (ADR 0008): mirror the SQL ----
+
+  async setLinkingQr(
+    _connectionId: string,
+    payload: LinkingPayload,
+  ): Promise<void> {
+    // A new payload replaces the previous one (mirrors the UPDATE).
+    this.linking = payload;
+  }
+
+  async clearLinkingQr(_connectionId: string): Promise<void> {
+    this.linking = null;
+  }
+
+  async clearExpiredLinking(): Promise<number> {
+    if (this.linking !== null && this.linking.expiresAt.getTime() < Date.now()) {
+      this.linking = null;
+      return 1;
+    }
+    return 0;
+  }
+
+  async syncGroupMembers(
+    chatId: string,
+    members: GroupMemberUpsert[],
+  ): Promise<SyncMembersResult> {
+    // Dedupe by user id (last wins), like the SQL statement.
+    const byUser = new Map<string, GroupMemberUpsert>();
+    for (const member of members) {
+      if (member.userId !== "") byUser.set(member.userId, member);
+    }
+    // Empty roster = no data: never deactivates everyone.
+    if (byUser.size === 0) return { upserted: 0, deactivated: 0 };
+    // Monitored boundary INSIDE the write (H-1, mirrors the EXISTS
+    // guard): unmonitored or unknown chats sync nothing.
+    if (this.groups.get(chatId)?.monitored !== true) {
+      return { upserted: 0, deactivated: 0 };
+    }
+
+    const roster = this.membersByChat.get(chatId) ?? new Map();
+    this.membersByChat.set(chatId, roster);
+    let upserted = 0;
+    for (const [userId, member] of byUser) {
+      const existing = roster.get(userId);
+      if (existing === undefined) {
+        roster.set(userId, {
+          userId,
+          name: member.name,
+          isAdmin: member.isAdmin,
+          active: true,
+        });
+      } else {
+        // Missing name keeps the stored one (COALESCE in the SQL).
+        existing.name = member.name ?? existing.name;
+        existing.isAdmin = member.isAdmin;
+        existing.active = true;
+      }
+      upserted += 1;
+    }
+    let deactivated = 0;
+    for (const row of roster.values()) {
+      if (row.active && !byUser.has(row.userId)) {
+        row.active = false; // kept as history — never deleted
+        deactivated += 1;
+      }
+    }
+    return { upserted, deactivated };
+  }
+
+  async consumeLogoutRequest(): Promise<Date | null> {
+    const requestedAt = this.logoutRequestedAt;
+    this.logoutRequestedAt = null;
+    return requestedAt;
+  }
+
+  async finalizeLogout(_connectionId: string): Promise<void> {
+    this.finalizeLogoutCalls += 1;
+    this.stateHistory.push("unavailable");
+    this.linking = null;
+    // last_message_at is deliberately kept (mirrors the SQL).
+  }
+
   /** Simulates the admin changing preferences in the dashboard. */
   adminConfigure(
     chatJid: string,
@@ -399,6 +524,7 @@ export function rawMessage(
     chatJid: "111111111111-22222222@g.us",
     messageId: "MSG-1",
     senderJid: "sender@s.whatsapp.net",
+    senderName: null,
     timestampSec: 1_772_000_000,
     fromMe: false,
     kind: "text",

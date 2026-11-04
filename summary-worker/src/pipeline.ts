@@ -313,6 +313,8 @@ export function consolidate(
  */
 const AI_SENDER_MAX_CHARS = 200;
 const AI_TEXT_MAX_CHARS = 4096;
+/** Mirrors `AiSummaryInput.instructions` (contracts/ai.ts). */
+const AI_INSTRUCTIONS_MAX_CHARS = 2000;
 
 function toAiMessages(messages: StoredMessage[]): AiMessage[] {
   return messages.map((message) => ({
@@ -546,6 +548,13 @@ async function runPipeline(
       groupName: context.groupName,
       period: run.interval,
       messages: toAiMessages(messages),
+      // Admin custom instructions (ADR 0008): passed as their own
+      // channel, never merged into conversation data. Truncated
+      // defensively to the contract cap (2000).
+      instructions:
+        run.instructions === null
+          ? null
+          : truncateText(run.instructions, AI_INSTRUCTIONS_MAX_CHARS),
     });
   } catch (error) {
     if (error instanceof ZodError) {

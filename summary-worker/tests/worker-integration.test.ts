@@ -170,6 +170,32 @@ describe.skipIf(!shouldRun)(
     }
 
     it(
+      "maps senders to display names — the JID never reaches the AI input (M-5)",
+      async () => {
+        const seed = await seedRun(pool, {
+          ...INTERVAL,
+          messages: [
+            { sender: "Ana", sentAt: "2026-10-28T09:00:00Z", text: "Named sender." },
+            { sentAt: "2026-10-28T10:00:00Z", text: "No push name." },
+          ],
+        });
+
+        const messages = await db.fetchMessages(seed.groupId, INTERVAL);
+        // Display name when captured; "unknown" when the message had
+        // none — never the phone-bearing sender_id.
+        expect(messages.map((message) => message.sender)).toEqual([
+          "Ana",
+          "unknown",
+        ]);
+        for (const message of messages) {
+          expect(message.sender).not.toContain("@");
+          expect(message.sender).not.toContain("123456789");
+        }
+      },
+      20_000,
+    );
+
+    it(
       "processes an enqueued job end-to-end and stores a validated summary",
       async () => {
         const seed = await seedRun(pool, {

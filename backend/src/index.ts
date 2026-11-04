@@ -16,6 +16,11 @@ import {
   parseSummaryTime,
   Scheduler,
 } from "./lib/scheduler.js";
+import {
+  defaultWorkerSpecs,
+  parseSuperviseWorkers,
+  WorkerSupervisor,
+} from "./lib/supervisor.js";
 
 // Load the repository-root .env (see .env.example) before any
 // configuration is read. Shell-exported variables win over the file.
@@ -108,6 +113,7 @@ let schedulerEnabled: boolean;
 let schedulerIntervalMs: number;
 let defaultSummaryTime: number;
 let backfillDays: number;
+let superviseWorkers: boolean;
 try {
   retryBaseMs = parseRetryBaseMs(process.env["SUMMARY_RETRY_BASE_MS"]);
   queuePrefix = parseQueuePrefix(process.env["SUMMARY_QUEUE_PREFIX"]);
@@ -120,6 +126,7 @@ try {
   );
   defaultSummaryTime = parseSummaryTime(process.env["DEFAULT_SUMMARY_TIME"]);
   backfillDays = parseBackfillDays(process.env["BACKFILL_DAYS"]);
+  superviseWorkers = parseSuperviseWorkers(process.env["SUPERVISE_WORKERS"]);
 } catch (error) {
   fail(error instanceof Error ? error.message : "Invalid configuration.");
 }
@@ -170,8 +177,20 @@ reconciler.start();
 if (schedulerEnabled) {
   scheduler.start();
 }
+// Worker supervision (docs/decisions/0008, round 3): spawn and
+// supervise summary-worker + bot-worker so `npm run dev -w
+// @summarly/backend` + the dashboard is all that is needed. The e2e
+// script — and the future deployment Compose (no application Compose
+// exists yet) — run their own workers and set SUPERVISE_WORKERS=false.
+let supervisor: WorkerSupervisor | undefined;
+if (superviseWorkers) {
+  supervisor = new WorkerSupervisor(defaultWorkerSpecs(), { log });
+  supervisor.start();
+}
 log("backend_started", {
   port,
+  pid: process.pid,
+  superviseWorkers,
   reconcileIntervalMs,
   schedulerEnabled,
   schedulerIntervalMs,
@@ -184,14 +203,22 @@ log("backend_started", {
 });
 
 let shuttingDown = false;
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
+// Windows consoles deliver Ctrl+C as SIGINT and Ctrl+Break as SIGBREAK;
+// both are graceful shutdown signals here. POSIX has no SIGBREAK.
+const shutdownSignals: readonly NodeJS.Signals[] =
+  process.platform === "win32"
+    ? ["SIGINT", "SIGTERM", "SIGBREAK"]
+    : ["SIGINT", "SIGTERM"];
+for (const signal of shutdownSignals) {
   process.on(signal, () => {
     if (shuttingDown) return;
     shuttingDown = true;
     void (async () => {
       try {
-        // Stop scheduled work first, then HTTP, then the queue, then
-        // the database pool (architecture A6 graceful shutdown).
+        // Supervised workers stop FIRST, then scheduled work, HTTP, the
+        // queue, and the database pool (architecture A6 graceful
+        // shutdown).
+        await supervisor?.stop();
         await scheduler.stop();
         await reconciler.stop();
         await app.close();

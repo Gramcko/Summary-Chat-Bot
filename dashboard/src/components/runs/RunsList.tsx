@@ -4,7 +4,7 @@ import type { Group, SummaryRun } from "@summarly/contracts";
 import Link from "next/link";
 import { useState } from "react";
 import { Alert } from "@/components/ui/Alert";
-import { RunStatusBadge } from "@/components/ui/Badges";
+import { Badge, RunStatusBadge } from "@/components/ui/Badges";
 import { Button, ButtonLink } from "@/components/ui/Button";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { EmptyState } from "@/components/ui/States";
@@ -49,6 +49,9 @@ function RunRow({ run, groups, onUpdated }: RunRowProps) {
           <span className="text-xs text-slate-500">
             {run.kind === "manual" ? "Manual" : "Scheduled"}
           </span>
+          {run.instructions === null ? null : (
+            <Badge tone="neutral">Custom instructions</Badge>
+          )}
         </div>
         <p className="mt-1 text-xs text-slate-600">
           {formatInterval(run.interval)}

@@ -138,9 +138,16 @@ function extractLinks(message: AiMessage): LinkItem[] {
  */
 export function generateMockSummary(input: AiSummaryInput): ProviderSummaryOutput {
   const messages = input.messages;
+  // Deterministic, minimal custom-instruction handling (ADR 0008):
+  // the mock never FOLLOWS instructions (that is what real providers
+  // do); it only records deterministically that some were provided.
+  const instructionsNote =
+    input.instructions !== null && input.instructions.trim() !== ""
+      ? " Custom instructions were provided."
+      : "";
   if (messages.length === 0) {
     return {
-      overview: "No messages were found in this period.",
+      overview: `No messages were found in this period.${instructionsNote}`,
       keyDiscussions: [],
       confirmedDecisions: [],
       proposals: [],
@@ -189,7 +196,7 @@ export function generateMockSummary(input: AiSummaryInput): ProviderSummaryOutpu
   const overview =
     `Conversation period with ${messages.length} message(s) from ` +
     `${senders.size} sender(s) between ${input.period.start} and ` +
-    `${input.period.end}.`;
+    `${input.period.end}.${instructionsNote}`;
 
   return {
     overview,

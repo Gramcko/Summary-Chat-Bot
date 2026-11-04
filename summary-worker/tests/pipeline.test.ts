@@ -900,3 +900,41 @@ describe("DB-call boundary (audit E-6: fixed messages, no pg text)", () => {
     );
   });
 });
+
+describe("custom instructions pass-through (ADR 0008)", () => {
+  it("delivers run.instructions to the provider as its own channel", async () => {
+    const run = makeRun();
+    run.instructions = "Focus on decisions and ignore chit-chat.";
+    const db = new FakeDb(run);
+    db.messages = makeStoredMessages(1);
+    const provider = new FakeProvider(() => fakeOutput());
+
+    await processSummaryRun(makeDeps(db, provider), run.id);
+    expect(provider.calls[0]?.instructions).toBe(
+      "Focus on decisions and ignore chit-chat.",
+    );
+  });
+
+  it("passes null when the run carries no instructions", async () => {
+    const run = makeRun();
+    const db = new FakeDb(run);
+    db.messages = makeStoredMessages(1);
+    const provider = new FakeProvider(() => fakeOutput());
+
+    await processSummaryRun(makeDeps(db, provider), run.id);
+    expect(provider.calls[0]?.instructions).toBeNull();
+  });
+
+  it("truncates instructions defensively at the 2000-char cap", async () => {
+    // The contract caps at 2000 on write; the boundary still protects
+    // against oversized rows (e.g. manual SQL).
+    const run = makeRun();
+    run.instructions = "x".repeat(4000);
+    const db = new FakeDb(run);
+    db.messages = makeStoredMessages(1);
+    const provider = new FakeProvider(() => fakeOutput());
+
+    await processSummaryRun(makeDeps(db, provider), run.id);
+    expect(provider.calls[0]?.instructions).toHaveLength(2000);
+  });
+});

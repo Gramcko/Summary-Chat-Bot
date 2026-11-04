@@ -14,9 +14,9 @@ These rules apply to all coding agents working in this repository. Read this fil
 - Type-check: `npm run typecheck` (contracts + backend + summary-worker + bot-worker + dashboard)
 - Tests: `npm test` (contracts + backend + summary-worker + bot-worker + dashboard)
 - Build: `npm run build` (contracts + backend + summary-worker + bot-worker + dashboard)
-- Dev backend: `npm run dev -w @summarly/backend`
-- Dev summary-worker: `npm run dev -w @summarly/summary-worker`
-- Dev bot-worker: `npm run dev -w @summarly/bot-worker` (links WhatsApp via terminal QR; see `.env.example` for `WA_SESSION_DIR`)
+- Dev backend: `npm run dev -w @summarly/backend` — **this plus the dashboard is all that is needed in dev**: the backend spawns and supervises the summary-worker and bot-worker child processes itself (worker supervision, `docs/decisions/0008` round 3). Set `SUPERVISE_WORKERS=false` to disable this (e2e — and the future deployment Compose, once it exists — run their own workers). Stop it with Ctrl+C (graceful; force-killing the backend can orphan the worker children on Windows). The worker entry used is the built `dist/index.js` when it exists, else `src/index.ts` via tsx (delete `dist/` to force live sources after a local build — a stale build logs `worker_entry_stale` but still runs).
+- Dev summary-worker (standalone, advanced/debugging): `npm run dev -w @summarly/summary-worker` — still works; use with `SUPERVISE_WORKERS=false` if a supervised backend is also running, or two instances will consume the queue.
+- Dev bot-worker (standalone, advanced/debugging): `npm run dev -w @summarly/bot-worker` (links WhatsApp via terminal QR; see `.env.example` for `WA_SESSION_DIR`) — still works; same `SUPERVISE_WORKERS=false` note as above.
 - Dev dashboard: `npm run dev -w @summarly/dashboard`
 - Build dashboard: `npm run build -w @summarly/dashboard`
 - Type-check dashboard: `npm run typecheck -w @summarly/dashboard`

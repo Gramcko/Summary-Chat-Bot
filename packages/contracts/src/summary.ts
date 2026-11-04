@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { Id, IsoDateTime } from "./common.js";
+import { Id, Interval, IsoDateTime } from "./common.js";
 
 /**
  * Reference to a source message supporting a summary claim. The
@@ -70,9 +70,19 @@ export const Summary = z.object({
   createdAt: IsoDateTime,
 });
 
+/**
+ * A summary as served in a group's "past summaries" list (ADR 0008):
+ * the stored summary plus the interval of the run that produced it
+ * (the run's kind is not needed here — the list is period-oriented).
+ */
+export const GroupSummary = Summary.extend({
+  interval: Interval,
+});
+
 export type SourceRef = z.infer<typeof SourceRef>;
 export type DecisionItem = z.infer<typeof DecisionItem>;
 export type TaskItem = z.infer<typeof TaskItem>;
 export type LinkItem = z.infer<typeof LinkItem>;
 export type SummaryResult = z.infer<typeof SummaryResult>;
 export type Summary = z.infer<typeof Summary>;
+export type GroupSummary = z.infer<typeof GroupSummary>;

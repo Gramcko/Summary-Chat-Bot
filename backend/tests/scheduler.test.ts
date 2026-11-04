@@ -356,6 +356,7 @@ class FakeSchedulerStore {
       status: "pending",
       interval: input.interval,
       attempts: 0,
+      instructions: null,
       createdAt: now,
       updatedAt: now,
       error: null,

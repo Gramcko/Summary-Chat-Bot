@@ -95,6 +95,22 @@ describe("normalizeMessage: capture rules", () => {
     if (result.action !== "capture") throw new Error("expected capture");
     expect(result.row.messageType).toBe("other");
   });
+
+  it("clamps sender names to 300 chars and maps empty to null (CR#5)", () => {
+    const long = normalizeMessage(
+      rawMessage({ senderName: "N".repeat(400) }),
+    );
+    if (long.action !== "capture") throw new Error("expected capture");
+    expect(long.row.senderName).toBe("N".repeat(300));
+
+    const short = normalizeMessage(rawMessage({ senderName: "Alice" }));
+    if (short.action !== "capture") throw new Error("expected capture");
+    expect(short.row.senderName).toBe("Alice");
+
+    const empty = normalizeMessage(rawMessage({ senderName: "" }));
+    if (empty.action !== "capture") throw new Error("expected capture");
+    expect(empty.row.senderName).toBeNull();
+  });
 });
 
 describe("normalizeMessage: skip rules (never persisted)", () => {

@@ -67,8 +67,26 @@ export const UpdateGroupRequest = z.object({
   summaryTime: SummaryTime.nullable().optional(),
 });
 
+/**
+ * A member of a monitored group's chat (ADR 0008). Best-effort roster
+ * maintained by the bot-worker: WhatsApp does not replay membership
+ * history, so this is a snapshot that drifts toward reality on each
+ * update. `userId` is the WhatsApp user JID and `name` the push name —
+ * both PII, served on the authenticated API only and covered by the
+ * normal retention rules. `active: false` means the member left the
+ * chat (kept as history).
+ */
+export const GroupMember = z.object({
+  userId: z.string().min(1).max(300),
+  name: z.string().min(1).max(300).nullable(),
+  isAdmin: z.boolean(),
+  active: z.boolean(),
+  updatedAt: IsoDateTime,
+});
+
 export type SummaryTime = z.infer<typeof SummaryTime>;
 export type HistoryImportStatus = z.infer<typeof HistoryImportStatus>;
 export type GroupHistoryImport = z.infer<typeof GroupHistoryImport>;
 export type Group = z.infer<typeof Group>;
+export type GroupMember = z.infer<typeof GroupMember>;
 export type UpdateGroupRequest = z.infer<typeof UpdateGroupRequest>;

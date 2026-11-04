@@ -81,9 +81,11 @@ down. It exits non-zero if any check fails.
 
 It covers the `/api` proxy for GET/POST/PATCH/PUT, the httpOnly session cookie
 round-trip, error-envelope passthrough with `details[].path`, `401` handling,
-`createRun`'s 201-vs-200 behaviour, retry conflicts, provider key
-write-only behaviour, every page, and that neither the backend origin nor the
-session cookie value leaks into the served HTML or client bundles.
+`createRun`'s 201-vs-200 behaviour (including custom `instructions`),
+retry conflicts, provider key write-only behaviour, the group detail endpoints
+(single group, members, paged/filtered messages, past summaries), the connection
+status + idempotent unlink, every page, and that neither the backend origin nor
+the session cookie value leaks into the served HTML or client bundles.
 
 It also asserts the proxy sanitization end to end: the test double records the
 headers it actually received, so spoofed `x-forwarded-for`, `x-real-ip`,
@@ -104,18 +106,38 @@ nothing is restored.
 
 ## Screens
 
+The app shell is a left sidebar (Overview, Groups, Summary runs, Connection,
+Settings) with sign-out at the bottom; on small screens it collapses into a
+focus-trapped drawer. A skip link, `<nav>`/`<main>` landmarks, visible focus
+rings, and `aria-live` async states are part of the shell.
+
 - `/setup` — one-time administrator password + recovery codes (shown once).
 - `/login`, `/recover` — session sign-in and single-use recovery code flow.
-- `/` — connection status and the most recent summary runs.
-- `/groups` — monitored flag (with the opt-in WhatsApp history import), IANA
-  time zone, and daily cutoff per group; import progress is polled while an
-  import is pending or running (ADR 0007).
-- `/runs` — request a manual summary and browse run history.
-- `/runs/[id]` — run status, retry, and the generated summary.
+- `/` — connection health, recent summary runs, group shortcuts.
+- `/connection` — live WhatsApp pairing payload (a QR code, or a typed pairing
+  code when the bot worker is configured with a phone number), refreshed while
+  linking with an expiry countdown, connection details, and an **End session /
+  Unlink** action (`POST /api/connection/logout`, confirmed; polling continues
+  until the re-armed pairing payload appears).
+- `/groups` — every captured group, with monitored/import badges; opens the
+  group detail.
+- `/groups/[id]` — tabs: **Summaries** (past summaries per group, link to the
+  run), **Members** (roster with admin/left badges), **Messages** (read-only chat
+  with a half-open from/to filter in the group time zone and “Load older”
+  cursor paging), **Settings** (monitored toggle + history-import flow, time
+  zone, daily cutoff).
+- `/runs` — request a manual summary (optional custom instructions, 0–2000
+  characters, with a counter) and browse run history.
+- `/runs/[id]` — run status, retry, custom instructions, and the generated
+  summary.
 - `/settings` — AI provider configuration (the API key is write-only).
 
 ## Notes
 
+- The only added runtime dependency is `qrcode` (pinned `1.5.4`, plus
+  `@types/qrcode`), used client-side to render the pairing ticket as an image.
+  The ticket itself is a live credential: it is never logged, linked, or shown
+  as text.
 - Responses are typed with `@summarly/contracts`. Only types are imported, so
   the shared Zod schemas never ship to the browser bundle.
 - Every API call goes through `src/lib/api.ts`, which always sends

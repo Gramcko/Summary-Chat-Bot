@@ -2,6 +2,7 @@ export * from "./ai.js";
 export * from "./common.js";
 export * from "./connection.js";
 export * from "./group.js";
+export * from "./message.js";
 export * from "./queue.js";
 export * from "./run.js";
 export * from "./summary.js";

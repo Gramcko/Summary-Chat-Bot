@@ -25,13 +25,22 @@
   instants, so `...Z` and `+02:00` spellings of the same moment are the same
   request), same kind — returns the existing run with `200`; a new run is
   created with `201`. The first request's timezone label is kept on the run
-  (the label does not change which messages the interval covers).
-  Safe to retry. API-created runs are always `kind: "manual"`; scheduled runs
-  are created by the scheduler (architecture §5.3).
+  (the label does not change which messages the interval covers); the
+  first request's `instructions` win likewise (run identity excludes
+  both). Safe to retry. API-created runs are always `kind: "manual"`;
+  scheduled runs are created by the scheduler (architecture §5.3).
 - Saved provider API keys are **write-only**: responses only report
   `hasApiKey: true|false`. No response shape contains key material. In
   `PUT /api/settings/ai-provider`, omit `apiKey` to keep the saved key or send
   `null` to clear it.
+- Message listings are **newest first** with opaque cursor pagination:
+  the response envelope is `{ "items": [...], "nextCursor": string|null }`
+  and the cursor is passed back verbatim in the `cursor` query parameter.
+  Date ranges are **half-open instants** `[from, to)` (`from` inclusive,
+  `to` exclusive), like summary intervals.
+- `ConnectionStatus.linking.qr` is a **live pairing ticket** (the QR /
+  pairing payload for linking the WhatsApp session). It is served only
+  on the authenticated API and must never be logged or shared.
 
 ## Endpoints
 
@@ -70,14 +79,19 @@ in-memory throttle.
 
 | Method | Path | Response | Notes |
 | --- | --- | --- | --- |
-| GET | `/api/connection` | `ConnectionStatus` | Non-secret WhatsApp connection state. |
+| GET | `/api/connection` | `ConnectionStatus` | Non-secret WhatsApp connection state. `linking` carries the pairing QR + expiry while linking (see session control below); `null` otherwise. |
 | GET | `/api/groups` | `Group[]` | Monitored groups. |
+| GET | `/api/groups/:id` | `Group` | Single group (detail screen). `400` non-UUID id; `404` unknown. |
+| GET | `/api/groups/:id/members` | `GroupMember[]` | Best-effort roster snapshot (admin names first, then alphabetical). `[]` when no chat is discovered yet. **Monitored groups only** (fix round B, H-1): `409` with `"Group is not monitored."` when the group is not monitored (same privacy boundary as history import), `404` unknown group. Names/JIDs are PII (admin-only data). |
+| GET | `/api/groups/:id/messages` | `ApiMessagePage` | Chat view, newest first (`items` + `nextCursor`; the cursor is emitted only when another page truly exists). Query: `from`/`to` half-open `[from, to)` ISO instants, `limit` 1-200 (default 50), `cursor` = previous `nextCursor`. `400` on an invalid range, limit, or cursor (including a non-UUID cursor id); `404` unknown group. |
+| GET | `/api/groups/:id/summaries` | `GroupSummary[]` | Past summaries, newest first, each with the run `interval` and `provider`/`model`. Query: `limit` 1–200 (default 20). |
 | PATCH | `/api/groups/:id` | `Group` | Partial update. `summaryTime: null` clears the daily cutoff. `historyImport` is system-managed and never changed by PATCH. |
 | POST | `/api/groups/:id/history-import` | `Group` (202/200) | Request a WhatsApp history import (opt-in, ADR 0007). `409` when the group is not monitored; `200` when an import is already pending/running; `202` otherwise (including re-requests after done/failed). |
-| POST | `/api/summary-runs` | `SummaryRun` (201/200) | Create-or-find (see conventions). Non-terminal runs are queued for the summary-worker (`generate-summary`, docs/decisions/0003); enqueue failures leave the run `pending` and are repaired by reconciliation. |
+| POST | `/api/summary-runs` | `SummaryRun` (201/200) | Create-or-find (see conventions). Optional `instructions` (1–2000 chars) steers how the summary is produced (see custom instructions below). Non-terminal runs are queued for the summary-worker (`generate-summary`, docs/decisions/0003); enqueue failures leave the run `pending` and are repaired by reconciliation. |
 | GET | `/api/summary-runs` | `RunListResponse` | Newest first. `nextCursor` is `null` in the skeleton. |
 | GET | `/api/summary-runs/:id` | `SummaryRun` | |
 | POST | `/api/summary-runs/:id/retry` | `SummaryRun` | `failed → pending` **and re-enqueues the run**; no-op for `pending`/`processing`; `409` for `completed` (regeneration is an open decision). |
+| POST | `/api/connection/logout` | `{ "ok": true }` (202) | End/unlink the WhatsApp session (see session control below). Idempotent: `202` also while a request is pending. |
 | GET | `/api/summaries/:id` | `Summary` | `404` until the summary-worker has completed the run. |
 | GET | `/api/summary-runs/:id/summary` | `Summary` | `404` for an unknown run or a run without a summary yet. |
 | GET | `/api/settings/ai-provider` | `ProviderConfigPublic` | `404` when unconfigured. Never returns key material. |
@@ -179,6 +193,75 @@ actual import and reports progress back. Behavior and limits:
   are indistinguishable in storage (a provenance column is a tracked
   follow-up).
 
+## Custom summary instructions (ADR 0008)
+
+`POST /api/summary-runs` accepts an optional `instructions` string
+(trimmed, 1–2000 chars) steering how the summary is produced — e.g.
+"focus on decisions and ignore chit-chat". Semantics:
+
+- Stored on the run (`summary_runs.instructions`) and echoed on
+  `SummaryRun.instructions` (`null` when the request carried none). On
+  the create-or-find repeat path the **first** request's instructions
+  win (run identity excludes them).
+- The queue payload stays identifier-only (docs/decisions/0003): the
+  summary-worker reads `instructions` from the run row and delivers it
+  to the AI adapter through a dedicated provider-neutral channel
+  (`AiSummaryInput.instructions`), truncated defensively at 2000 chars.
+- **Separation rule:** adapters present the instructions as a clearly
+  labelled ADMIN INSTRUCTIONS section, separate from both the system
+  instruction and the delimited conversation data block — message text
+  is untrusted data and never crosses into it (and vice versa). See
+  `docs/decisions/0008`.
+- The mock adapter does not follow instructions; it only records
+  deterministically that some were provided (its overview gains a fixed
+  note).
+
+## Group detail and session control (ADR 0008)
+
+**Group detail.** `GET /api/groups/:id` returns the group itself;
+`/members`, `/messages`, and `/summaries` provide what the group
+detail screens render (see the endpoint table for shapes and
+pagination):
+
+- `GroupMember` rows are a **best-effort roster snapshot** maintained
+  by the bot-worker - WhatsApp does not replay membership history, so
+  the list may be incomplete or stale until the next refresh. Leavers
+  stay in the roster as `active: false` history. Sorted admin names
+  first, then alphabetical. **Rosters are monitored-only** (fix round
+  B, H-1): both the bot-worker's roster sync and this endpoint require
+  the group to be monitored (`409` otherwise), matching the ADR 0004
+  opt-in boundary — un-monitoring revokes roster access too.
+- `ApiMessage` keeps the stored body verbatim (including `senderName`,
+  the WhatsApp push name captured with the message). The chat view
+  paginates newest-first; `from`/`to` filter the half-open instant
+  range `[from, to)`.
+- `GroupSummary` is a `Summary` plus the run's `interval` (what period
+  the summary covers) and its `provider`/`model`.
+- **Names and JIDs are PII** (admin-only data, like the message bodies
+  already stored). They are never logged and are covered by the normal
+  retention/purge rules.
+
+**Session control.** The connection screen shows the linking QR and can
+end the session:
+
+- While the session is being linked, `GET /api/connection` carries
+  `linking: { kind, qr, expiresAt }` — the pairing payload published by
+  the bot-worker (`kind` is `qr` or `pairing-code`; payloads published
+  without a kind are served as `qr`). It is a **live pairing ticket**:
+  authenticated API only, never logged. `linking` is served **only**
+  while the session is being linked — state `connecting` or
+  `disconnected` — and the payload is unexpired; it is `null` once
+  connected or when the QR has expired (audit M-4). API responses are
+  sent with `Cache-Control: no-store, private` and `Vary: Cookie` so no
+  cache along the way retains the ticket.
+- `POST /api/connection/logout` records the admin's END/UNLINK request
+  (`logout_requested_at` on the connection row) and answers `202
+  {"ok": true}` — idempotent, an already-pending request keeps its
+  original timestamp. The API never touches the session itself: the
+  **bot-worker consumes the flag** (ends the session, clears the stored
+  credentials, resets the connection state) and clears the request.
+  Until then the request stays pending and visible in server state.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -205,6 +288,8 @@ actual import and reports progress back. Behavior and limits:
 | `HISTORY_IMPORT_MAX_ROUNDS` | `20` | bot-worker: maximum history batches per import |
 | `HISTORY_IMPORT_MAX_MESSAGES` | `2000` | bot-worker: message budget per import (reaching it ends the import `done`, partial) |
 | `HISTORY_IMPORT_TIME_BUDGET_MS` | `120000` | bot-worker: wall-clock budget per import |
+| `SUPERVISE_WORKERS` | `true` | Backend worker supervision (ADR 0008 round 3): the backend spawns/restarts/stops the summary-worker and bot-worker children itself. Set `false` when the workers run separately — e2e does, and the future deployment Compose must (no application Compose exists yet). |
+| `SESSION_CONTROL_POLL_MS` | `3000` | bot-worker: how often session control is polled (pairing QR/pairing-code publication and consuming the admin's end/unlink request) |
 
 ## Security notes
 
@@ -222,6 +307,11 @@ actual import and reports progress back. Behavior and limits:
 - Password change and recovery invalidate all existing sessions.
 - The backend binds to loopback by default; do not expose it to untrusted
   networks without HTTPS and a reviewed authentication model.
+- `ConnectionStatus.linking.qr` is a **live pairing ticket** for the
+  WhatsApp session: served on the authenticated API only, never logged,
+  same sensitivity class as the session state itself (ADR 0004/0008).
+- Member names, sender names, and JIDs are **PII**: admin-only API
+  data, never logged, and covered by the retention rules below.
 
 ## Data retention
 
@@ -232,8 +322,22 @@ actual import and reports progress back. Behavior and limits:
   `npm run purge-messages -w @summarly/backend` (by group id, chat id,
   and/or a `--before <ISO date>` cutoff; destructive, with a typed
   confirmation or an explicit `--yes` flag; it reports counts only).
-  There is no API or dashboard deletion endpoint yet.
+  It covers **both** captured messages and the `group_members` roster
+  (fix round A, audit M-2/M5 — names/JIDs live in both): a
+  chat-scoped purge removes the full roster of those chats (including
+  departed members kept as history), a date-only purge removes roster
+  rows last updated before the cutoff, and an empty resolved scope
+  deletes nothing. There is no API or dashboard deletion endpoint yet.
 - **Database backups are as sensitive as the WhatsApp session volume**:
   dumps contain full conversations and phone-number-bearing sender JIDs.
   Encrypt and rotate dumps, restrict their access — and remember that
   purging rows does not remove them from backups taken earlier.
+- Sender names (`messages.sender_name`) travel with their message rows
+  and are purged by the same command. The member roster
+  (`group_members`) is a separate best-effort snapshot carrying names
+  and JIDs; it is **monitored-only** (fix round B, H-1 — the API gate
+  and the bot-worker's sync require a monitored group, and migration
+  0006 removes rows captured before the gate), `purge-messages` covers
+  it (see above), and it otherwise follows the same retention policy —
+  it should be included in any future automated retention pass
+  (tracked with retention productization, `docs/decisions/0004` §11).

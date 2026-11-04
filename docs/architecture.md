@@ -109,6 +109,7 @@ Responsibilities:
 - Create durable `summary_run` records in PostgreSQL.
 - Enqueue summary jobs with BullMQ.
 - Host the initial scheduling and reconciliation module.
+- Own the worker processes' lifetime: spawn/restart/stop of the `summary-worker` and `bot-worker` children (worker supervision, `SUPERVISE_WORKERS`, ADR 0008 round 3).
 
 The backend must not own the live Baileys socket or import socket details into request handlers. Keep WhatsApp operations in `bot-worker` and talk through defined data/status boundaries.
 
@@ -124,6 +125,7 @@ Responsibilities:
 - Receive supported incoming messages and normalize them into an internal message contract.
 - Persist messages in PostgreSQL and handle duplicate delivery safely.
 - Provide connection status without exposing authentication material.
+- Publish the pairing QR/pairing-code and the group roster into PostgreSQL, and consume the admin's end/unlink request (session control, ADR 0008).
 
 For the MVP, focus on text messages and links. Define behavior for unsupported event types. Keep WhatsApp session state in protected persistent storage; exclude it from Git, logs, API responses, and static files.
 
@@ -137,7 +139,7 @@ For a `generate-summary` job, it should:
 2. Fetch messages from PostgreSQL for the requested group and interval.
 3. Order messages deterministically and handle empty periods.
 4. Split large conversations into context-sized chunks when needed, and consolidate results while preserving source references when feasible.
-5. Call the configured provider with conversation messages treated as untrusted data, separate from system instructions.
+5. Call the configured provider with conversation messages treated as untrusted data, separate from system instructions and from any admin-supplied summary instructions (each is its own labelled channel — see `docs/decisions/0008`).
 6. Validate the response against a defined result schema.
 7. Persist the summary and final run status in PostgreSQL.
 8. Distinguish retryable errors (for example, a temporary rate limit) from permanent errors (for example, invalid provider configuration).
@@ -148,10 +150,11 @@ Use bounded concurrency and provider-aware rate limits. Queue payloads should co
 
 PostgreSQL is the durable source of truth for application and business state. Logical entities (names are provisional) include:
 
-- `whatsapp_connections`: connection metadata and non-secret status.
+- `whatsapp_connections`: connection metadata and non-secret status (plus the linking QR and the logout control flag — ADR 0008).
 - `groups`: monitored groups, timezone, and preferences.
+- `group_members`: best-effort roster snapshot per chat (names/JIDs are PII — ADR 0008).
 - `messages`: normalized messages and stable provider identifiers.
-- `summary_runs`: a request for a given group and period, status, attempts, timestamps, and safe error metadata.
+- `summary_runs`: a request for a given group and period, status, attempts, timestamps, safe error metadata, and optional admin instructions (ADR 0008).
 - `summaries`: validated output, provider/model metadata, and source references.
 - `ai_provider_configs`: provider preferences and, only if needed, encrypted user-supplied credentials.
 

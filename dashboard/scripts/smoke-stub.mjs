@@ -30,6 +30,12 @@ function createState() {
     authed: false,
     /** Raw request log, used by the smoke check to inspect forwarded headers. */
     requests: [],
+    connection: {
+      state: "connected",
+      since: "2026-10-29T06:00:00.000Z",
+      lastMessageAt: "2026-10-29T11:58:00.000Z",
+      linking: null,
+    },
     groups: [
       {
         id: GROUP_FAMILY_ID,
@@ -67,6 +73,7 @@ function createState() {
         attempts: 1,
         createdAt: "2026-10-29T07:05:00.000Z",
         updatedAt: "2026-10-29T07:06:00.000Z",
+        instructions: "Focus on decisions and deadlines; ignore small talk.",
         error: null,
       },
       {
@@ -82,6 +89,7 @@ function createState() {
         attempts: 0,
         createdAt: "2026-10-29T12:01:00.000Z",
         updatedAt: "2026-10-29T12:01:00.000Z",
+        instructions: null,
         error: null,
       },
       {
@@ -97,6 +105,7 @@ function createState() {
         attempts: 3,
         createdAt: "2026-10-28T22:00:30.000Z",
         updatedAt: "2026-10-28T22:03:00.000Z",
+        instructions: null,
         error: {
           code: "provider_timeout",
           message: "The AI provider did not respond.",
@@ -146,6 +155,86 @@ const SUMMARY = {
   },
   createdAt: "2026-10-29T07:06:00.000Z",
 };
+
+const FAMILY_CHAT_ID = "120363000000000001@g.us";
+
+/** Best-effort roster snapshot (ADR 0008). */
+const GROUP_MEMBERS = [
+  {
+    userId: "34600000001@s.whatsapp.net",
+    name: "Ana",
+    isAdmin: true,
+    active: true,
+    updatedAt: "2026-11-03T09:00:00.000Z",
+  },
+  {
+    userId: "34600000002@s.whatsapp.net",
+    name: "Luis",
+    isAdmin: false,
+    active: true,
+    updatedAt: "2026-11-03T09:00:00.000Z",
+  },
+  {
+    userId: "34600000003@s.whatsapp.net",
+    name: null,
+    isAdmin: false,
+    active: false,
+    updatedAt: "2026-10-30T18:00:00.000Z",
+  },
+];
+
+/** Captured messages, newest first (the order the API serves). */
+const GROUP_MESSAGES = [
+  {
+    id: "11111111-1111-4111-8111-111111111111",
+    chatId: FAMILY_CHAT_ID,
+    sentAt: "2026-11-04T17:30:00.000Z",
+    senderId: "34600000002@s.whatsapp.net",
+    senderName: "Luis",
+    body: "I'll bring the tickets on Saturday.",
+    messageType: "text",
+  },
+  {
+    id: "22222222-2222-4222-8222-222222222222",
+    chatId: FAMILY_CHAT_ID,
+    sentAt: "2026-11-04T17:25:00.000Z",
+    senderId: "34600000001@s.whatsapp.net",
+    senderName: "Ana",
+    body: "The meeting point is the main station entrance.",
+    messageType: "text",
+  },
+  {
+    id: "33333333-3333-4333-8333-333333333333",
+    chatId: FAMILY_CHAT_ID,
+    sentAt: "2026-11-03T10:00:00.000Z",
+    senderId: "34600000002@s.whatsapp.net",
+    senderName: "Luis",
+    body: "https://example.com/trip",
+    messageType: "link",
+  },
+  {
+    id: "44444444-4444-4444-8444-444444444444",
+    chatId: FAMILY_CHAT_ID,
+    sentAt: "2026-11-02T08:00:00.000Z",
+    senderId: "34600000001@s.whatsapp.net",
+    senderName: "Ana",
+    body: "",
+    messageType: "other",
+  },
+];
+
+/** Past summaries of the group: `Summary` plus the run interval. */
+const GROUP_SUMMARIES = [
+  {
+    ...SUMMARY,
+    id: "55555555-5555-4555-8555-555555555555",
+    interval: {
+      start: "2026-10-28T07:00:00.000Z",
+      end: "2026-10-29T07:00:00.000Z",
+      timezone: "Europe/Madrid",
+    },
+  },
+];
 
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -276,11 +365,27 @@ async function handle(req, res, state) {
   }
 
   if (path === "/api/connection" && method === "GET") {
-    return sendJson(res, 200, {
-      state: "connected",
-      since: "2026-10-29T06:00:00.000Z",
-      lastMessageAt: "2026-10-29T11:58:00.000Z",
-    });
+    return sendJson(res, 200, state.connection);
+  }
+
+  /**
+   * Idempotent unlink request (ADR 0008): the first call moves the session to
+   * "connecting" and publishes a pairing ticket; repeats keep it.
+   */
+  if (path === "/api/connection/logout" && method === "POST") {
+    if (state.connection.state !== "connecting") {
+      state.connection = {
+        state: "connecting",
+        since: new Date().toISOString(),
+        lastMessageAt: state.connection.lastMessageAt,
+        linking: {
+          kind: "qr",
+          qr: "2@smoke-pairing-ticket-not-a-real-code,smoke",
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        },
+      };
+    }
+    return sendJson(res, 202, { ok: true });
   }
 
   if (path === "/api/groups" && method === "GET") {
@@ -288,6 +393,102 @@ async function handle(req, res, state) {
   }
 
   const groupMatch = /^\/api\/groups\/([^/]+)$/.exec(path);
+  if (groupMatch && method === "GET") {
+    const group = state.groups.find((candidate) => candidate.id === groupMatch[1]);
+    if (group === undefined) {
+      return sendError(res, 404, "not_found", "Group not found.");
+    }
+    return sendJson(res, 200, group);
+  }
+
+  const membersMatch = /^\/api\/groups\/([^/]+)\/members$/.exec(path);
+  if (membersMatch && method === "GET") {
+    const group = state.groups.find(
+      (candidate) => candidate.id === membersMatch[1],
+    );
+    if (group === undefined) {
+      return sendError(res, 404, "not_found", "Group not found.");
+    }
+    // Member rosters are only served for monitored groups (privacy boundary).
+    if (!group.monitored) {
+      return sendError(
+        res,
+        409,
+        "conflict",
+        "Group must be monitored before viewing members.",
+      );
+    }
+    // No discovered chat yet: an empty roster, not an error.
+    return sendJson(res, 200, group.chatId === null ? [] : GROUP_MEMBERS);
+  }
+
+  const messagesMatch = /^\/api\/groups\/([^/]+)\/messages$/.exec(path);
+  if (messagesMatch && method === "GET") {
+    const group = state.groups.find(
+      (candidate) => candidate.id === messagesMatch[1],
+    );
+    if (group === undefined) {
+      return sendError(res, 404, "not_found", "Group not found.");
+    }
+
+    const from = url.searchParams.get("from") ?? undefined;
+    const to = url.searchParams.get("to") ?? undefined;
+    const fromMs = from === undefined ? undefined : Date.parse(from);
+    const toMs = to === undefined ? undefined : Date.parse(to);
+    if (
+      (fromMs !== undefined && !Number.isFinite(fromMs)) ||
+      (toMs !== undefined && !Number.isFinite(toMs)) ||
+      (fromMs !== undefined && toMs !== undefined && fromMs >= toMs)
+    ) {
+      return sendError(
+        res,
+        400,
+        "validation_error",
+        "Invalid range: `from` must be an instant before `to`.",
+      );
+    }
+
+    const rawLimit = Number(url.searchParams.get("limit") ?? "50");
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(200, Math.max(1, Math.trunc(rawLimit)))
+      : 50;
+
+    const filtered =
+      group.chatId === null
+        ? []
+        : GROUP_MESSAGES.filter((message) => {
+            const sentAt = Date.parse(message.sentAt);
+            if (fromMs !== undefined && sentAt < fromMs) return false;
+            if (toMs !== undefined && sentAt >= toMs) return false;
+            return true;
+          });
+
+    let start = 0;
+    const cursor = url.searchParams.get("cursor");
+    if (cursor !== null) {
+      const match = /^cursor-(\d+)$/.exec(cursor);
+      if (match === null) {
+        return sendError(res, 400, "validation_error", "Invalid cursor.");
+      }
+      start = Number(match[1]);
+    }
+
+    const items = filtered.slice(start, start + limit);
+    const next = start + limit < filtered.length ? `cursor-${start + limit}` : null;
+    return sendJson(res, 200, { items, nextCursor: next });
+  }
+
+  const summariesMatch = /^\/api\/groups\/([^/]+)\/summaries$/.exec(path);
+  if (summariesMatch && method === "GET") {
+    const group = state.groups.find(
+      (candidate) => candidate.id === summariesMatch[1],
+    );
+    if (group === undefined) {
+      return sendError(res, 404, "not_found", "Group not found.");
+    }
+    return sendJson(res, 200, group.id === GROUP_FAMILY_ID ? GROUP_SUMMARIES : []);
+  }
+
   if (groupMatch && method === "PATCH") {
     const group = state.groups.find((candidate) => candidate.id === groupMatch[1]);
     if (group === undefined) {
@@ -381,6 +582,20 @@ async function handle(req, res, state) {
         },
       ]);
     }
+    if (body.instructions !== undefined) {
+      if (
+        typeof body.instructions !== "string" ||
+        body.instructions.trim().length === 0 ||
+        body.instructions.trim().length > 2000
+      ) {
+        return sendError(res, 400, "validation_error", "Request validation failed.", [
+          {
+            path: "instructions",
+            message: "String must contain at most 2000 character(s)",
+          },
+        ]);
+      }
+    }
     const existing = state.runs.find(
       (run) =>
         run.groupId === body.groupId &&
@@ -398,6 +613,8 @@ async function handle(req, res, state) {
       attempts: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      instructions:
+        typeof body.instructions === "string" ? body.instructions.trim() : null,
       error: null,
     };
     state.runs.unshift(created);

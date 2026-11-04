@@ -1,4 +1,5 @@
 import type {
+  ApiMessagePage,
   ConnectionStatus,
   CreateAdminRequest,
   CreateAdminResponse,
@@ -6,6 +7,8 @@ import type {
   ErrorCode,
   ErrorDetail,
   Group,
+  GroupMember,
+  GroupSummary,
   LoginRequest,
   OkResponse,
   ProviderConfigPublic,
@@ -240,6 +243,17 @@ export function isNetworkError(cause: unknown): boolean {
   return cause instanceof ApiError && cause.code === "network";
 }
 
+/**
+ * Query for `GET /api/groups/:id/messages`; the response envelope is the
+ * shared contract type `ApiMessagePage` (newest first, `nextCursor`).
+ */
+export interface GroupMessagesQuery {
+  from?: string;
+  to?: string;
+  limit?: number;
+  cursor?: string;
+}
+
 export const api = {
   setupStatus(): Promise<SetupStatus> {
     return requestRaw<SetupStatus>("/setup/status").then((result) => result.data);
@@ -276,8 +290,55 @@ export const api = {
     );
   },
 
+  /**
+   * Asks the bot worker to end the linked WhatsApp session (ADR 0008).
+   * Idempotent: `202` whether or not a request was already pending.
+   */
+  async logoutConnection(): Promise<OkResponse> {
+    return (
+      await requestRaw<OkResponse>("/connection/logout", { method: "POST" })
+    ).data;
+  },
+
   groups(): Promise<Group[]> {
     return requestRaw<Group[]>("/groups").then((result) => result.data);
+  },
+
+  /** A single group (the group detail screen). */
+  group(id: string): Promise<Group> {
+    return requestRaw<Group>(`/groups/${encodeURIComponent(id)}`).then(
+      (result) => result.data,
+    );
+  },
+
+  /** Best-effort roster snapshot of the group's chat (ADR 0008). */
+  groupMembers(id: string): Promise<GroupMember[]> {
+    return requestRaw<GroupMember[]>(
+      `/groups/${encodeURIComponent(id)}/members`,
+    ).then((result) => result.data);
+  },
+
+  /**
+   * Chat history, newest first, paginated by `nextCursor`. `from`/`to` are
+   * instants filtering the half-open range `[from, to)`.
+   */
+  groupMessages(id: string, query: GroupMessagesQuery = {}): Promise<ApiMessagePage> {
+    const params = new URLSearchParams();
+    if (query.from !== undefined) params.set("from", query.from);
+    if (query.to !== undefined) params.set("to", query.to);
+    if (query.limit !== undefined) params.set("limit", String(query.limit));
+    if (query.cursor !== undefined) params.set("cursor", query.cursor);
+    const search = params.toString();
+    return requestRaw<ApiMessagePage>(
+      `/groups/${encodeURIComponent(id)}/messages${search === "" ? "" : `?${search}`}`,
+    ).then((result) => result.data);
+  },
+
+  /** Past summaries of the group, newest first, with their run interval. */
+  groupSummaries(id: string): Promise<GroupSummary[]> {
+    return requestRaw<GroupSummary[]>(
+      `/groups/${encodeURIComponent(id)}/summaries`,
+    ).then((result) => result.data);
   },
 
   updateGroup(id: string, body: UpdateGroupRequest): Promise<Group> {

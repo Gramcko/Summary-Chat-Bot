@@ -51,6 +51,7 @@ function newMessage(overrides: Partial<NewMessage> = {}): NewMessage {
     chatJid: GROUP_A,
     whatsappMessageId: `WA-${randomUUID()}`,
     senderJid: "sender@s.whatsapp.net",
+    senderName: null,
     sentAt: new Date("2026-11-01T10:00:00Z"),
     body: "hello",
     messageType: "text",
@@ -128,7 +129,7 @@ describe.skipIf(!shouldRun)(
       // The write refuses unmonitored chats (audit M4), so the group must
       // exist and be monitored first.
       await db.upsertDiscoveredChats(
-        [{ chatJid: GROUP_A, name: "Group A" }],
+        [{ chatJid: GROUP_A, name: "Group A", members: [] }],
         { timezone: "UTC" },
       );
       await pool.query(
@@ -170,7 +171,7 @@ describe.skipIf(!shouldRun)(
     it("the INSERT itself refuses rows for unmonitored chats (audit M4)", async () => {
       const connectionId = await db.ensureConnection();
       await db.upsertDiscoveredChats(
-        [{ chatJid: GROUP_A, name: "Monitored" }, { chatJid: GROUP_B, name: "Unmonitored" }],
+        [{ chatJid: GROUP_A, name: "Monitored", members: [] }, { chatJid: GROUP_B, name: "Unmonitored", members: [] }],
         { timezone: "UTC" },
       );
       await pool.query(
@@ -192,7 +193,7 @@ describe.skipIf(!shouldRun)(
     it("regression: unmonitoring BETWEEN filter and insert drops the row (audit M4)", async () => {
       const connectionId = await db.ensureConnection();
       await db.upsertDiscoveredChats(
-        [{ chatJid: GROUP_A, name: "Race Group" }],
+        [{ chatJid: GROUP_A, name: "Race Group", members: [] }],
         { timezone: "UTC" },
       );
       await pool.query(
@@ -226,7 +227,7 @@ describe.skipIf(!shouldRun)(
     it("discovery upsert never clobbers admin preferences (regression)", async () => {
       // First discovery: new group, privacy-first defaults.
       let result = await db.upsertDiscoveredChats(
-        [{ chatJid: GROUP_A, name: "Team" }],
+        [{ chatJid: GROUP_A, name: "Team", members: [] }],
         { timezone: "UTC" },
       );
       expect(result).toEqual({ inserted: 1, updated: 0 });
@@ -258,7 +259,7 @@ describe.skipIf(!shouldRun)(
 
       // A subject rename (live event) updates ONLY the name.
       result = await db.upsertDiscoveredChats(
-        [{ chatJid: GROUP_A, name: "Team Renamed" }],
+        [{ chatJid: GROUP_A, name: "Team Renamed", members: [] }],
         { timezone: "UTC" },
       );
       expect(result).toEqual({ inserted: 0, updated: 1 });
@@ -278,8 +279,8 @@ describe.skipIf(!shouldRun)(
       // registers new chats next to existing ones.
       result = await db.upsertDiscoveredChats(
         [
-          { chatJid: GROUP_A, name: "Team v3" },
-          { chatJid: GROUP_B, name: "Other" },
+          { chatJid: GROUP_A, name: "Team v3", members: [] },
+          { chatJid: GROUP_B, name: "Other", members: [] },
         ],
         { timezone: "Asia/Tokyo" },
       );
@@ -321,8 +322,8 @@ describe.skipIf(!shouldRun)(
       await service.start();
       // Discovery registers GROUP_A (unmonitored) and GROUP_B.
       adapter.fetchChatsResults = [
-        { chatJid: GROUP_A, name: "Integration Group" },
-        { chatJid: GROUP_B, name: "Unmonitored Group" },
+        { chatJid: GROUP_A, name: "Integration Group", members: [] },
+        { chatJid: GROUP_B, name: "Unmonitored Group", members: [] },
       ];
       adapter.emit({ type: "open" });
       await service.idle();
@@ -690,6 +691,273 @@ describe.skipIf(!shouldRun)(
         "SELECT last_message_at FROM whatsapp_connections",
       );
       expect(connection.rows[0]?.last_message_at).toBeNull();
+    });
+
+    // ---- Session control, roster, sender names (ADR 0008) ----
+
+    it("linking payload (with kind) round-trips and clears on the row", async () => {
+      const connectionId = await db.ensureConnection();
+      await db.setLinkingQr(connectionId, {
+        qr: "SECRET-QR-VALUE",
+        expiresAt: new Date("2026-11-04T10:00:30Z"),
+        kind: "qr",
+      });
+      let row = await pool.query<{
+        linking_qr: string | null;
+        linking_qr_expires_at: Date | null;
+        linking_kind: string | null;
+      }>(
+        "SELECT linking_qr, linking_qr_expires_at, linking_kind FROM whatsapp_connections WHERE id = $1",
+        [connectionId],
+      );
+      expect(row.rows[0]?.linking_qr).toBe("SECRET-QR-VALUE");
+      expect(row.rows[0]?.linking_kind).toBe("qr");
+      expect(row.rows[0]?.linking_qr_expires_at?.toISOString()).toBe(
+        "2026-11-04T10:00:30.000Z",
+      );
+
+      // A new payload REPLACES the previous one (fresh QR supersedes),
+      // and the kind travels with it (CR#6).
+      await db.setLinkingQr(connectionId, {
+        qr: "NEW-CODE",
+        expiresAt: new Date("2026-11-04T10:01:00Z"),
+        kind: "pairing-code",
+      });
+      row = await pool.query(
+        "SELECT linking_qr, linking_qr_expires_at, linking_kind FROM whatsapp_connections WHERE id = $1",
+        [connectionId],
+      );
+      expect(row.rows[0]?.linking_qr).toBe("NEW-CODE");
+      expect(row.rows[0]?.linking_kind).toBe("pairing-code");
+
+      await db.clearLinkingQr(connectionId);
+      row = await pool.query(
+        "SELECT linking_qr, linking_qr_expires_at, linking_kind FROM whatsapp_connections WHERE id = $1",
+        [connectionId],
+      );
+      expect(row.rows[0]?.linking_qr).toBeNull();
+      expect(row.rows[0]?.linking_qr_expires_at).toBeNull();
+      expect(row.rows[0]?.linking_kind).toBeNull();
+    });
+
+    it("clearExpiredLinking removes stale payloads but keeps fresh ones", async () => {
+      const connectionId = await db.ensureConnection();
+      await db.setLinkingQr(connectionId, {
+        qr: "FRESH-QR",
+        expiresAt: new Date(Date.now() + 60_000),
+        kind: "qr",
+      });
+      expect(await db.clearExpiredLinking()).toBe(0); // fresh: untouched
+      let row = await pool.query<{ linking_qr: string | null }>(
+        "SELECT linking_qr FROM whatsapp_connections WHERE id = $1",
+        [connectionId],
+      );
+      expect(row.rows[0]?.linking_qr).toBe("FRESH-QR");
+
+      await db.setLinkingQr(connectionId, {
+        qr: "STALE-QR",
+        expiresAt: new Date(Date.now() - 1),
+        kind: "pairing-code",
+      });
+      expect(await db.clearExpiredLinking()).toBe(1); // expired: gone
+      row = await pool.query(
+        "SELECT linking_qr FROM whatsapp_connections WHERE id = $1",
+        [connectionId],
+      );
+      expect(row.rows[0]?.linking_qr).toBeNull();
+      const kind = await pool.query<{ linking_kind: string | null }>(
+        "SELECT linking_kind FROM whatsapp_connections WHERE id = $1",
+        [connectionId],
+      );
+      expect(kind.rows[0]?.linking_kind).toBeNull();
+    });
+
+    it("syncGroupMembers enforces the MONITORED boundary in SQL (H-1)", async () => {
+      const unmonitoredChat = "not-monitored@g.us";
+      await db.upsertDiscoveredChats(
+        [{ chatJid: unmonitoredChat, name: "Private", members: [] }],
+        { timezone: "UTC" },
+      ); // inserts monitored = false
+
+      // The unmonitored chat syncs NOTHING — even if a caller believes
+      // it should (the EXISTS guard is the boundary).
+      const result = await db.syncGroupMembers(unmonitoredChat, [
+        { userId: "999@s.whatsapp.net", name: "Eve", isAdmin: false },
+      ]);
+      expect(result).toEqual({ upserted: 0, deactivated: 0 });
+      const rows = await pool.query<{ count: string }>(
+        "SELECT count(*) AS count FROM group_members WHERE chat_id = $1",
+        [unmonitoredChat],
+      );
+      expect(rows.rows[0]?.count).toBe("0");
+    });
+
+    it("syncGroupMembers upserts, keeps names, and deactivates absent members", async () => {
+      const chatId = "members-test@g.us";
+      // Rosters only ever sync for MONITORED groups (H-1).
+      await db.upsertDiscoveredChats(
+        [{ chatJid: chatId, name: "Members", members: [] }],
+        { timezone: "UTC" },
+      );
+      await pool.query(
+        "UPDATE groups SET monitored = true WHERE chat_id = $1",
+        [chatId],
+      );
+      const first = await db.syncGroupMembers(chatId, [
+        { userId: "111@s.whatsapp.net", name: "Alice", isAdmin: true },
+        { userId: "222@lid", name: null, isAdmin: false },
+      ]);
+      expect(first).toEqual({ upserted: 2, deactivated: 0 });
+
+      // Bob left and Alice was renamed; Carol joined.
+      const second = await db.syncGroupMembers(chatId, [
+        { userId: "111@s.whatsapp.net", name: "Alice Updated", isAdmin: false },
+        { userId: "333@s.whatsapp.net", name: "Carol", isAdmin: false },
+      ]);
+      expect(second).toEqual({ upserted: 2, deactivated: 1 });
+
+      let rows = await pool.query<{
+        user_id: string;
+        name: string | null;
+        is_admin: boolean;
+        active: boolean;
+      }>(
+        "SELECT user_id, name, is_admin, active FROM group_members WHERE chat_id = $1 ORDER BY user_id",
+        [chatId],
+      );
+      expect(rows.rows).toEqual([
+        {
+          user_id: "111@s.whatsapp.net",
+          name: "Alice Updated",
+          is_admin: false,
+          active: true,
+        },
+        {
+          user_id: "222@lid",
+          name: null,
+          is_admin: false,
+          active: false, // left the chat — kept as history, never deleted
+        },
+        {
+          user_id: "333@s.whatsapp.net",
+          name: "Carol",
+          is_admin: false,
+          active: true,
+        },
+      ]);
+
+      // A nameless sync keeps stored names and reactivates returnees.
+      await db.syncGroupMembers(chatId, [
+        { userId: "111@s.whatsapp.net", name: null, isAdmin: true },
+        { userId: "222@lid", name: null, isAdmin: false },
+        { userId: "333@s.whatsapp.net", name: null, isAdmin: false },
+      ]);
+      rows = await pool.query(
+        "SELECT user_id, name, is_admin, active FROM group_members WHERE chat_id = $1 ORDER BY user_id",
+        [chatId],
+      );
+      expect(rows.rows.map((row) => row.name)).toEqual([
+        "Alice Updated",
+        null,
+        "Carol",
+      ]);
+      expect(rows.rows.every((row) => row.active)).toBe(true);
+
+      // An EMPTY roster is "no data": nobody is ever deactivated.
+      const empty = await db.syncGroupMembers(chatId, []);
+      expect(empty).toEqual({ upserted: 0, deactivated: 0 });
+      const active = await pool.query<{ count: string }>(
+        "SELECT count(*) AS count FROM group_members WHERE chat_id = $1 AND active = true",
+        [chatId],
+      );
+      expect(active.rows[0]?.count).toBe("3");
+
+      // Mid-way unmonitor (H-1): once the admin opts out, future syncs
+      // stop — the guard is evaluated per statement, not once at
+      // discovery time.
+      await pool.query("UPDATE groups SET monitored = false WHERE chat_id = $1", [
+        chatId,
+      ]);
+      const afterUnmonitor = await db.syncGroupMembers(chatId, [
+        { userId: "111@s.whatsapp.net", name: "Ghost", isAdmin: false },
+      ]);
+      expect(afterUnmonitor).toEqual({ upserted: 0, deactivated: 0 });
+      const ghost = await pool.query<{ name: string | null }>(
+        "SELECT name FROM group_members WHERE chat_id = $1 AND user_id = $2",
+        [chatId, "111@s.whatsapp.net"],
+      );
+      expect(ghost.rows[0]?.name).toBe("Alice Updated"); // untouched
+    });
+
+    it("logout request is consumed once and finalizeLogout clears the row", async () => {
+      const connectionId = await db.ensureConnection();
+      await db.setLinkingQr(connectionId, {
+        qr: "STALE-QR",
+        expiresAt: new Date(),
+        kind: "qr",
+      });
+      await pool.query(
+        "UPDATE whatsapp_connections SET logout_requested_at = now(), last_message_at = now() WHERE id = $1",
+        [connectionId],
+      );
+
+      const requestedAt = await db.consumeLogoutRequest();
+      expect(requestedAt).toBeInstanceOf(Date);
+      // Consumed exactly once (atomic read-and-clear).
+      expect(await db.consumeLogoutRequest()).toBeNull();
+
+      await db.finalizeLogout(connectionId);
+      const row = await pool.query<{
+        state: string;
+        linking_qr: string | null;
+        linking_kind: string | null;
+        logout_requested_at: Date | null;
+        last_message_at: Date | null;
+      }>(
+        "SELECT state, linking_qr, linking_kind, logout_requested_at, last_message_at " +
+          "FROM whatsapp_connections WHERE id = $1",
+        [connectionId],
+      );
+      expect(row.rows[0]?.state).toBe("unavailable");
+      expect(row.rows[0]?.linking_qr).toBeNull();
+      expect(row.rows[0]?.linking_kind).toBeNull();
+      expect(row.rows[0]?.logout_requested_at).toBeNull();
+      // last_message_at is historical fact — deliberately kept.
+      expect(row.rows[0]?.last_message_at).not.toBeNull();
+    });
+
+    it("insertMessages persists sender_name (shared live + history path)", async () => {
+      const connectionId = await db.ensureConnection();
+      await db.upsertDiscoveredChats(
+        [{ chatJid: GROUP_A, name: "Group A", members: [] }],
+        { timezone: "UTC" },
+      );
+      await pool.query("UPDATE groups SET monitored = true WHERE chat_id = $1", [
+        GROUP_A,
+      ]);
+      await db.insertMessages(connectionId, [
+        newMessage({
+          chatJid: GROUP_A,
+          whatsappMessageId: "SN-1",
+          senderName: "Alice",
+        }),
+        newMessage({
+          chatJid: GROUP_A,
+          whatsappMessageId: "SN-2",
+          senderName: null,
+        }),
+      ]);
+
+      const rows = await pool.query<{
+        whatsapp_message_id: string;
+        sender_name: string | null;
+      }>(
+        "SELECT whatsapp_message_id, sender_name FROM messages ORDER BY whatsapp_message_id",
+      );
+      expect(rows.rows).toEqual([
+        { whatsapp_message_id: "SN-1", sender_name: "Alice" },
+        { whatsapp_message_id: "SN-2", sender_name: null },
+      ]);
     });
   },
 );

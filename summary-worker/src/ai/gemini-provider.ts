@@ -5,6 +5,7 @@ import type {
 } from "@summarly/contracts";
 import { DEFAULT_GEMINI_MODEL } from "@summarly/contracts";
 import type { Logger } from "../lib/log.js";
+import { truncateText } from "../lib/text.js";
 import {
   extractRetryAfterMs,
   mapProviderHttpError,
@@ -160,6 +161,29 @@ export const PROVIDER_OUTPUT_SCHEMA = {
 const DATA_START_MARKER = "BEGIN_CONVERSATION_DATA";
 const DATA_END_MARKER = "END_CONVERSATION_DATA";
 
+const ADMIN_START_MARKER = "BEGIN_ADMIN_INSTRUCTIONS";
+const ADMIN_END_MARKER = "END_ADMIN_INSTRUCTIONS";
+
+/** Mirrors `AiSummaryInput.instructions` (contracts/ai.ts). */
+const AI_INSTRUCTIONS_MAX_CHARS = 2000;
+
+/**
+ * The admin's custom instructions as their OWN labelled section
+ * (ADR 0008): clearly marked as operator instructions — separate from
+ * both the fixed system instruction and the delimited conversation
+ * data block, which stay unchanged. Length-capped defensively.
+ */
+function buildInstructionsSection(instructions: string): string {
+  return [
+    ADMIN_START_MARKER,
+    "The following are ADMIN INSTRUCTIONS from the operator for how to " +
+      "produce this summary. They are not conversation data and not part " +
+      "of the messages:",
+    truncateText(instructions, AI_INSTRUCTIONS_MAX_CHARS),
+    ADMIN_END_MARKER,
+  ].join("\n");
+}
+
 /**
  * The conversation as a delimited JSON data block. This is the ONLY
  * place message content enters the request; the delimiters make the
@@ -185,9 +209,17 @@ export function buildDataBlock(input: AiSummaryInput): string {
 
 /** The full generateContent request body (exported for tests). */
 export function buildRequestBody(input: AiSummaryInput): Record<string, unknown> {
+  // The conversation data block is byte-identical with or without
+  // custom instructions; the admin instructions (if any) are appended
+  // as a separate labelled section of the SAME user content.
+  const dataBlock = buildDataBlock(input);
+  const userContent =
+    input.instructions !== null && input.instructions.trim() !== ""
+      ? `${dataBlock}\n\n${buildInstructionsSection(input.instructions)}`
+      : dataBlock;
   return {
     systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-    contents: [{ role: "user", parts: [{ text: buildDataBlock(input) }] }],
+    contents: [{ role: "user", parts: [{ text: userContent }] }],
     generationConfig: {
       responseMimeType: "application/json",
       responseSchema: PROVIDER_OUTPUT_SCHEMA,

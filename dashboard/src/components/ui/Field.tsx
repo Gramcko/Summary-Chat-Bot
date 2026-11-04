@@ -256,3 +256,90 @@ export function CheckboxField({
     </div>
   );
 }
+
+export interface TextAreaFieldProps {
+  id: string;
+  label: ReactNode;
+  value: string;
+  onChange: (value: string) => void;
+  hint?: string;
+  error?: string;
+  required?: boolean;
+  placeholder?: string;
+  /** Hard input limit (HTML `maxLength`); omitted means no truncation. */
+  maxLength?: number;
+  /** Display limit for the `n / max` counter (defaults to `maxLength`). */
+  counterMax?: number;
+  rows?: number;
+  disabled?: boolean;
+  spellCheck?: boolean;
+  className?: string;
+  /** Shows `n / max` under the field (requires `maxLength` or `counterMax`). */
+  showCounter?: boolean;
+}
+
+export function TextAreaField({
+  id,
+  label,
+  value,
+  onChange,
+  hint,
+  error,
+  required = false,
+  placeholder,
+  maxLength,
+  counterMax,
+  rows = 4,
+  disabled = false,
+  spellCheck,
+  className = "",
+  showCounter = false,
+}: TextAreaFieldProps) {
+  const displayMax = counterMax ?? maxLength;
+  const counterId =
+    showCounter && displayMax !== undefined ? `${id}-counter` : undefined;
+  const describedByIds = [
+    hint === undefined ? null : `${id}-hint`,
+    error === undefined ? null : `${id}-error`,
+    counterId ?? null,
+  ].filter((entry): entry is string => entry !== null);
+
+  return (
+    <div className={className}>
+      <FieldLabel htmlFor={id} label={label} required={required} />
+      <textarea
+        id={id}
+        name={id}
+        value={value}
+        onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+          onChange(event.target.value)
+        }
+        rows={rows}
+        className={`mt-1.5 min-h-24 w-full resize-y ${inputClasses(error)}`}
+        aria-invalid={error === undefined ? undefined : true}
+        aria-describedby={
+          describedByIds.length === 0 ? undefined : describedByIds.join(" ")
+        }
+        aria-required={required || undefined}
+        required={required}
+        placeholder={placeholder}
+        maxLength={maxLength}
+        disabled={disabled}
+        spellCheck={spellCheck}
+      />
+      <FieldMessages id={id} hint={hint} error={error} />
+      {counterId === undefined ? null : (
+        <p
+          id={counterId}
+          className={`mt-1 text-right text-xs tabular-nums ${
+            displayMax !== undefined && value.length > displayMax
+              ? "font-medium text-red-700"
+              : "text-slate-500"
+          }`}
+        >
+          {value.length} / {displayMax}
+        </p>
+      )}
+    </div>
+  );
+}

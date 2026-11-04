@@ -280,6 +280,24 @@ describe("history import: claim → request → ingest → done", () => {
     // The message budget stays exact on top of the buffer cap.
     expect(h.db.groups.get(GROUP_A)?.historyImportedCount).toBe(2);
   });
+
+  it("persists sender names on the history path too (ADR 0008)", async () => {
+    const h = harness();
+    seedImport(h.db);
+    scriptResponses(h.adapter, [
+      () =>
+        h.adapter.emitHistory(GROUP_A, [
+          rawMessage({ messageId: "H1", senderName: "Alice" }),
+          rawMessage({ messageId: "H2", senderName: null }),
+        ]),
+    ]);
+
+    await h.service.runOnce();
+
+    // The shared normalize path carries push names into both capture
+    // routes; names are PII and never appear in the logs.
+    expect(h.db.messages.map((row) => row.senderName)).toEqual(["Alice", null]);
+  });
 });
 
 describe("history import: bounded budget (partial by design)", () => {

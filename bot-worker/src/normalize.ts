@@ -48,6 +48,8 @@ export interface NewMessage {
   chatJid: string;
   whatsappMessageId: string;
   senderJid: string | null;
+  /** WhatsApp push name of the sender when known (PII, display only). */
+  senderName: string | null;
   sentAt: Date;
   body: string;
   messageType: MessageType;
@@ -109,10 +111,18 @@ export function normalizeMessage(raw: RawInboundMessage): NormalizeResult {
   }
 
   const sentAt = new Date(raw.timestampSec * 1000);
+  // Sender names are clamped to the contract maximum (300 chars, CR#5):
+  // the same rule on the live-capture and history-import paths, which
+  // share this normalize step.
+  const senderName =
+    raw.senderName !== null && raw.senderName !== ""
+      ? raw.senderName.slice(0, 300)
+      : null;
   const base = {
     chatJid: raw.chatJid,
     whatsappMessageId: raw.messageId,
     senderJid: raw.senderJid,
+    senderName,
     sentAt,
   };
 

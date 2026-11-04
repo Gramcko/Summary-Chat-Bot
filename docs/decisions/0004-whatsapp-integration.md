@@ -389,3 +389,84 @@ retention policy is productized (Phase E/F):
   digest) against the fork's current state, and re-test linking. When CI
   exists, add `npm audit signatures` / provenance verification to the
   pipeline.
+
+## Additions (ADR 0008 round 2 — bot-worker)
+
+- **Headless linking via the database:** every linking QR / pairing
+  code is now PUBLISHED to `whatsapp_connections.linking_qr` +
+  `linking_qr_expires_at` so the dashboard can render it (the auth-only
+  API reads it; a fresh payload replaces the old one). The value is a
+  LIVE PAIRING TICKET: it is stored for that API and **never logged** —
+  the same rule as before now covers the DB path too. TTL semantics are
+  conservative: QR ~60 s (they rotate every ~20 s but may stay valid
+  longer), pairing codes 5 minutes. The payload is cleared when the
+  session connects, when the session is lost, and on logout. The
+  TTY-gated terminal display remains for headless-operator UX.
+- **Admin logout control:** the backend sets
+  `whatsapp_connections.logout_requested_at`; the bot-worker consumes
+  and clears the flag (`SESSION_CONTROL_POLL_MS`, default 3000, floor
+  1000), stops reconnects, revokes the linked device remotely
+  (`logout()`, verified in Baileys 6.7.24 — it does NOT delete local
+  files), deletes the session-directory FILES (the directory may stay),
+  and finalizes the row to `unavailable` with the linking payload
+  cleared (`last_message_at` is kept — historical fact). Idempotent: a
+  second request while logged out only clears the flag.
+- **Group members roster (best-effort):** on connect the discovered
+  groups' participants are upserted into `group_members` (user JID,
+  name when available, admin flag); `group-participants.update` events
+  refresh that chat. WhatsApp does NOT replay membership history, so
+  the roster is a snapshot that drifts toward reality — members missing
+  from a snapshot are marked `active = false` and kept (never deleted),
+  and an empty snapshot is "no data", never "everyone left". **Names
+  are optional**: the push name is preferred (then saved/verified
+  name); a missing name keeps the stored one and never fails a sync.
+  Both names and user JIDs are PII (auth-only API, retention applies).
+- **Sender names at ingestion:** the WhatsApp push name is stored in
+  `messages.sender_name` on both the live-capture and history-import
+  paths (shared normalize path). Display-only PII: never logged.
+
+### Fix round B (audit + review corrections)
+
+- **Rosters are MONITORED-only (H-1).** The earlier "all discovered
+  groups" scope leaked membership of groups the admin never opted in.
+  Roster sync now runs only for chats in `groups` with
+  `monitored = true` — filtered at discovery AND enforced inside the
+  upsert SQL (EXISTS guard), and participant events for unmonitored
+  chats neither fetch nor sync. A group that gets unmonitored stops
+  syncing immediately (existing rows stay as historical data).
+- **Logout is BOUNDED and always cleans up (M-1).** The remote logout
+  (`sock.logout()`) is wrapped in a 15 s timeout: a stalled network can
+  no longer skip the credential purge or block shutdown. The purge and
+  the `unavailable` finalize ALWAYS run; `logout_completed{ok}` reports
+  whether the remote revoke succeeded. The purge deletes ONLY known
+  Baileys auth artefacts (M-3) — `creds.json` and
+  `<category>-<id>.json` for the signal-store categories verified
+  against the installed 6.7.24 (`pre-key`, `session`, `sender-key`,
+  `sender-key-memory`, `app-state-sync-key`,
+  `app-state-sync-version`) — anything else in the directory is left in
+  place and counted in a warn log.
+- **Re-linking actually works (CR-M1).** After the teardown the capture
+  latches are reset and the socket restarted (`rearm`), so the normal
+  flow publishes a fresh QR within one poll — no worker restart needed.
+  If re-arm itself fails, the latch stays set and later requests only
+  clear the flag until the worker is restarted (logged
+  `session_rearm_failed`).
+- **Pairing-code dead end fixed (CR#6).** The pairing latch expires
+  with the published code (5-minute TTL): a QR arriving afterwards
+  starts a fresh pairing flow instead of silently dead-ending. Every
+  published payload now carries its `kind` (`qr` | `pairing-code`,
+  `linking_kind`), and expired payloads are cleared opportunistically
+  on the session-control tick in addition to the event-driven clears
+  (CR#7) — a stale pairing ticket can never outlive its expiry.
+- **Roster writes are one statement (CR#8).** Upsert + deactivation run
+  in a single CTE, so no observer can see the transient
+  "everyone active" window the two-statement version exposed.
+- **Sender names clamped (CR#5)** to the 300-char contract maximum at
+  ingest (shared normalize step, both capture paths).
+- **Parent-PID watchdog (risk).** Like the summary-worker, the
+  bot-worker polls `SUMMARLY_PARENT_PID` (~2 s) when supervised and
+  shuts down gracefully when the parent disappears — a force-killed
+  backend must never orphan a live WhatsApp session. Standalone runs
+  are unaffected.
+- `WA_SESSION_ALLOW_INSECURE` is now commented out by default in
+  `.env.example` (dev users keep the line in their local `.env`).

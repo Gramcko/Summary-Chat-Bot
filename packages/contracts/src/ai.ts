@@ -27,11 +27,19 @@ export const AiMessage = z.object({
  * Input for one AI summarization request. `period` is the half-open
  * interval [start, end) of the run being summarized; `messages` is
  * ordered deterministically and may be empty (empty periods are valid).
+ *
+ * `instructions` is the admin's optional custom prompt ("focus on
+ * decisions and ignore chit-chat"). It is a PROVIDER-NEUTRAL channel:
+ * adapters must present it as clearly-labelled ADMIN INSTRUCTIONS in a
+ * section of its own — never merged into the conversation data block
+ * and never into the system instruction (ADR 0008). It is part of the
+ * request, not of the summarized content.
  */
 export const AiSummaryInput = z.object({
   groupName: z.string().min(1),
   period: Interval,
   messages: z.array(AiMessage),
+  instructions: z.string().max(2000).nullable(),
 });
 
 /**

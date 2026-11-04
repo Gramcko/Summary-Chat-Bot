@@ -8,7 +8,7 @@ import {
   it,
 } from "vitest";
 import { Pool } from "pg";
-import { ApiError, Group, ProviderConfigPublic, Summary, type ConnectionStatus, type SummaryResult } from "@summarly/contracts";
+import { ApiError, Group, GroupSummary, ProviderConfigPublic, Summary, type ConnectionStatus, type SummaryResult } from "@summarly/contracts";
 import { buildApp } from "../src/app.js";
 import { decryptSecret, parseEncryptionKey } from "../src/lib/crypto.js";
 import { hashPassword, verifyPassword } from "../src/lib/password.js";
@@ -491,6 +491,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
           state: "connected",
           since,
           lastMessageAt: since,
+          linking: null,
         });
         const status = await store.getConnectionStatus();
         expect(status.state).toBe("connected");
@@ -955,6 +956,274 @@ describe.skipIf(!process.env["DATABASE_URL"])(
         });
         await store.cancelPendingHistoryImport(wiredId);
         expect((await importRow(wiredId))?.history_import_status).toBeNull();
+      });
+    });
+
+    describe("product upgrade surfaces (ADR 0008)", () => {
+      it("persists run instructions (first request wins on create-or-find)", async () => {
+        const store = new PostgresStore(pool);
+        const groupId = await seedGroupRow(store);
+        const interval = {
+          start: "2026-11-01T00:00:00.000Z",
+          end: "2026-11-02T00:00:00.000Z",
+          timezone: "Europe/Madrid",
+        };
+        const first = await store.createOrFindRun({
+          groupId,
+          interval,
+          kind: "manual",
+          instructions: "Focus on decisions.",
+        });
+        expect(first.run.instructions).toBe("Focus on decisions.");
+        const row = await pool.query<{ instructions: string | null }>(
+          "SELECT instructions FROM summary_runs WHERE id = $1",
+          [first.run.id],
+        );
+        expect(row.rows[0]?.instructions).toBe("Focus on decisions.");
+
+        // Identity excludes instructions: the repeat keeps the first.
+        const repeat = await store.createOrFindRun({
+          groupId,
+          interval,
+          kind: "manual",
+          instructions: "Different instructions.",
+        });
+        expect(repeat.created).toBe(false);
+        expect(repeat.run.instructions).toBe("Focus on decisions.");
+
+        // No instructions -> NULL.
+        const other = await store.createOrFindRun({
+          groupId,
+          interval: {
+            start: "2026-11-02T00:00:00.000Z",
+            end: "2026-11-03T00:00:00.000Z",
+            timezone: "Europe/Madrid",
+          },
+          kind: "manual",
+        });
+        expect(other.run.instructions).toBeNull();
+      });
+
+      it("stores connection linking and the logout request (SQL semantics)", async () => {
+        const store = new PostgresStore(pool);
+        await store.setConnectionStatus({
+          state: "disconnected",
+          since: nowIso(),
+          lastMessageAt: null,
+          linking: null,
+        });
+
+        // Linking appears while valid (and in a linking state) and hides
+        // when expired, cleared, or the session is CONNECTED (M-4).
+        await store.updateConnectionLinking({
+          qr: "2@abc123pairingpayload",
+          expiresAt: "2100-01-01T00:00:00.000Z",
+        });
+        expect((await store.getConnectionStatus()).linking).toEqual({
+          kind: "qr", // default for QR payloads
+          qr: "2@abc123pairingpayload",
+          expiresAt: "2100-01-01T00:00:00.000Z",
+        });
+        // The published kind is stored and served (migration 0005).
+        await store.updateConnectionLinking({
+          kind: "pairing-code",
+          qr: "12345678",
+          expiresAt: "2100-01-01T00:00:00.000Z",
+        });
+        expect((await store.getConnectionStatus()).linking).toEqual({
+          kind: "pairing-code",
+          qr: "12345678",
+          expiresAt: "2100-01-01T00:00:00.000Z",
+        });
+        // M-4: a valid payload is NOT served once connected (or in any
+        // non-linking state).
+        await store.setConnectionStatus({
+          state: "connected",
+          since: nowIso(),
+          lastMessageAt: null,
+          linking: null,
+        });
+        expect((await store.getConnectionStatus()).linking).toBeNull();
+        await store.setConnectionStatus({
+          state: "disconnected",
+          since: nowIso(),
+          lastMessageAt: null,
+          linking: null,
+        });
+        await store.updateConnectionLinking({
+          qr: "2@expired",
+          expiresAt: "2000-01-01T00:00:00.000Z",
+        });
+        expect((await store.getConnectionStatus()).linking).toBeNull();
+        await store.updateConnectionLinking(null);
+
+        // requestLogout is idempotent: the first timestamp survives.
+        await store.requestLogout();
+        const first = await pool.query<{ logout_requested_at: Date }>(
+          "SELECT logout_requested_at FROM whatsapp_connections",
+        );
+        await store.requestLogout();
+        const second = await pool.query<{ logout_requested_at: Date }>(
+          "SELECT logout_requested_at FROM whatsapp_connections",
+        );
+        expect(second.rows[0]?.logout_requested_at.toISOString()).toBe(
+          first.rows[0]?.logout_requested_at.toISOString(),
+        );
+
+        // clearLogoutRequest is the bot-worker's consume path.
+        await store.clearLogoutRequest();
+        expect(
+          (
+            await store.getConnectionStatus()
+          ),
+        ).toBeDefined();
+        const cleared = await pool.query<{ logout_requested_at: Date | null }>(
+          "SELECT logout_requested_at FROM whatsapp_connections",
+        );
+        expect(cleared.rows[0]?.logout_requested_at).toBeNull();
+      });
+
+      it("upserts and lists group members (roster refresh)", async () => {
+        const store = new PostgresStore(pool);
+        const chatId = `${randomUUID()}@g.us`;
+        await store.upsertGroupMembers(chatId, [
+          { userId: "2@s.whatsapp.net", name: "Bo", isAdmin: false, active: true },
+          { userId: "1@s.whatsapp.net", name: "Ana", isAdmin: true, active: true },
+          { userId: "3@s.whatsapp.net", name: null, isAdmin: false, active: true },
+        ]);
+        const members = await store.listGroupMembers(chatId);
+        expect(members.map((member) => member.userId)).toEqual([
+          "1@s.whatsapp.net",
+          "2@s.whatsapp.net",
+          "3@s.whatsapp.net", // NULL name sorts LAST (mirrors SQL)
+        ]);
+
+        // Refresh updates in place (same chat_id + user_id).
+        await store.upsertGroupMembers(chatId, [
+          { userId: "2@s.whatsapp.net", name: "Bo (renamed)", isAdmin: true, active: false },
+        ]);
+        const refreshed = await store.listGroupMembers(chatId);
+        expect(refreshed).toHaveLength(3);
+        const bo = refreshed.find((member) => member.userId === "2@s.whatsapp.net");
+        expect(bo?.name).toBe("Bo (renamed)");
+        expect(bo?.isAdmin).toBe(true);
+        expect(bo?.active).toBe(false);
+
+        // COALESCE name semantics (fix round A, m9): a refresh WITHOUT a
+        // display name must not wipe a known one.
+        await store.upsertGroupMembers(chatId, [
+          { userId: "2@s.whatsapp.net", name: null, isAdmin: false, active: true },
+        ]);
+        const coalesced = await store.listGroupMembers(chatId);
+        expect(
+          coalesced.find((member) => member.userId === "2@s.whatsapp.net")?.name,
+        ).toBe("Bo (renamed)");
+      });
+
+      it("lists chat messages newest-first with sender names, range, and cursor", async () => {
+        const store = new PostgresStore(pool);
+        const chatId = `${randomUUID()}@g.us`;
+        await pool.query(
+          `INSERT INTO whatsapp_connections (id, state) VALUES ($1, 'connected')`,
+          [randomUUID()],
+        );
+        const insert = (
+          id: string,
+          sentAt: string,
+          body: string,
+          senderName: string | null,
+        ) =>
+          pool.query(
+            `INSERT INTO messages
+               (connection_id, chat_id, whatsapp_message_id, sender_id,
+                sender_name, sent_at, body)
+             SELECT id, $1, $2, 'user@s.whatsapp.net', $3, $4, $5
+             FROM whatsapp_connections LIMIT 1`,
+            [chatId, `wa-${id}`, senderName, new Date(sentAt), body],
+          );
+        const idA = randomUUID();
+        const idB = randomUUID();
+        const idC = randomUUID();
+        await insert(idA, "2026-11-01T09:00:00Z", "early", "Ana");
+        await insert(idB, "2026-11-01T10:00:00Z", "middle", null);
+        await insert(idC, "2026-11-01T11:00:00Z", "late", "Cid");
+
+        const page1 = await store.listGroupMessages(chatId, {
+          limit: 2,
+        });
+        expect(page1.map((message) => message.body)).toEqual(["late", "middle"]);
+        expect(page1[0]?.senderName).toBe("Cid");
+        expect(page1[1]?.senderName).toBeNull();
+        expect(page1[0]?.chatId).toBeUndefined();
+
+        const page2 = await store.listGroupMessages(chatId, {
+          limit: 2,
+          cursor: `${page1[1]?.sentAt}|${page1[1]?.id}`,
+        });
+        expect(page2.map((message) => message.body)).toEqual(["early"]);
+
+        // A malformed cursor (non-UUID id) is a clean store error, never
+        // a `::uuid` cast failure (fix round A, audit L-4). The route
+        // validates first and answers 400; this is the backstop.
+        await expect(
+          store.listGroupMessages(chatId, {
+            limit: 2,
+            cursor: "2026-11-01T10:00:00.000Z|not-a-uuid",
+          }),
+        ).rejects.toThrow(/invalid message cursor/);
+
+        // Half-open [from, to).
+        const ranged = await store.listGroupMessages(chatId, {
+          from: "2026-11-01T09:00:00Z",
+          to: "2026-11-01T11:00:00Z",
+          limit: 50,
+        });
+        expect(ranged.map((message) => message.body)).toEqual([
+          "middle",
+          "early",
+        ]);
+      });
+
+      it("lists group summaries with their run intervals", async () => {
+        const store = new PostgresStore(pool);
+        const groupId = await seedGroupRow(store);
+        const run = await store.createOrFindRun({
+          groupId,
+          interval: {
+            start: "2026-10-31T23:00:00.000Z",
+            end: "2026-11-01T23:00:00.000Z",
+            timezone: "Europe/Madrid",
+          },
+          kind: "scheduled",
+        });
+        await store.saveSummary({
+          id: randomUUID(),
+          runId: run.run.id,
+          provider: "mock",
+          model: "mock-1",
+          result: {
+            overview: "Integration overview.",
+            keyDiscussions: [],
+            confirmedDecisions: [],
+            proposals: [],
+            unresolvedQuestions: [],
+            tasks: [],
+            links: [],
+            aiGenerated: true,
+          },
+          createdAt: nowIso(),
+        });
+
+        const summaries = await store.listGroupSummaries(groupId, { limit: 20 });
+        expect(summaries).toHaveLength(1);
+        expect(GroupSummary.parse(summaries[0])).toBeDefined();
+        expect(summaries[0]?.interval.start).toBe("2026-10-31T23:00:00.000Z");
+        expect(summaries[0]?.interval.timezone).toBe("Europe/Madrid");
+
+        // Other groups see none of it.
+        expect(
+          await store.listGroupSummaries(randomUUID(), { limit: 20 }),
+        ).toEqual([]);
       });
     });
   },

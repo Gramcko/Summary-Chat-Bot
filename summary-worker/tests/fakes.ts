@@ -33,6 +33,7 @@ export function makeRun(overrides?: Partial<SummaryRun>): SummaryRun {
     status: "pending",
     interval: INTERVAL,
     attempts: 0,
+    instructions: null,
     createdAt: "2026-10-29T00:00:00.000Z",
     updatedAt: "2026-10-29T00:00:00.000Z",
     error: null,

@@ -2,7 +2,8 @@
 
 import type { SummaryRun } from "@summarly/contracts";
 import { Button, ButtonLink } from "@/components/ui/Button";
-import { EmptyState, ErrorState, LoadingBlock, PageHeader } from "@/components/ui/States";
+import { EmptyState, ErrorState, PageHeader } from "@/components/ui/States";
+import { SkeletonCard } from "@/components/ui/Skeleton";
 import { api } from "@/lib/api";
 import { useResource } from "@/lib/hooks";
 import { RequestRunForm } from "@/components/runs/RequestRunForm";
@@ -65,7 +66,7 @@ export default function RunsPage() {
       )}
 
       {groups.loading && groupList === null ? (
-        <LoadingBlock label="Loading groups…" />
+        <SkeletonCard label="Loading groups…" />
       ) : null}
 
       {groupList !== null && groupList.length === 0 ? (
@@ -85,7 +86,7 @@ export default function RunsPage() {
       ) : null}
 
       {runs.loading && runs.data === null ? (
-        <LoadingBlock label="Loading summary runs…" />
+        <SkeletonCard label="Loading summary runs…" />
       ) : null}
 
       {runs.error === null ? null : (

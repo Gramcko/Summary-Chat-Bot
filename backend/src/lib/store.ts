@@ -1,11 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import type {
-  ConnectionStatus,
-  Group,
-  Interval,
-  RunKind,
-  Summary,
-  SummaryRun,
+import {
+  Id,
+  type ApiMessage,
+  type ConnectionLinking,
+  type ConnectionStatus,
+  type Group,
+  type GroupMember,
+  type GroupSummary,
+  type Interval,
+  type RunKind,
+  type Summary,
+  type SummaryRun,
 } from "@summarly/contracts";
 
 export interface AdminRecord {
@@ -25,6 +30,72 @@ export interface CreateRunInput {
   groupId: string;
   interval: Interval;
   kind: RunKind;
+  /**
+   * Admin custom summary instructions (ADR 0008); omitted/undefined
+   * stores NULL. The FIRST request's instructions win on a repeated
+   * create-or-find, like the timezone label — run identity is
+   * (group, interval, kind) and does not include them.
+   */
+  instructions?: string | null;
+}
+
+/** Membership upsert entry (system fields come from the store). */
+export interface GroupMemberInput {
+  userId: string;
+  name: string | null;
+  isAdmin: boolean;
+  active: boolean;
+}
+
+/** Newest-first message listing (ADR 0008). `cursor` is opaque text. */
+export interface ListMessagesOptions {
+  /** Inclusive lower bound (ISO instant). */
+  from?: string;
+  /** Exclusive upper bound (ISO instant) — half-open [from, to). */
+  to?: string;
+  limit: number;
+  /** Opaque cursor from a previous page's `nextCursor`. */
+  cursor?: string;
+}
+
+/** Cursor = `<sentAt ISO>|<message id>`; undefined when invalid. */
+export function decodeMessageCursor(
+  cursor: string,
+): { sentAt: string; id: string } | undefined {
+  const separator = cursor.indexOf("|");
+  if (separator <= 0 || separator === cursor.length - 1) return undefined;
+  const sentAt = cursor.slice(0, separator);
+  const id = cursor.slice(separator + 1);
+  // The id MUST be a contract `Id` (UUID): anything else is a malformed
+  // cursor — a 400 at the route, never a `::uuid` cast error in SQL
+  // (fix round A, audit L-4).
+  if (!Number.isFinite(Date.parse(sentAt)) || !Id.safeParse(id).success) {
+    return undefined;
+  }
+  return { sentAt, id };
+}
+
+export function encodeMessageCursor(message: {
+  sentAt: string;
+  id: string;
+}): string {
+  return `${message.sentAt}|${message.id}`;
+}
+
+/**
+ * Linking-visibility rule (fix round A, audit M-4): the pairing ticket
+ * is served ONLY while the session is actually being linked — state
+ * `connecting` or `disconnected` — AND the payload has not expired.
+ * Both stores route through this helper so they cannot drift.
+ */
+export function servedLinking(
+  state: string,
+  linking: ConnectionLinking | null,
+  nowMs: number = Date.now(),
+): ConnectionLinking | null {
+  if (linking === null) return null;
+  if (state !== "connecting" && state !== "disconnected") return null;
+  return Date.parse(linking.expiresAt) > nowMs ? linking : null;
 }
 
 /**
@@ -131,6 +202,38 @@ export interface Store {
    */
   cancelPendingHistoryImport(groupId: string): Promise<boolean>;
 
+  // ---- Group detail data (ADR 0008) ----
+  /**
+   * Best-effort roster refresh for a chat (bot-worker's discovery
+   * shape): upserts by (chatId, userId), updating name/isAdmin/active.
+   * Leavers are marked `active: false` by the caller — rows are kept
+   * as history, never deleted here.
+   */
+  upsertGroupMembers(
+    chatId: string,
+    members: GroupMemberInput[],
+  ): Promise<void>;
+  /** Members of a chat, admin names first then alphabetical. */
+  listGroupMembers(chatId: string): Promise<GroupMember[]>;
+  /**
+   * Captured messages of a chat for the admin chat view: newest first
+   * over the half-open date range [from, to), `limit` rows per page.
+   * `cursor` is the `nextCursor` of the previous page (opaque).
+   */
+  listGroupMessages(
+    chatId: string,
+    options: ListMessagesOptions,
+  ): Promise<ApiMessage[]>;
+  /**
+   * Past summaries of a GROUP (summary runs join by group id — a group
+   * without a discovered chat can still have scheduled runs), newest
+   * first, each with the run interval.
+   */
+  listGroupSummaries(
+    groupId: string,
+    options: { limit: number },
+  ): Promise<GroupSummary[]>;
+
   // ---- Summary runs ----
   /**
    * Create-or-find semantics: a request for the same group, half-open
@@ -169,6 +272,29 @@ export interface Store {
   // ---- WhatsApp connection status (non-secret) ----
   getConnectionStatus(): Promise<ConnectionStatus>;
   setConnectionStatus(status: ConnectionStatus): Promise<void>;
+  /**
+   * Sets (or clears with null) the pairing QR / payload displayed by
+   * the bot-worker (ADR 0008). The QR is a live pairing ticket: it is
+   * served only on the authenticated API and must never be logged.
+   * Writing does NOT touch `logout_requested_at`.
+   */
+  updateConnectionLinking(
+    linking: {
+      qr: string;
+      expiresAt: string;
+      /** Pairing payload kind (bot-worker publishes it); default qr. */
+      kind?: ConnectionLinking["kind"];
+    } | null,
+  ): Promise<void>;
+  /**
+   * Records the admin's "end / unlink session" request
+   * (logout_requested_at = now()). Idempotent: an already-pending
+   * request keeps its original timestamp. The bot-worker consumes the
+   * flag and clears it via {@link clearLogoutRequest}.
+   */
+  requestLogout(): Promise<void>;
+  /** Clears the consumed logout request (bot-worker side). */
+  clearLogoutRequest(): Promise<void>;
 }
 
 /**
@@ -192,7 +318,11 @@ export class InMemoryStore implements Store {
     state: "unavailable",
     since: nowIso(),
     lastMessageAt: null,
+    linking: null,
   };
+  private logoutRequestedAt: string | null = null;
+  private readonly members = new Map<string, Map<string, GroupMember>>();
+  private readonly messageLog: ApiMessage[] = [];
 
   async getAdmin(): Promise<AdminRecord | null> {
     return this.admin;
@@ -325,6 +455,108 @@ export class InMemoryStore implements Store {
     return true;
   }
 
+  async upsertGroupMembers(
+    chatId: string,
+    members: GroupMemberInput[],
+  ): Promise<void> {
+    const roster = this.members.get(chatId) ?? new Map<string, GroupMember>();
+    for (const member of members) {
+      const existing = roster.get(member.userId);
+      roster.set(member.userId, {
+        userId: member.userId,
+        // COALESCE parity with the SQL writer (fix round A, m9): a
+        // refresh without a display name (Baileys group metadata
+        // carries only JIDs) must never wipe a name learned from a
+        // message pushName.
+        name: member.name ?? existing?.name ?? null,
+        isAdmin: member.isAdmin,
+        active: member.active,
+        updatedAt: nowIso(),
+      });
+    }
+    this.members.set(chatId, roster);
+  }
+
+  async listGroupMembers(chatId: string): Promise<GroupMember[]> {
+    const roster = this.members.get(chatId);
+    if (roster === undefined) return [];
+    // Admins first, then name (nulls last, mirroring the SQL ORDER BY),
+    // then stable by userId.
+    return [...roster.values()].sort((a, b) => {
+      if (a.isAdmin !== b.isAdmin) return Number(b.isAdmin) - Number(a.isAdmin);
+      if (a.name === null && b.name !== null) return 1;
+      if (a.name !== null && b.name === null) return -1;
+      if (a.name !== null && b.name !== null && a.name !== b.name) {
+        return a.name.localeCompare(b.name);
+      }
+      return a.userId.localeCompare(b.userId);
+    });
+  }
+
+  /** Test seam: capture writes belong to bot-worker in production. */
+  seedMessages(messages: ApiMessage[]): void {
+    this.messageLog.push(...messages);
+  }
+
+  async listGroupMessages(
+    chatId: string,
+    options: ListMessagesOptions,
+  ): Promise<ApiMessage[]> {
+    const from = options.from === undefined ? -Infinity : Date.parse(options.from);
+    const to = options.to === undefined ? Infinity : Date.parse(options.to);
+    const cursor =
+      options.cursor === undefined
+        ? undefined
+        : decodeMessageCursor(options.cursor);
+    // A provided cursor that does not decode is a caller bug: throw
+    // instead of silently returning page 1 (the route validates first
+    // and answers 400 — this is the store-level backstop).
+    if (options.cursor !== undefined && cursor === undefined) {
+      throw new Error("invalid message cursor");
+    }
+    const cursorSentAtMs =
+      cursor === undefined ? Infinity : Date.parse(cursor.sentAt);
+    const matching = this.messageLog.filter(
+      (message) =>
+        message.chatId === chatId &&
+        Date.parse(message.sentAt) >= from &&
+        Date.parse(message.sentAt) < to &&
+        (cursor === undefined ||
+          Date.parse(message.sentAt) < cursorSentAtMs ||
+          // Keyset tie-break at EQUAL INSTANTS — compared as instants,
+          // not strings, so equivalent spellings ("...Z" vs "+02:00")
+          // land on the same side of the cursor (fix round A, m2).
+          (Date.parse(message.sentAt) === cursorSentAtMs &&
+            message.id < cursor.id)),
+    );
+    matching.sort(
+      (a, b) =>
+        Date.parse(b.sentAt) - Date.parse(a.sentAt) ||
+        // Plain string comparison = PostgreSQL uuid byte ordering for
+        // canonical lowercase uuids (localeCompare would disagree).
+        (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+    );
+    return matching.slice(0, options.limit);
+  }
+
+  async listGroupSummaries(
+    groupId: string,
+    options: { limit: number },
+  ): Promise<GroupSummary[]> {
+    const items: GroupSummary[] = [];
+    for (const summary of this.summaries.values()) {
+      const run = this.runs.get(summary.runId);
+      if (run === undefined || run.groupId !== groupId) continue;
+      items.push({ ...summary, interval: run.interval });
+    }
+    items.sort(
+      (a, b) =>
+        Date.parse(b.createdAt) - Date.parse(a.createdAt) ||
+        b.id.localeCompare(a.id),
+    );
+    return items.slice(0, options.limit);
+  }
+
   async createOrFindRun(
     input: CreateRunInput,
   ): Promise<{ run: SummaryRun; created: boolean }> {
@@ -347,6 +579,9 @@ export class InMemoryStore implements Store {
       status: "pending",
       interval: input.interval,
       attempts: 0,
+      // First request's instructions win on a repeated create-or-find
+      // (identity excludes them) — ADR 0008.
+      instructions: input.instructions ?? null,
       createdAt: now,
       updatedAt: now,
       error: null,
@@ -411,10 +646,51 @@ export class InMemoryStore implements Store {
   }
 
   async getConnectionStatus(): Promise<ConnectionStatus> {
-    return this.connection;
+    // Parity with PostgresStore (fix round A, audit M-4): the stored
+    // payload is RAW and visibility (linking states + unexpired) is
+    // applied at read time through the shared rule.
+    return {
+      ...this.connection,
+      linking: servedLinking(this.connection.state, this.connection.linking),
+    };
   }
 
   async setConnectionStatus(status: ConnectionStatus): Promise<void> {
-    this.connection = status;
+    // Only the state fields are mutable here; the pairing-queue
+    // ("linking") state is written exclusively by
+    // updateConnectionLinking (mirrors the SQL columns — ADR 0008).
+    this.connection = { ...status, linking: this.connection.linking };
+  }
+
+  async updateConnectionLinking(
+    linking: {
+      qr: string;
+      expiresAt: string;
+      kind?: ConnectionLinking["kind"];
+    } | null,
+  ): Promise<void> {
+    this.connection = {
+      ...this.connection,
+      linking:
+        linking === null
+          ? null
+          : {
+              // Pre-kind payloads are QR payloads (documented default).
+              kind: linking.kind ?? "qr",
+              qr: linking.qr,
+              expiresAt: linking.expiresAt,
+            },
+    };
+  }
+
+  async requestLogout(): Promise<void> {
+    // Idempotent: an already-pending request keeps its timestamp.
+    if (this.logoutRequestedAt === null) {
+      this.logoutRequestedAt = nowIso();
+    }
+  }
+
+  async clearLogoutRequest(): Promise<void> {
+    this.logoutRequestedAt = null;
   }
 }
