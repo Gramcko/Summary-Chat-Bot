@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import {
+  DefaultTimezoneSettings,
   ProviderConfigPublic,
   ProviderConfigUpdate,
 } from "@summarly/contracts";
@@ -73,5 +74,18 @@ export function registerSettingsRoutes(
       baseUrl: stored.baseUrl,
       hasApiKey: apiKey !== null,
     });
+  });
+
+  /** Global default IANA time zone (new groups + summary form default). */
+  app.get("/api/settings/default-timezone", async () =>
+    DefaultTimezoneSettings.parse({
+      timezone: await store.getDefaultTimezone(),
+    }),
+  );
+
+  app.put("/api/settings/default-timezone", async (request) => {
+    const body = DefaultTimezoneSettings.parse(request.body);
+    const timezone = await store.setDefaultTimezone(body.timezone);
+    return DefaultTimezoneSettings.parse({ timezone });
   });
 }

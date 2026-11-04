@@ -1,5 +1,6 @@
 "use client";
 
+import { DefaultTimezoneForm } from "@/components/settings/DefaultTimezoneForm";
 import { ProviderForm } from "@/components/settings/ProviderForm";
 import { Button } from "@/components/ui/Button";
 import { ErrorState, LoadingBlock, PageHeader } from "@/components/ui/States";
@@ -15,7 +16,7 @@ export default function SettingsPage() {
     <div className="space-y-6">
       <PageHeader
         title="Settings"
-        description="AI provider configuration for summary generation. Credentials are stored server-side and never shown again."
+        description="AI provider configuration for summary generation and the default time zone for new groups. Credentials are stored server-side and never shown again."
         actions={
           <Button
             variant="secondary"
@@ -46,6 +47,8 @@ export default function SettingsPage() {
           onSaved={(updated) => config.setData(updated)}
         />
       ) : null}
+
+      <DefaultTimezoneForm />
 
       <p className="text-xs leading-5 text-slate-500">
         WhatsApp session credentials are never available through the dashboard.

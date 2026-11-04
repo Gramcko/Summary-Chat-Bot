@@ -6,6 +6,7 @@ import { normalizeMessage, SKIP_REASONS, type NewMessage, type SkipReason } from
 import type {
   AdapterEvent,
   HistoryCursor,
+  HistoryFailureReason,
   RawInboundMessage,
   WhatsAppAdapter,
 } from "./whatsapp/adapter.js";
@@ -49,7 +50,10 @@ export interface HistoryImportBudgets {
 }
 
 export const DEFAULT_HISTORY_IMPORT_BUDGETS: HistoryImportBudgets = {
-  batchCount: 100,
+  // WhatsApp caps `historySyncOnDemandRequest.onDemandMsgCount` at 50
+  // (Baileys README: "quantity (max: 50 per query)"); larger values are
+  // silently ignored.
+  batchCount: 50,
   maxRounds: 20,
   maxMessages: 2000,
   timeBudgetMs: 120_000,
@@ -61,7 +65,7 @@ export const DEFAULT_HISTORY_IMPORT_BUDGETS: HistoryImportBudgets = {
 
 /** Upper bounds for the effort knobs (SA-L1). */
 export const HISTORY_IMPORT_BOUNDS = {
-  batchCount: 500,
+  batchCount: 50,
   maxRounds: 100,
   maxMessages: 20_000,
 } as const;
@@ -135,6 +139,8 @@ export class HistoryImportService {
   private importChat: string | null = null;
   /** Messages received for the current round (released after it). */
   private importBuffer: RawInboundMessage[] = [];
+  /** Failure reported by the phone for the active request (if any). */
+  private importFailure: HistoryFailureReason | null = null;
   /** Bumps on every received history batch (settle tracking). */
   private activityVersion = 0;
   private wake: (() => void) | null = null;
@@ -198,6 +204,13 @@ export class HistoryImportService {
   // ------------------------------------------------------------------
 
   private onEvent(event: AdapterEvent): void {
+    if (event.type === "history-error") {
+      // The phone explicitly refused/failed the request: stop waiting.
+      if (this.importChat !== event.chatJid) return;
+      this.importFailure = event.reason;
+      this.wakeNow();
+      return;
+    }
     if (event.type !== "history") return;
     // Ignore stale/foreign batches (ADR 0007): only the chat currently
     // being imported is collected; events after completion are dropped.
@@ -292,6 +305,7 @@ export class HistoryImportService {
     const deadline = this.now() + budgets.timeBudgetMs;
     this.importChat = claim.chatJid;
     this.importBuffer = [];
+    this.importFailure = null;
     this.activityVersion = 0;
 
     const chatRef = safeChatRef(claim.chatJid);
@@ -307,6 +321,29 @@ export class HistoryImportService {
     let gotAnyBatch = false;
     const seenIds = new Set<string>();
     let oldest: HistoryCursor | null = null;
+
+    // On-demand history pages BACK from a real message key. Without an
+    // anchor WhatsApp ignores the request and the import would burn the
+    // full round timeout (observed as `history_timeout`). Use the
+    // oldest captured message; if the chat has none, fail fast with a
+    // clear code instead of waiting.
+    try {
+      oldest = await this.db.getOldestMessageCursor(claim.chatJid);
+    } catch (error) {
+      this.log("error", "history_cursor_failed", {
+        groupId: claim.groupId,
+        chatRef,
+        reason: errorReason(error),
+      });
+      failure = "history_internal";
+    }
+    if (failure === null && oldest === null) {
+      this.log("warn", "history_no_anchor", {
+        groupId: claim.groupId,
+        chatRef,
+      });
+      failure = "history_no_anchor";
+    }
 
     try {
       while (
@@ -355,6 +392,12 @@ export class HistoryImportService {
           Math.min(deadline, this.now() + budgets.roundTimeoutMs),
           budgets.roundSettleMs,
         );
+        if (this.importFailure !== null) {
+          // The phone answered with a failure code. Ingest any messages
+          // that did arrive, then stop with the specific reason.
+          failure = this.importFailure;
+          if (batch.length === 0) break;
+        }
         if (batch.length === 0) {
           // WhatsApp answered with nothing: "history_timeout" when it
           // never answered at all, otherwise the available history is

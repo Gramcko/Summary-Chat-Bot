@@ -2,6 +2,7 @@ import { reconnectDelayMs } from "./backoff.js";
 import type { BackoffPolicy } from "./config.js";
 import type { BotDb, ConnectionState } from "./db.js";
 import { errorReason } from "./lib/errors.js";
+import { normalizeJidAlias } from "./lib/jid.js";
 import type { LogFields, Logger } from "./lib/log.js";
 import { safeChatRef } from "./lib/privacy.js";
 import {
@@ -294,6 +295,9 @@ export class CaptureService {
       case "participants":
         await this.refreshRoster(event.chatJid);
         break;
+      case "contact-names":
+        await this.persistContactNames(event.contacts);
+        break;
       case "messages":
         break; // routed through the message queue; never reaches here
     }
@@ -399,10 +403,20 @@ export class CaptureService {
 
   private async runDiscovery(): Promise<void> {
     let chats: Array<{ chatJid: string; name: string; members: GroupMemberInfo[] }> = [];
+    // NEW groups use the admin-configured default zone from Settings;
+    // the env value is only a fallback for older/unmigrated databases.
+    let timezone = this.defaultTimezone;
+    try {
+      timezone = (await this.db.getDefaultTimezone()) ?? timezone;
+    } catch (error) {
+      this.log("warn", "default_timezone_read_failed", {
+        reason: safeReason(error),
+      });
+    }
     try {
       chats = await this.adapter.fetchChats();
       const result = await this.db.upsertDiscoveredChats(chats, {
-        timezone: this.defaultTimezone,
+        timezone,
       });
       this.log("info", "discovery_complete", {
         chats: chats.length,
@@ -445,6 +459,29 @@ export class CaptureService {
     } catch (error) {
       this.log("error", "roster_sync_failed", {
         chatRef: safeChatRef(chatJid),
+        reason: safeReason(error),
+      });
+    }
+  }
+
+  /**
+   * Persists display names learned from contacts / message push names
+   * (ADR 0008). The DB write is restricted to monitored groups; names
+   * are PII, so only the affected-row count is logged.
+   */
+  private async persistContactNames(
+    contacts: ReadonlyArray<{ jids: string[]; name: string }>,
+  ): Promise<void> {
+    if (contacts.length === 0) return;
+    try {
+      const updated = await this.db.updateGroupMemberNames(contacts);
+      if (updated > 0) {
+        this.log("debug", "member_names_updated", { updated });
+      }
+    } catch (error) {
+      // Best-effort like the roster sync: a name write must never break
+      // the event chain.
+      this.log("error", "member_names_update_failed", {
         reason: safeReason(error),
       });
     }
@@ -609,6 +646,17 @@ export class CaptureService {
     if (kept.length === 0) return;
 
     const result = await this.db.insertMessages(this.connectionId, kept);
+    // Message push names are the most reliable name source for unsaved
+    // contacts in LID-addressed groups (ADR 0008). Persist them on the
+    // roster too; best-effort, never fatal.
+    const named: Array<{ jids: string[]; name: string }> = [];
+    for (const row of kept) {
+      if (row.senderJid !== null && row.senderName !== null) {
+        const alias = normalizeJidAlias(row.senderJid);
+        if (alias !== null) named.push({ jids: [alias], name: row.senderName });
+      }
+    }
+    if (named.length > 0) await this.persistContactNames(named);
     const perChat = new Map<string, number>();
     for (const row of kept) {
       perChat.set(row.chatJid, (perChat.get(row.chatJid) ?? 0) + 1);

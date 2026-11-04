@@ -62,6 +62,13 @@ function seedImport(db: FakeDb, chatJid = GROUP_A, monitored = true): string {
     timezone: "UTC",
     summaryTime: null,
   });
+  // On-demand history needs a real anchor message to page back from.
+  // A far-future timestamp keeps every scripted response "older".
+  db.historyAnchors.set(chatJid, {
+    messageId: "ANCHOR",
+    fromMe: false,
+    timestampSec: 2_000_000_000,
+  });
   db.requestHistoryImport(chatJid);
   return db.groups.get(chatJid)?.id ?? "";
 }
@@ -109,9 +116,14 @@ describe("history import: claim → request → ingest → done", () => {
       "H3",
     ]);
 
-    // Round 2 pages backwards from the OLDEST message received.
+    // Round 1 pages back from the oldest captured message; round 2 pages
+    // backwards from the OLDEST message received.
     expect(h.adapter.historyRequests).toHaveLength(2);
-    expect(h.adapter.historyRequests[0]?.cursor).toBeNull();
+    expect(h.adapter.historyRequests[0]?.cursor).toEqual({
+      messageId: "ANCHOR",
+      fromMe: false,
+      timestampSec: 2_000_000_000,
+    });
     expect(h.adapter.historyRequests[1]?.cursor).toEqual({
       messageId: "H3",
       fromMe: false,
@@ -434,6 +446,48 @@ describe("history import: failures and recovery", () => {
     const group = h.db.groups.get(GROUP_A);
     expect(group?.historyStatus).toBe("failed");
     expect(group?.historyError).toBe("history_timeout");
+  });
+
+  it("stops immediately when the phone reports a failure code", async () => {
+    const h = harness();
+    seedImport(h.db);
+    h.adapter.onRequestHistory = () => {
+      setTimeout(
+        () =>
+          h.adapter.emit({
+            type: "history-error",
+            chatJid: GROUP_A,
+            reason: "history_phone_offline",
+          }),
+        1,
+      );
+    };
+
+    await h.service.runOnce();
+
+    const group = h.db.groups.get(GROUP_A);
+    expect(group?.historyStatus).toBe("failed");
+    expect(group?.historyError).toBe("history_phone_offline");
+    expect(h.adapter.historyRequests).toHaveLength(1);
+  });
+
+  it("fails fast with history_no_anchor when the chat has no captured messages", async () => {    const h = harness();
+    h.db.groups.set(GROUP_A, {
+      id: randomUUID(),
+      name: "Empty",
+      monitored: true,
+      timezone: "UTC",
+      summaryTime: null,
+    });
+    h.db.requestHistoryImport(GROUP_A);
+
+    await h.service.runOnce();
+
+    const group = h.db.groups.get(GROUP_A);
+    expect(group?.historyStatus).toBe("failed");
+    expect(group?.historyError).toBe("history_no_anchor");
+    expect(h.adapter.historyRequests).toHaveLength(0);
+    expect(findEvents(h.logs, "history_no_anchor")).toHaveLength(1);
   });
 
   it("recovers stale running claims (crashed worker) and re-runs them", async () => {

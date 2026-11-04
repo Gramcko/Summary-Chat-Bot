@@ -11,17 +11,21 @@ import {
 } from "react";
 import { api, toApiError } from "@/lib/api";
 import { errorMessage } from "@/lib/messages";
+import { NotificationProvider } from "./notifications/NotificationProvider";
 import { Button } from "./ui/Button";
 
 type IconName =
   | "overview"
   | "groups"
+  | "contacts"
   | "runs"
   | "connection"
   | "settings"
   | "menu"
   | "close"
-  | "logout";
+  | "logout"
+  | "collapse"
+  | "expand";
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
   overview: (
@@ -44,6 +48,14 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
     <>
       <path d="M8 6h13M8 12h13M8 18h13" />
       <path d="M3.5 6h.01M3.5 12h.01M3.5 18h.01" />
+    </>
+  ),
+  contacts: (
+    <>
+      <circle cx="9" cy="8" r="3.2" />
+      <path d="M3.5 19a5.5 5.5 0 0 1 11 0" />
+      <circle cx="17.5" cy="9" r="2.5" />
+      <path d="M14.8 18.5a4.5 4.5 0 0 1 6.7-3.9" />
     </>
   ),
   connection: (
@@ -69,6 +81,8 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
       <path d="M10 16l4-4-4-4M14 12H3" />
     </>
   ),
+  collapse: <path d="M15 6l-6 6 6 6" />,
+  expand: <path d="M9 6l6 6-6 6" />,
 };
 
 function Icon({ name, className = "" }: { name: IconName; className?: string }) {
@@ -97,6 +111,7 @@ interface NavItem {
 const NAV_ITEMS: readonly NavItem[] = [
   { href: "/", label: "Overview", icon: "overview" },
   { href: "/groups", label: "Groups", icon: "groups" },
+  { href: "/contacts", label: "Contacts", icon: "contacts" },
   { href: "/runs", label: "Summary runs", icon: "runs" },
   { href: "/connection", label: "Connection", icon: "connection" },
   { href: "/settings", label: "Settings", icon: "settings" },
@@ -109,19 +124,11 @@ function isActive(pathname: string, href: string): boolean {
 
 function Brand({ compact = false }: { compact?: boolean }) {
   return (
-    <div className="flex items-center gap-3">
-      <span
-        aria-hidden="true"
-        className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-brand-600 text-sm font-bold text-white shadow-sm"
-      >
-        S
-      </span>
-      <div className="leading-tight">
-        <p className="text-sm font-semibold text-slate-900">Summarly</p>
-        {compact ? null : (
-          <p className="text-xs text-slate-500">WhatsApp group summaries</p>
-        )}
-      </div>
+    <div className="leading-tight">
+      <p className="text-sm font-semibold text-slate-900">Summarly</p>
+      {compact ? null : (
+        <p className="text-xs text-slate-500">WhatsApp group summaries</p>
+      )}
     </div>
   );
 }
@@ -129,9 +136,11 @@ function Brand({ compact = false }: { compact?: boolean }) {
 interface NavListProps {
   pathname: string;
   onNavigate?: () => void;
+  /** Icon-only desktop sidebar. */
+  collapsed?: boolean;
 }
 
-function NavList({ pathname, onNavigate }: NavListProps) {
+function NavList({ pathname, onNavigate, collapsed = false }: NavListProps) {
   return (
     <nav aria-label="Primary">
       <ul className="space-y-1">
@@ -142,8 +151,12 @@ function NavList({ pathname, onNavigate }: NavListProps) {
               <Link
                 href={item.href}
                 aria-current={active ? "page" : undefined}
+                aria-label={collapsed ? item.label : undefined}
+                title={collapsed ? item.label : undefined}
                 onClick={onNavigate}
-                className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
+                className={`flex items-center rounded-lg text-sm font-medium transition-colors ${
+                  collapsed ? "justify-center px-2 py-2.5" : "gap-3 px-3 py-2"
+                } ${
                   active
                     ? "bg-brand-50 text-brand-800"
                     : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
@@ -153,7 +166,7 @@ function NavList({ pathname, onNavigate }: NavListProps) {
                   name={item.icon}
                   className={active ? "text-brand-600" : "text-slate-400"}
                 />
-                {item.label}
+                {collapsed ? null : item.label}
               </Link>
             </li>
           );
@@ -167,19 +180,30 @@ interface SignOutButtonProps {
   loading: boolean;
   onClick: () => void;
   className?: string;
+  /** Icon-only desktop sidebar. */
+  collapsed?: boolean;
 }
 
-function SignOutButton({ loading, onClick, className = "" }: SignOutButtonProps) {
+function SignOutButton({
+  loading,
+  onClick,
+  className = "",
+  collapsed = false,
+}: SignOutButtonProps) {
   return (
     <Button
       variant="ghost"
       size="sm"
       loading={loading}
       onClick={onClick}
-      className={`w-full justify-start gap-3 text-slate-600 ${className}`}
+      aria-label={collapsed ? "Sign out" : undefined}
+      title={collapsed ? "Sign out" : undefined}
+      className={`w-full text-slate-600 ${
+        collapsed ? "justify-center" : "justify-start gap-3"
+      } ${className}`}
     >
       {loading ? null : <Icon name="logout" className="text-slate-400" />}
-      Sign out
+      {collapsed ? null : "Sign out"}
     </Button>
   );
 }
@@ -193,6 +217,28 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(false);
+
+  // Persist the desktop sidebar preference (mobile always uses the drawer).
+  useEffect(() => {
+    try {
+      setCollapsed(
+        window.localStorage.getItem("summarly.sidebar.collapsed") === "true",
+      );
+    } catch {
+      // Storage can be unavailable (private mode); keep expanded.
+    }
+  }, []);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        "summarly.sidebar.collapsed",
+        String(collapsed),
+      );
+    } catch {
+      // Preference persistence is best-effort.
+    }
+  }, [collapsed]);
 
   // Close the mobile drawer whenever the route changes.
   useEffect(() => {
@@ -221,7 +267,14 @@ export function AppShell({ children }: { children: ReactNode }) {
   }
 
   return (
-    <div className="min-h-dvh lg:grid lg:grid-cols-[16rem_minmax(0,1fr)]">
+    <NotificationProvider>
+      <div
+        className={`min-h-dvh lg:grid ${
+          collapsed
+            ? "lg:grid-cols-[4.5rem_minmax(0,1fr)]"
+            : "lg:grid-cols-[16rem_minmax(0,1fr)]"
+        }`}
+      >
       <a
         href="#main"
         className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-3 focus:z-50 focus:rounded-lg focus:bg-white focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:text-brand-700 focus:shadow-raised"
@@ -231,19 +284,49 @@ export function AppShell({ children }: { children: ReactNode }) {
 
       {/* Desktop sidebar */}
       <aside className="hidden border-r border-slate-200 bg-white lg:sticky lg:top-0 lg:flex lg:h-dvh lg:flex-col">
-        <div className="px-5 py-5">
-          <Link href="/" className="rounded-lg">
-            <Brand />
-          </Link>
+        <div
+          className={`flex items-center py-4 ${
+            collapsed ? "justify-center px-2" : "justify-between gap-2 px-5"
+          }`}
+        >
+          {collapsed ? null : (
+            <Link href="/" className="rounded-lg">
+              <Brand />
+            </Link>
+          )}
+          <button
+            type="button"
+            onClick={() => setCollapsed((value) => !value)}
+            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            aria-pressed={collapsed}
+            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-800"
+          >
+            <Icon name={collapsed ? "expand" : "collapse"} />
+          </button>
         </div>
-        <div className="flex-1 overflow-y-auto px-3 pb-4">
-          <NavList pathname={pathname} />
+        <div
+          className={`flex-1 overflow-y-auto pb-4 ${
+            collapsed ? "px-2" : "px-3"
+          }`}
+        >
+          <NavList pathname={pathname} collapsed={collapsed} />
         </div>
-        <div className="border-t border-slate-200 px-3 py-3">
-          <SignOutButton loading={loggingOut} onClick={() => void handleLogout()} />
-          <p className="mt-2 px-3 text-[11px] leading-4 text-slate-400">
-            Self-hosted · administrator
-          </p>
+        <div
+          className={`border-t border-slate-200 py-3 ${
+            collapsed ? "px-2" : "px-3"
+          }`}
+        >
+          <SignOutButton
+            loading={loggingOut}
+            onClick={() => void handleLogout()}
+            collapsed={collapsed}
+          />
+          {collapsed ? null : (
+            <p className="mt-2 px-3 text-[11px] leading-4 text-slate-400">
+              Self-hosted · administrator
+            </p>
+          )}
         </div>
       </aside>
 
@@ -314,11 +397,14 @@ export function AppShell({ children }: { children: ReactNode }) {
       {logoutError === null || drawerOpen ? null : (
         <div
           role="alert"
-          className="fixed bottom-4 left-4 right-4 z-40 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800 shadow-raised lg:left-[17rem] lg:right-auto lg:max-w-md"
+          className={`fixed bottom-4 left-4 right-4 z-40 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800 shadow-raised lg:right-auto lg:max-w-md ${
+            collapsed ? "lg:left-[5.5rem]" : "lg:left-[17rem]"
+          }`}
         >
           Could not sign out: {logoutError}
         </div>
       )}
-    </div>
+      </div>
+    </NotificationProvider>
   );
 }

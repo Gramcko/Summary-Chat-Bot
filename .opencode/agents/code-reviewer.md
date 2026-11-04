@@ -1,7 +1,7 @@
 ---
 description: Independent read-only code reviewer for Summarly Chat Bot.
 mode: subagent
-model: opencode-go/mimo-v2.6-pro
+model: opencode-go/deepseek-v4.1-flash
 permissions:
   - { action: "edit", resource: "*", effect: "deny" }
   - { action: "shell", resource: "*", effect: "deny" }

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { IanaTimeZone } from "./common.js";
 
 /**
  * Provider base-URL validation (audit E-2). The URL addresses a
@@ -57,3 +58,13 @@ export const ProviderConfigUpdate = z.object({
 
 export type ProviderConfigPublic = z.infer<typeof ProviderConfigPublic>;
 export type ProviderConfigUpdate = z.infer<typeof ProviderConfigUpdate>;
+
+/**
+ * Global default IANA time zone for NEW groups and as the initial value
+ * of the summary request form. Existing groups keep their own zone.
+ */
+export const DefaultTimezoneSettings = z.object({
+  timezone: IanaTimeZone,
+});
+
+export type DefaultTimezoneSettings = z.infer<typeof DefaultTimezoneSettings>;

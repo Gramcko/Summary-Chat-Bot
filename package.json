@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Self-hosted WhatsApp group daily summaries (Summarly).",
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   },

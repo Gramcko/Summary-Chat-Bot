@@ -83,7 +83,7 @@ describe.skipIf(!shouldRun)(
       // Destructive: only ever safe against a throwaway database (the
       // guard above). Mirrors the summary-worker suite.
       await pool.query(
-        "TRUNCATE TABLE messages, groups, whatsapp_connections, " +
+        "TRUNCATE TABLE messages, groups, group_members, whatsapp_connections, " +
           "summary_runs, summaries, ai_provider_configs, " +
           "admin_credentials, admin_sessions",
       );
@@ -641,6 +641,15 @@ describe.skipIf(!shouldRun)(
 
     it("full import flow: rows land exactly once, count = inserts, no last_message_at", async () => {
       const groupId = await seedHistoryImport(GROUP_A, true);
+      // On-demand history needs an anchor message to page back from.
+      const connectionId = await db.ensureConnection();
+      await pool.query(
+        `INSERT INTO messages
+           (connection_id, chat_id, whatsapp_message_id, sender_id,
+            sender_name, sent_at, body)
+         VALUES ($1, $2, 'ANCHOR', NULL, NULL, $3, 'anchor')`,
+        [connectionId, GROUP_A, new Date(2_000_000_000 * 1000)],
+      );
       const adapter = new FakeAdapter();
       const logs: LogEntry[] = [];
       const imports = new HistoryImportService({
@@ -673,7 +682,8 @@ describe.skipIf(!shouldRun)(
       await imports.runOnce();
 
       const rows = await pool.query<{ whatsapp_message_id: string }>(
-        "SELECT whatsapp_message_id FROM messages ORDER BY whatsapp_message_id",
+        "SELECT whatsapp_message_id FROM messages " +
+          "WHERE whatsapp_message_id <> 'ANCHOR' ORDER BY whatsapp_message_id",
       );
       expect(rows.rows.map((row) => row.whatsapp_message_id)).toEqual([
         "H1",
@@ -782,7 +792,12 @@ describe.skipIf(!shouldRun)(
       // The unmonitored chat syncs NOTHING — even if a caller believes
       // it should (the EXISTS guard is the boundary).
       const result = await db.syncGroupMembers(unmonitoredChat, [
-        { userId: "999@s.whatsapp.net", name: "Eve", isAdmin: false },
+        {
+          userId: "999@s.whatsapp.net",
+          name: "Eve",
+          phone: "999@s.whatsapp.net",
+          isAdmin: false,
+        },
       ]);
       expect(result).toEqual({ upserted: 0, deactivated: 0 });
       const rows = await pool.query<{ count: string }>(
@@ -804,15 +819,30 @@ describe.skipIf(!shouldRun)(
         [chatId],
       );
       const first = await db.syncGroupMembers(chatId, [
-        { userId: "111@s.whatsapp.net", name: "Alice", isAdmin: true },
-        { userId: "222@lid", name: null, isAdmin: false },
+        {
+          userId: "111@s.whatsapp.net",
+          name: "Alice",
+          phone: "111@s.whatsapp.net",
+          isAdmin: true,
+        },
+        { userId: "222@lid", name: null, phone: null, isAdmin: false },
       ]);
       expect(first).toEqual({ upserted: 2, deactivated: 0 });
 
       // Bob left and Alice was renamed; Carol joined.
       const second = await db.syncGroupMembers(chatId, [
-        { userId: "111@s.whatsapp.net", name: "Alice Updated", isAdmin: false },
-        { userId: "333@s.whatsapp.net", name: "Carol", isAdmin: false },
+        {
+          userId: "111@s.whatsapp.net",
+          name: "Alice Updated",
+          phone: "111@s.whatsapp.net",
+          isAdmin: false,
+        },
+        {
+          userId: "333@s.whatsapp.net",
+          name: "Carol",
+          phone: "333@s.whatsapp.net",
+          isAdmin: false,
+        },
       ]);
       expect(second).toEqual({ upserted: 2, deactivated: 1 });
 
@@ -848,9 +878,9 @@ describe.skipIf(!shouldRun)(
 
       // A nameless sync keeps stored names and reactivates returnees.
       await db.syncGroupMembers(chatId, [
-        { userId: "111@s.whatsapp.net", name: null, isAdmin: true },
-        { userId: "222@lid", name: null, isAdmin: false },
-        { userId: "333@s.whatsapp.net", name: null, isAdmin: false },
+        { userId: "111@s.whatsapp.net", name: null, phone: null, isAdmin: true },
+        { userId: "222@lid", name: null, phone: null, isAdmin: false },
+        { userId: "333@s.whatsapp.net", name: null, phone: null, isAdmin: false },
       ]);
       rows = await pool.query(
         "SELECT user_id, name, is_admin, active FROM group_members WHERE chat_id = $1 ORDER BY user_id",
@@ -879,7 +909,12 @@ describe.skipIf(!shouldRun)(
         chatId,
       ]);
       const afterUnmonitor = await db.syncGroupMembers(chatId, [
-        { userId: "111@s.whatsapp.net", name: "Ghost", isAdmin: false },
+        {
+          userId: "111@s.whatsapp.net",
+          name: "Ghost",
+          phone: "111@s.whatsapp.net",
+          isAdmin: false,
+        },
       ]);
       expect(afterUnmonitor).toEqual({ upserted: 0, deactivated: 0 });
       const ghost = await pool.query<{ name: string | null }>(
@@ -889,8 +924,54 @@ describe.skipIf(!shouldRun)(
       expect(ghost.rows[0]?.name).toBe("Alice Updated"); // untouched
     });
 
-    it("logout request is consumed once and finalizeLogout clears the row", async () => {
-      const connectionId = await db.ensureConnection();
+    it("updateGroupMemberNames writes learned names on monitored rosters only", async () => {
+      const chatId = "names-test@g.us";
+      await db.upsertDiscoveredChats(
+        [{ chatJid: chatId, name: "Names", members: [] }],
+        { timezone: "UTC" },
+      );
+      await pool.query(
+        "UPDATE groups SET monitored = true WHERE chat_id = $1",
+        [chatId],
+      );
+      await db.syncGroupMembers(chatId, [
+        {
+          userId: "111@lid",
+          name: null,
+          phone: "111@s.whatsapp.net",
+          isAdmin: false,
+        },
+      ]);
+
+      // LID and PN aliases both resolve to the same roster row.
+      const updated = await db.updateGroupMemberNames([
+        { jids: ["111@lid", "111@s.whatsapp.net"], name: "Ana" },
+      ]);
+      expect(updated).toBe(1);
+      const named = await pool.query<{ name: string | null; phone: string | null }>(
+        "SELECT name, phone FROM group_members WHERE chat_id = $1 AND user_id = $2",
+        [chatId, "111@lid"],
+      );
+      expect(named.rows[0]?.name).toBe("Ana");
+      expect(named.rows[0]?.phone).toBe("111@s.whatsapp.net");
+
+      // Un-monitoring revokes the name write (privacy boundary).
+      await pool.query(
+        "UPDATE groups SET monitored = false WHERE chat_id = $1",
+        [chatId],
+      );
+      const ignored = await db.updateGroupMemberNames([
+        { jids: ["111@lid"], name: "Ignored" },
+      ]);
+      expect(ignored).toBe(0);
+      const unchanged = await pool.query<{ name: string | null }>(
+        "SELECT name FROM group_members WHERE chat_id = $1 AND user_id = $2",
+        [chatId, "111@lid"],
+      );
+      expect(unchanged.rows[0]?.name).toBe("Ana");
+    });
+
+    it("logout request is consumed once and finalizeLogout clears the row", async () => {      const connectionId = await db.ensureConnection();
       await db.setLinkingQr(connectionId, {
         qr: "STALE-QR",
         expiresAt: new Date(),

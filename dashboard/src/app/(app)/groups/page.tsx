@@ -2,9 +2,10 @@
 
 import type { Group } from "@summarly/contracts";
 import Link from "next/link";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Badge } from "@/components/ui/Badges";
 import { Button, ButtonLink } from "@/components/ui/Button";
+import { SelectField, TextField } from "@/components/ui/Field";
 import { EmptyState, ErrorState, PageHeader } from "@/components/ui/States";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { api } from "@/lib/api";
@@ -80,6 +81,8 @@ function GroupRow({ group }: { group: Group }) {
 
 export default function GroupsPage() {
   const groups = useResource(() => api.groups(), []);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState("all");
 
   // Keep import badges live while the bot-worker is importing.
   const polling = anyHistoryImportInFlight(groups.data);
@@ -91,6 +94,18 @@ export default function GroupsPage() {
   }, [polling, reload]);
 
   const data = groups.data;
+  const needle = query.trim().toLowerCase();
+  const filtered = (data ?? []).filter((group) => {
+    const matchesFilter =
+      filter === "all" ||
+      (filter === "monitored" && group.monitored) ||
+      (filter === "unmonitored" && !group.monitored);
+    const matchesSearch =
+      needle === "" ||
+      group.name.toLowerCase().includes(needle) ||
+      (group.chatId ?? "").toLowerCase().includes(needle);
+    return matchesFilter && matchesSearch;
+  });
 
   return (
     <div className="space-y-6">
@@ -113,6 +128,30 @@ export default function GroupsPage() {
           </>
         }
       />
+
+      {data !== null && data.length > 0 ? (
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_14rem]">
+          <TextField
+            id="group-search"
+            label="Search groups"
+            value={query}
+            onChange={setQuery}
+            placeholder="Name or chat id…"
+            spellCheck={false}
+          />
+          <SelectField
+            id="group-filter"
+            label="Show"
+            value={filter}
+            onChange={setFilter}
+            options={[
+              { value: "all", label: "All groups" },
+              { value: "monitored", label: "Monitored only" },
+              { value: "unmonitored", label: "Not monitored" },
+            ]}
+          />
+        </div>
+      ) : null}
 
       {groups.loading && data === null ? (
         <div className="space-y-3">
@@ -142,11 +181,24 @@ export default function GroupsPage() {
       ) : null}
 
       {data !== null && data.length > 0 ? (
-        <ul className="space-y-3">
-          {data.map((group) => (
-            <GroupRow key={group.id} group={group} />
-          ))}
-        </ul>
+        <>
+          <p aria-live="polite" className="text-xs text-slate-500">
+            {filtered.length} of {data.length} group
+            {data.length === 1 ? "" : "s"}
+          </p>
+          {filtered.length === 0 ? (
+            <EmptyState
+              title="No groups match"
+              description="Try a different search term or filter."
+            />
+          ) : (
+            <ul className="space-y-3">
+              {filtered.map((group) => (
+                <GroupRow key={group.id} group={group} />
+              ))}
+            </ul>
+          )}
+        </>
       ) : null}
     </div>
   );

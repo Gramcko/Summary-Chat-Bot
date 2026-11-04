@@ -413,14 +413,23 @@ retention policy is productized (Phase E/F):
   second request while logged out only clears the flag.
 - **Group members roster (best-effort):** on connect the discovered
   groups' participants are upserted into `group_members` (user JID,
-  name when available, admin flag); `group-participants.update` events
-  refresh that chat. WhatsApp does NOT replay membership history, so
-  the roster is a snapshot that drifts toward reality — members missing
-  from a snapshot are marked `active = false` and kept (never deleted),
-  and an empty snapshot is "no data", never "everyone left". **Names
-  are optional**: the push name is preferred (then saved/verified
-  name); a missing name keeps the stored one and never fails a sync.
-  Both names and user JIDs are PII (auth-only API, retention applies).
+  name when available, PN JID fallback, admin flag);
+  `group-participants.update` events refresh that chat. WhatsApp does
+  NOT replay membership history, so the roster is a snapshot that
+  drifts toward reality — members missing from a snapshot are marked
+  `active = false` and kept (never deleted), and an empty snapshot is
+  "no data", never "everyone left". **Group metadata carries only
+  JIDs** (verified against Baileys 6.7.24 `extractGroupMetadata`), so
+  names are resolved from the adapter's contact cache: `contacts.upsert`
+  / `contacts.update` (saved contacts and live message push names) plus
+  message push names. Because bulk history sync is disabled (privacy),
+  Baileys' initial app-state sync never runs; the adapter resyncs just
+  the `critical_unblock_low` contacts collection before discovery
+  (best-effort). Learned names are written back to the roster
+  (monitored groups only) so they survive reconnects. **Names are
+  optional**: a missing name keeps the stored one and never fails a
+  sync; LID-only members expose `phone = null`. Both names and user
+  JIDs are PII (auth-only API, retention applies).
 - **Sender names at ingestion:** the WhatsApp push name is stored in
   `messages.sender_name` on both the live-capture and history-import
   paths (shared normalize path). Display-only PII: never logged.

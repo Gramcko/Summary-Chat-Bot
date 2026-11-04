@@ -252,7 +252,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
     batchCount: parseBudgetInt(
       env,
       "HISTORY_IMPORT_BATCH_COUNT",
-      100,
+      DEFAULT_HISTORY_IMPORT_BUDGETS.batchCount,
       HISTORY_IMPORT_BOUNDS.batchCount,
     ),
     maxRounds: parseBudgetInt(

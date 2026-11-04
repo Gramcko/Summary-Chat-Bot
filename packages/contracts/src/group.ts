@@ -73,12 +73,15 @@ export const UpdateGroupRequest = z.object({
  * history, so this is a snapshot that drifts toward reality on each
  * update. `userId` is the WhatsApp user JID and `name` the push name —
  * both PII, served on the authenticated API only and covered by the
- * normal retention rules. `active: false` means the member left the
- * chat (kept as history).
+ * normal retention rules. `phone` is the PN JID (`…@s.whatsapp.net`)
+ * when known (null for LID-only members): a FALLBACK IDENTIFIER shown
+ * only to the admin — PII like the rest of the roster. `active: false`
+ * means the member left the chat (kept as history).
  */
 export const GroupMember = z.object({
   userId: z.string().min(1).max(300),
   name: z.string().min(1).max(300).nullable(),
+  phone: z.string().max(100).nullable(),
   isAdmin: z.boolean(),
   active: z.boolean(),
   updatedAt: IsoDateTime,

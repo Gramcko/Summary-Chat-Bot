@@ -203,6 +203,15 @@ test("failed import shows the safe error text and offers a retry", () => {
   assert.equal(withError.inFlight, false);
   assert.equal(withError.showRetry, true);
   assert.equal(withError.message, "History import failed");
-  assert.equal(withError.detail, "history_unavailable");
+  assert.equal(
+    withError.detail,
+    "WhatsApp could not provide history for this chat.",
+  );
   assert.equal(withoutError.detail, "The import did not finish.");
+
+  const noAnchor = summarizeHistoryImport(
+    importState({ status: "failed", error: "history_no_anchor" }),
+  );
+  assert.ok(noAnchor !== null);
+  assert.match(noAnchor.detail ?? "", /no captured messages/i);
 });

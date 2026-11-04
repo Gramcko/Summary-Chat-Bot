@@ -85,6 +85,10 @@ in-memory throttle.
 | GET | `/api/groups/:id/members` | `GroupMember[]` | Best-effort roster snapshot (admin names first, then alphabetical). `[]` when no chat is discovered yet. **Monitored groups only** (fix round B, H-1): `409` with `"Group is not monitored."` when the group is not monitored (same privacy boundary as history import), `404` unknown group. Names/JIDs are PII (admin-only data). |
 | GET | `/api/groups/:id/messages` | `ApiMessagePage` | Chat view, newest first (`items` + `nextCursor`; the cursor is emitted only when another page truly exists). Query: `from`/`to` half-open `[from, to)` ISO instants, `limit` 1-200 (default 50), `cursor` = previous `nextCursor`. `400` on an invalid range, limit, or cursor (including a non-UUID cursor id); `404` unknown group. |
 | GET | `/api/groups/:id/summaries` | `GroupSummary[]` | Past summaries, newest first, each with the run `interval` and `provider`/`model`. Query: `limit` 1–200 (default 20). |
+| GET | `/api/contacts` | `ContactSummary[]` | People who are active members of at least one **monitored** group, aggregated by canonical identity (PN JID when known, else LID). Includes their monitored groups, message count, and last message time. Names/phones/JIDs are PII (admin-only). |
+| GET | `/api/contacts/:id` | `ContactDetail` | One contact plus its JID `aliases`. `404` unknown contact. `:id` is the canonical contact id (a JID, not a UUID) and must be URL-encoded. |
+| PATCH | `/api/contacts/:id` | `ContactDetail` | Admin display-name override (`{ "name": "..." }`, 1–300 chars). It wins over roster/WhatsApp names and survives automatic refreshes. `400` invalid name; `404` unknown contact. |
+| GET | `/api/contacts/:id/messages` | `ContactMessagePage` | Messages sent by the contact across monitored groups, newest first, each with `groupId`/`groupName`. Same `from`/`to`/`limit`/`cursor` semantics as the group chat view; `404` unknown contact. |
 | PATCH | `/api/groups/:id` | `Group` | Partial update. `summaryTime: null` clears the daily cutoff. `historyImport` is system-managed and never changed by PATCH. |
 | POST | `/api/groups/:id/history-import` | `Group` (202/200) | Request a WhatsApp history import (opt-in, ADR 0007). `409` when the group is not monitored; `200` when an import is already pending/running; `202` otherwise (including re-requests after done/failed). |
 | POST | `/api/summary-runs` | `SummaryRun` (201/200) | Create-or-find (see conventions). Optional `instructions` (1–2000 chars) steers how the summary is produced (see custom instructions below). Non-terminal runs are queued for the summary-worker (`generate-summary`, docs/decisions/0003); enqueue failures leave the run `pending` and are repaired by reconciliation. |
@@ -96,6 +100,8 @@ in-memory throttle.
 | GET | `/api/summary-runs/:id/summary` | `Summary` | `404` for an unknown run or a run without a summary yet. |
 | GET | `/api/settings/ai-provider` | `ProviderConfigPublic` | `404` when unconfigured. Never returns key material. |
 | PUT | `/api/settings/ai-provider` | `ProviderConfigPublic` | Upsert. `apiKey`: omit = keep, string = replace, `null` = clear. |
+| GET | `/api/settings/default-timezone` | `DefaultTimezoneSettings` | Global IANA zone for NEW groups and the summary form's initial value. |
+| PUT | `/api/settings/default-timezone` | `DefaultTimezoneSettings` | Sets the global default zone (`{ "timezone": "America/Caracas" }`). `400` unknown zone. |
 
 AI provider strings (ADR 0005): enter `provider: "google-gemini"` with
 `model: "gemini-3.8-flash"` (or the cheaper `gemini-3.5-flash-lite`) to
@@ -227,19 +233,35 @@ pagination):
   by the bot-worker - WhatsApp does not replay membership history, so
   the list may be incomplete or stale until the next refresh. Leavers
   stay in the roster as `active: false` history. Sorted admin names
-  first, then alphabetical. **Rosters are monitored-only** (fix round
-  B, H-1): both the bot-worker's roster sync and this endpoint require
-  the group to be monitored (`409` otherwise), matching the ADR 0004
-  opt-in boundary — un-monitoring revokes roster access too.
+  first, then alphabetical. **Names** are resolved from WhatsApp
+  contacts and message push names (group metadata carries only JIDs);
+  when no name has been observed, `phone` (the PN JID) is a fallback
+  identifier for LID-addressed groups, and `null` means the member is
+  LID-only. **Rosters are monitored-only** (fix round B, H-1): both the
+  bot-worker's roster sync and this endpoint require the group to be
+  monitored (`409` otherwise), matching the ADR 0004 opt-in boundary —
+  un-monitoring revokes roster access too.
 - `ApiMessage` keeps the stored body verbatim (including `senderName`,
-  the WhatsApp push name captured with the message). The chat view
-  paginates newest-first; `from`/`to` filter the half-open instant
-  range `[from, to)`.
+  the WhatsApp push name captured with the message). When the captured
+  push name is missing, the API falls back to the member's current
+  roster name (matched by LID/PN alias), so older messages still show
+  the name once it is learned. The chat view paginates newest-first;
+  `from`/`to` filter the half-open instant range `[from, to)`.
 - `GroupSummary` is a `Summary` plus the run's `interval` (what period
   the summary covers) and its `provider`/`model`.
 - **Names and JIDs are PII** (admin-only data, like the message bodies
   already stored). They are never logged and are covered by the normal
   retention/purge rules.
+
+**Contacts.** `/api/contacts` derives a contact list from the rosters
+of monitored groups only. A contact is aggregated by canonical identity
+(PN JID when known, otherwise LID), and includes the monitored groups
+where the person is an active member plus their message count. The
+detail endpoint exposes the contact's JID aliases and the messages it
+sent across monitored groups, each tagged with its group. Unmonitoring
+a group removes its members and messages from this surface immediately.
+There is no global address book: people who are not on a monitored
+group's roster never appear.
 
 **Session control.** The connection screen shows the linking QR and can
 end the session:

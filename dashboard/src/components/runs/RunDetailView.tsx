@@ -4,11 +4,13 @@ import type { RunStatus } from "@summarly/contracts";
 import Link from "next/link";
 import { useEffect, useState, type ReactNode } from "react";
 import { SummaryView } from "@/components/SummaryView";
+import { RunMessagesTab } from "@/components/runs/RunMessagesTab";
 import { Alert } from "@/components/ui/Alert";
 import { RunStatusBadge, runStatusHint } from "@/components/ui/Badges";
 import { Button, ButtonLink } from "@/components/ui/Button";
 import { Card, CardBody, CardHeader } from "@/components/ui/Card";
 import { EmptyState, ErrorState, LoadingBlock, PageHeader } from "@/components/ui/States";
+import { Tabs, type TabDefinition } from "@/components/ui/Tabs";
 import { api, toApiError, type ApiError } from "@/lib/api";
 import { isRunInProgress, shortId } from "@/lib/format";
 import { useResource } from "@/lib/hooks";
@@ -37,7 +39,13 @@ const EMPTY_SUMMARY_COPY: Record<RunStatus, string> = {
     "This run failed, so no summary was produced. Retry the run to try again.",
 };
 
+const RUN_TABS: readonly TabDefinition[] = [
+  { id: "summary", label: "Summary" },
+  { id: "messages", label: "Messages used" },
+];
+
 export function RunDetailView({ runId }: { runId: string }) {
+  const [tab, setTab] = useState<string>("summary");
   const run = useResource(() => api.run(runId), [runId]);
   const groups = useResource(() => api.groups(), []);
   const current = run.data;
@@ -206,43 +214,45 @@ export function RunDetailView({ runId }: { runId: string }) {
         </Alert>
       )}
 
-      <section aria-labelledby="summary-heading" className="space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2
-            id="summary-heading"
-            className="text-lg font-semibold text-slate-900"
-          >
-            Summary
-          </h2>
-          {summary.loading ? (
-            <span role="status" className="text-xs text-slate-500">
-              Refreshing summary…
-            </span>
-          ) : null}
-        </div>
+      <Tabs tabs={RUN_TABS} activeId={tab} onChange={setTab} label="Run sections">
+        {tab === "summary" ? (
+          <div className="space-y-4">
+            {summary.loading ? (
+              <span role="status" className="text-xs text-slate-500">
+                Refreshing summary…
+              </span>
+            ) : null}
 
-        {summary.error === null ? null : (
-          <ErrorState
-            error={summary.error}
-            title="Could not load the summary"
-            onRetry={summary.reload}
-          />
-        )}
+            {summary.error === null ? null : (
+              <ErrorState
+                error={summary.error}
+                title="Could not load the summary"
+                onRetry={summary.reload}
+              />
+            )}
 
-        {summary.data === null ? (
-          summary.error === null && !summary.loading ? (
-            <EmptyState
-              title="Summary not generated yet"
-              description={EMPTY_SUMMARY_COPY[current.status]}
-            />
-          ) : null
-        ) : (
-          <SummaryView
-            summary={summary.data}
-            timeZone={current.interval.timezone}
+            {summary.data === null ? (
+              summary.error === null && !summary.loading ? (
+                <EmptyState
+                  title="Summary not generated yet"
+                  description={EMPTY_SUMMARY_COPY[current.status]}
+                />
+              ) : null
+            ) : (
+              <SummaryView
+                summary={summary.data}
+                timeZone={current.interval.timezone}
+              />
+            )}
+          </div>
+        ) : null}
+        {tab === "messages" ? (
+          <RunMessagesTab
+            groupId={current.groupId}
+            interval={current.interval}
           />
-        )}
-      </section>
+        ) : null}
+      </Tabs>
     </div>
   );
 }

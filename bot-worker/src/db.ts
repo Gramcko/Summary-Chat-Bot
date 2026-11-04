@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Pool, QueryResultRow } from "pg";
 import type { NewMessage } from "./normalize.js";
-import type { DiscoveredChat } from "./whatsapp/adapter.js";
+import type { DiscoveredChat, HistoryCursor } from "./whatsapp/adapter.js";
 
 /**
  * bot-worker's own thin PostgreSQL access layer (architecture §4.3/§4.5,
@@ -71,8 +71,13 @@ export interface LinkingPayload {
 /** One roster entry to upsert (ADR 0008, best-effort). */
 export interface GroupMemberUpsert {
   userId: string;
-  /** Push name when known; null keeps any previously stored name. */
+  /** Push/contact name when known; null keeps any previously stored name. */
   name: string | null;
+  /**
+   * Phone-number JID (`…@s.whatsapp.net`) when known; null keeps any
+   * previously stored value. Fallback identifier for LID-only members.
+   */
+  phone: string | null;
   isAdmin: boolean;
 }
 
@@ -127,6 +132,23 @@ export interface BotDb {
     chats: DiscoveredChat[],
     defaults: ChatDefaults,
   ): Promise<UpsertChatsResult>;
+
+  /**
+   * Global default IANA time zone from `app_settings` (used for NEW
+   * groups). Null when the setting/table is unavailable — the caller
+   * falls back to its env default.
+   */
+  getDefaultTimezone(): Promise<string | null>;
+
+  /**
+   * Oldest captured message of a chat, used as the FIRST paging anchor
+   * for on-demand history (ADR 0007). WhatsApp's
+   * `historySyncOnDemandRequest` requires a real message key; a request
+   * without one is silently ignored (observed as `history_timeout`).
+   * Null when the chat has no captured messages yet. Own messages are
+   * never captured, so `fromMe` is always false here.
+   */
+  getOldestMessageCursor(chatId: string): Promise<HistoryCursor | null>;
 
   // ---- History imports (ADR 0007) ----
 
@@ -205,6 +227,15 @@ export interface BotDb {
     chatId: string,
     members: GroupMemberUpsert[],
   ): Promise<SyncMembersResult>;
+  /**
+   * Persists display names learned from WhatsApp contacts / message push
+   * names (ADR 0008) on existing roster rows. Only rows in MONITORED
+   * groups are touched (privacy boundary). Returns the updated row
+   * count. Names are PII and never logged by the caller.
+   */
+  updateGroupMemberNames(
+    entries: ReadonlyArray<{ jids: string[]; name: string }>,
+  ): Promise<number>;
   /**
    * Atomically consumes the admin logout request (reads and clears
    * `logout_requested_at`); returns the request time, or null when no
@@ -418,6 +449,47 @@ export class PostgresBotDb implements BotDb {
     return { inserted, updated };
   }
 
+  async getDefaultTimezone(): Promise<string | null> {
+    try {
+      const result = await this.pool.query<{ default_timezone: string }>(
+        "SELECT default_timezone FROM app_settings WHERE id = 1",
+      );
+      return result.rows[0]?.default_timezone ?? null;
+    } catch (error) {
+      // Older deployments may not have migration 0009 yet: fall back to
+      // the env default instead of failing discovery.
+      if ((error as { code?: string }).code === "42P01") return null;
+      throw error;
+    }
+  }
+
+  async getOldestMessageCursor(
+    chatId: string,
+  ): Promise<HistoryCursor | null> {
+    // The on-demand history request must page BACK from a real message
+    // key (Baileys README: "you need to have oldest message in chat").
+    // An empty key is silently ignored by WhatsApp, which the import
+    // service observes as a timeout.
+    const result = await this.pool.query<{
+      whatsapp_message_id: string;
+      sent_at: Date;
+    }>(
+      `SELECT whatsapp_message_id, sent_at
+       FROM messages
+       WHERE chat_id = $1
+       ORDER BY sent_at ASC, id ASC
+       LIMIT 1`,
+      [chatId],
+    );
+    const row = result.rows[0];
+    if (row === undefined) return null;
+    return {
+      messageId: row.whatsapp_message_id,
+      fromMe: false,
+      timestampSec: Math.floor(row.sent_at.getTime() / 1000),
+    };
+  }
+
   // ---- History imports (ADR 0007) ----
 
   async claimPendingHistoryImports(
@@ -608,9 +680,11 @@ export class PostgresBotDb implements BotDb {
     const tuples: string[] = [];
     let param = 3;
     for (const [userId, member] of byUser) {
-      tuples.push(`($${param}::text, $${param + 1}::text, $${param + 2}::boolean)`);
-      values.push(userId, member.name, member.isAdmin);
-      param += 3;
+      tuples.push(
+        `($${param}::text, $${param + 1}::text, $${param + 2}::text, $${param + 3}::boolean)`,
+      );
+      values.push(userId, member.name, member.phone, member.isAdmin);
+      param += 4;
     }
     // ONE statement (CR#8): upsert and deactivation share a snapshot,
     // so no observer can see the transient "everyone active" window the
@@ -632,12 +706,13 @@ export class PostgresBotDb implements BotDb {
          )
        ),
        upserted AS (
-         INSERT INTO group_members (id, chat_id, user_id, name, is_admin, active, updated_at)
-         SELECT gen_random_uuid(), $1, v.user_id, v.name, v.is_admin, true, now()
-         FROM (VALUES ${tuples.join(", ")}) AS v(user_id, name, is_admin)
+         INSERT INTO group_members (id, chat_id, user_id, name, phone, is_admin, active, updated_at)
+         SELECT gen_random_uuid(), $1, v.user_id, v.name, v.phone, v.is_admin, true, now()
+         FROM (VALUES ${tuples.join(", ")}) AS v(user_id, name, phone, is_admin)
          WHERE EXISTS (SELECT 1 FROM guarded)
          ON CONFLICT (chat_id, user_id) DO UPDATE SET
            name = COALESCE(EXCLUDED.name, group_members.name),
+           phone = COALESCE(EXCLUDED.phone, group_members.phone),
            is_admin = EXCLUDED.is_admin,
            active = true,
            updated_at = now()
@@ -661,6 +736,45 @@ export class PostgresBotDb implements BotDb {
       upserted: result.rows[0]?.upserted ?? 0,
       deactivated: result.rows[0]?.deactivated ?? 0,
     };
+  }
+
+  async updateGroupMemberNames(
+    entries: ReadonlyArray<{ jids: string[]; name: string }>,
+  ): Promise<number> {
+    // Flatten aliases -> name rows, dedupe by alias (last name wins) and
+    // clamp to the contract cap. Names are PII: nothing here is logged.
+    const byJid = new Map<string, string>();
+    for (const entry of entries) {
+      const name = entry.name.trim().slice(0, 300);
+      if (name === "") continue;
+      for (const jid of entry.jids) {
+        if (jid !== "") byJid.set(jid, name);
+      }
+    }
+    if (byJid.size === 0) return 0;
+
+    const rows = [...byJid.entries()];
+    let updated = 0;
+    // Bounded chunks keep the parameter count small on large contact
+    // syncs (two arrays per chunk, no per-row parameters).
+    for (let offset = 0; offset < rows.length; offset += 500) {
+      const chunk = rows.slice(offset, offset + 500);
+      const result = await this.pool.query(
+        `WITH incoming AS (
+           SELECT unnest($1::text[]) AS user_id, unnest($2::text[]) AS name
+         )
+         UPDATE group_members gm
+         SET name = incoming.name, updated_at = now()
+         FROM incoming, groups g
+         WHERE gm.user_id = incoming.user_id
+           AND g.chat_id = gm.chat_id
+           AND g.monitored = true
+           AND gm.name IS DISTINCT FROM incoming.name`,
+        [chunk.map(([jid]) => jid), chunk.map(([, name]) => name)],
+      );
+      updated += result.rowCount ?? 0;
+    }
+    return updated;
   }
 
   async consumeLogoutRequest(): Promise<Date | null> {

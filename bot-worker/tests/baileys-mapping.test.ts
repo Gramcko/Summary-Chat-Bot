@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { WAMessage } from "@whiskeysockets/baileys";
+import { isPhoneJid, normalizeJidAlias } from "../src/lib/jid.js";
 import {
   classifyClose,
   classifyHistoryCorrelation,
+  historyFailureFromResponseCode,
   isIgnoredIncomingJid,
   mapGroupParticipants,
+  mapHistoryResponseFailure,
   mapHistorySet,
   mapWAMessage,
   normalizeParticipantsAction,
@@ -482,10 +485,66 @@ describe("isIgnoredIncomingJid (SA-L2 self-JID predicate)", () => {
     expect(isIgnoredIncomingJid("status@broadcast", new Set())).toBe(true);
     expect(isIgnoredIncomingJid("555:1@s.whatsapp.net", new Set())).toBe(true);
   });
+
+  it("tolerates a missing JID (receipts/offline nodes) instead of throwing", () => {
+    expect(isIgnoredIncomingJid(undefined, selfUsers)).toBe(true);
+    expect(isIgnoredIncomingJid(null, selfUsers)).toBe(true);
+    expect(isIgnoredIncomingJid("", selfUsers)).toBe(true);
+  });
 });
 
-describe("classifyHistoryCorrelation (SA-M3, log-only)", () => {
-  const known = new Set(["req-1", "req-2"]);
+describe("history failure response codes (on-demand PDO)", () => {
+  it("maps the phone's response codes to safe reasons", () => {
+    expect(historyFailureFromResponseCode(0)).toBeNull(); // success
+    expect(historyFailureFromResponseCode(1)).toBe("history_expired");
+    expect(historyFailureFromResponseCode(2)).toBe("history_declined");
+    expect(historyFailureFromResponseCode(3)).toBe("history_unavailable");
+    expect(historyFailureFromResponseCode(4)).toBe("history_unavailable");
+    expect(historyFailureFromResponseCode(5)).toBe("history_phone_offline");
+    expect(historyFailureFromResponseCode(6)).toBe("history_unavailable");
+    expect(historyFailureFromResponseCode(undefined)).toBeNull();
+  });
+
+  it("extracts a failure from a PDO response message", () => {
+    const message = wa({
+      message: {
+        protocolMessage: {
+          peerDataOperationRequestResponseMessage: {
+            stanzaId: "req-1",
+            peerDataOperationResult: [
+              {
+                fullHistorySyncOnDemandRequestResponse: { responseCode: 5 },
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(mapHistoryResponseFailure(message)).toEqual({
+      requestId: "req-1",
+      reason: "history_phone_offline",
+    });
+    // A success response is not a failure: wait for the history payload.
+    const success = wa({
+      message: {
+        protocolMessage: {
+          peerDataOperationRequestResponseMessage: {
+            stanzaId: "req-2",
+            peerDataOperationResult: [
+              {
+                fullHistorySyncOnDemandRequestResponse: { responseCode: 0 },
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(mapHistoryResponseFailure(success)).toBeNull();
+    expect(mapHistoryResponseFailure(wa({}))).toBeNull();
+  });
+});
+
+describe("classifyHistoryCorrelation (SA-M3, log-only)", () => {  const known = new Set(["req-1", "req-2"]);
 
   it("matches an outstanding request id", () => {
     expect(classifyHistoryCorrelation("req-1", known)).toBe("match");
@@ -500,6 +559,23 @@ describe("classifyHistoryCorrelation (SA-M3, log-only)", () => {
     expect(classifyHistoryCorrelation("req-1", new Set())).toBe(
       "unknown-session-id",
     );
+  });
+});
+
+describe("JID aliases (contact-name resolution)", () => {
+  it("strips device suffixes and keeps the server", () => {
+    expect(normalizeJidAlias("123:4@s.whatsapp.net")).toBe("123@s.whatsapp.net");
+    expect(normalizeJidAlias("999@lid")).toBe("999@lid");
+    expect(normalizeJidAlias("123")).toBe("123");
+    expect(normalizeJidAlias("")).toBeNull();
+    expect(normalizeJidAlias(null)).toBeNull();
+  });
+
+  it("recognizes only phone-number JIDs as the phone fallback", () => {
+    expect(isPhoneJid("123@s.whatsapp.net")).toBe(true);
+    expect(isPhoneJid("123:4@s.whatsapp.net")).toBe(true);
+    expect(isPhoneJid("123@lid")).toBe(false);
+    expect(isPhoneJid(null)).toBe(false);
   });
 });
 
@@ -518,10 +594,32 @@ describe("mapGroupParticipants (ADR 0008 roster mapping)", () => {
         { id: "4@s.whatsapp.net" },
       ]),
     ).toEqual([
-      { userId: "1@s.whatsapp.net", name: "Push", isAdmin: false },
-      { userId: "2@s.whatsapp.net", name: "Saved", isAdmin: false },
-      { userId: "3@s.whatsapp.net", name: "Biz", isAdmin: false },
-      { userId: "4@s.whatsapp.net", name: null, isAdmin: false },
+      { userId: "1@s.whatsapp.net", name: "Push", phone: "1@s.whatsapp.net", isAdmin: false },
+      { userId: "2@s.whatsapp.net", name: "Saved", phone: "2@s.whatsapp.net", isAdmin: false },
+      { userId: "3@s.whatsapp.net", name: "Biz", phone: "3@s.whatsapp.net", isAdmin: false },
+      { userId: "4@s.whatsapp.net", name: null, phone: "4@s.whatsapp.net", isAdmin: false },
+    ]);
+  });
+
+  it("resolves names through the contact cache and exposes the PN fallback", () => {
+    const resolved = mapGroupParticipants(
+      [
+        // LID-addressed group: the participant id is a LID, `jid` the PN.
+        { id: "111@lid", jid: "111@s.whatsapp.net", admin: "admin" },
+        // LID-only member: no PN known.
+        { id: "222@lid" },
+      ],
+      (participant) =>
+        participant.jid === "111@s.whatsapp.net" ? "Ana" : null,
+    );
+    expect(resolved).toEqual([
+      {
+        userId: "111@lid",
+        name: "Ana",
+        phone: "111@s.whatsapp.net",
+        isAdmin: true,
+      },
+      { userId: "222@lid", name: null, phone: null, isAdmin: false },
     ]);
   });
 

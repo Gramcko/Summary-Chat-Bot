@@ -149,8 +149,9 @@ messages with a backwards cursor → collect the batches WhatsApp returns
 for that chat → ingest → repeat while WhatsApp keeps returning new
 messages. Effort is bounded by env knobs (`.env.example`):
 `HISTORY_IMPORT_POLL_MS` (5000, floor 1000),
-`HISTORY_IMPORT_BATCH_COUNT` (100), `HISTORY_IMPORT_MAX_ROUNDS` (20),
-`HISTORY_IMPORT_MAX_MESSAGES` (2000, an **exact** cap — the last batch
+`HISTORY_IMPORT_BATCH_COUNT` (50 — WhatsApp caps an on-demand query at 50),
+`HISTORY_IMPORT_MAX_ROUNDS` (20),
+`HISTORY_IMPORT_MAX_MESSAGES` (2000, an **exact** cap - the last batch
 is truncated to the remaining room), and
 `HISTORY_IMPORT_TIME_BUDGET_MS` (120000). Internal timing values — a
 30 s first-response/per-round cap followed by a 2 s quiet window after
@@ -167,10 +168,26 @@ problems, with safe codes in `history_import_error`:
 import stops immediately), `history_internal` (unexpected local error).
 
 **Pagination:** the cursor is the OLDEST message received so far
-(message id + fromMe + timestamp; the first request uses an empty
-cursor). Exact WhatsApp cursor semantics could not be verified without a
-live account — the loop is robust either way: rounds that return only
+(message id + fromMe + timestamp). The FIRST request must page back from
+the oldest captured message in PostgreSQL: WhatsApp silently ignores an
+empty/synthetic key, which used to surface as a 30-second
+`history_timeout`. If the chat has no captured message yet there is no
+anchor, so the import fails fast with `history_no_anchor` instead of
+waiting. Exact WhatsApp cursor semantics could not be verified without a
+live account - the loop is robust either way: rounds that return only
 duplicates (or nothing) end the import.
+
+**The linked phone must be online.** On-demand history is served by the
+primary phone, not by the WhatsApp servers. If the phone is offline (or
+does not answer), no `messaging-history.set` arrives and the round ends
+as `history_timeout`. The adapter now also parses the peer-data
+operation response code (`fullHistorySyncOnDemandRequestResponse`) and
+surfaces `history_phone_offline`, `history_declined`, or
+`history_expired` immediately when the phone explicitly refuses. The
+dashboard maps these codes to actionable copy (keep the phone online,
+then retry). The self-JID predicate also tolerates missing `from` JIDs
+on receipts/offline nodes; a `TypeError` there previously aborted the
+whole offline-node batch, which could hide a history response.
 
 ### Claim lifecycle and stale recovery
 

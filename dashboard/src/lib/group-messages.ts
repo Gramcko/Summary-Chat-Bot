@@ -89,10 +89,10 @@ export function resolveMessageRange(
  * Appends an older page (the API returns newest first) and drops ids that are
  * already loaded, so "Load older" is idempotent even if the cursor repeats.
  */
-export function mergeOlderMessages(
-  current: readonly ApiMessage[],
-  older: readonly ApiMessage[],
-): ApiMessage[] {
+export function mergeOlderMessages<T extends { id: string }>(
+  current: readonly T[],
+  older: readonly T[],
+): T[] {
   const seen = new Set(current.map((message) => message.id));
   const merged = [...current];
   for (const message of older) {

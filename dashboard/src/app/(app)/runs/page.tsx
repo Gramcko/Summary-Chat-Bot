@@ -12,6 +12,7 @@ import { RunsList } from "@/components/runs/RunsList";
 export default function RunsPage() {
   const groups = useResource(() => api.groups(), []);
   const runs = useResource(() => api.runs(), []);
+  const defaultTimezone = useResource(() => api.defaultTimezone(), []);
 
   function handleCreated(run: SummaryRun, created: boolean): void {
     if (!created) {
@@ -81,8 +82,12 @@ export default function RunsPage() {
         />
       ) : null}
 
-      {groupList !== null && groupList.length > 0 ? (
-        <RequestRunForm groups={groupList} onCreated={handleCreated} />
+      {groupList !== null && groupList.length > 0 && !defaultTimezone.loading ? (
+        <RequestRunForm
+          groups={groupList}
+          defaultTimezone={defaultTimezone.data?.timezone ?? "UTC"}
+          onCreated={handleCreated}
+        />
       ) : null}
 
       {runs.loading && runs.data === null ? (

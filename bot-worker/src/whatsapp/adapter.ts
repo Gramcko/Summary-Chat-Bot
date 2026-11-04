@@ -66,16 +66,34 @@ export const LINKING_QR_TTL_MS = 60_000;
 export const PAIRING_CODE_TTL_MS = 300_000;
 
 /**
- * One roster entry of a group chat (ADR 0008): participant JID + push
- * name when known + admin flag. Best-effort data — WhatsApp does not
- * replay membership history.
+ * One roster entry of a group chat (ADR 0008): participant JID + display
+ * name when known + phone-number JID fallback + admin flag. Best-effort
+ * data — WhatsApp does not replay membership history.
  */
 export interface GroupMemberInfo {
   /** Participant JID (may be an `@lid` or `@s.whatsapp.net` form). */
   userId: string;
-  /** Push name when WhatsApp provided one; null otherwise. */
+  /**
+   * Display name when known. Group metadata carries only JIDs, so the
+   * adapter resolves this from WhatsApp contacts / message push names;
+   * null when no name has been observed yet.
+   */
   name: string | null;
+  /**
+   * Phone-number JID (`…@s.whatsapp.net`) when known; null for LID-only
+   * members. A fallback identifier for the admin UI — PII like the rest
+   * of the roster.
+   */
+  phone: string | null;
   isAdmin: boolean;
+}
+
+/** A display name observed for one or more WhatsApp JID aliases. */
+export interface ContactNameUpdate {
+  /** Normalized JID aliases (LID and/or PN form) the name applies to. */
+  jids: string[];
+  /** Display name (already trimmed to the contract cap). PII — never logged. */
+  name: string;
 }
 
 /** A group chat the linked account participates in. */
@@ -90,6 +108,13 @@ export interface DiscoveredChat {
    */
   members: GroupMemberInfo[];
 }
+
+/** Why an on-demand history request could not be fulfilled. */
+export type HistoryFailureReason =
+  | "history_phone_offline"
+  | "history_declined"
+  | "history_expired"
+  | "history_unavailable";
 
 /** Participant-change actions (mirror of the WhatsApp event taxonomy). */
 export type ParticipantsAction =
@@ -150,6 +175,16 @@ export type AdapterEvent =
       participants: string[];
     }
   /**
+   * Display names learned from WhatsApp contacts / message push names
+   * (ADR 0008). Group metadata never carries names, so this is how the
+   * roster learns them after discovery. `jids` are the aliases the name
+   * applies to (LID and/or PN form). Names are PII: never logged.
+   */
+  | {
+      type: "contact-names";
+      contacts: ContactNameUpdate[];
+    }
+  /**
    * Fetched history for ONE chat (ADR 0007). Emits only messages for
    * chats with an outstanding history request — WhatsApp may return
    * other chats' history in the same batch and it is dropped inside the
@@ -163,6 +198,16 @@ export type AdapterEvent =
       progress: number | null;
       /** Peer-data request id when WhatsApp echoed one (correlation). */
       requestId: string | null;
+    }
+  /**
+   * The phone answered an on-demand history request with a failure
+   * code (offline primary, declined, expired, ...). The import service
+   * stops waiting and reports the reason instead of a generic timeout.
+   */
+  | {
+      type: "history-error";
+      chatJid: string;
+      reason: HistoryFailureReason;
     };
 
 /**

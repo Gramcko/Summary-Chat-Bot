@@ -9,12 +9,22 @@ import { api } from "@/lib/api";
 import { useResource } from "@/lib/hooks";
 import { formatDateTime } from "@/lib/time";
 
+function formatPhone(phone: string | null): string | null {
+  if (phone === null) return null;
+  // `phone` is the PN JID (`123@s.whatsapp.net`); show the digits only.
+  const digits = phone.split("@")[0]?.split(":")[0] ?? "";
+  return digits === "" ? phone : `+${digits}`;
+}
+
 function displayName(member: GroupMember): string {
-  return member.name ?? member.userId;
+  return member.name ?? formatPhone(member.phone) ?? "Unknown member";
 }
 
 function initials(member: GroupMember): string {
-  const source = member.name ?? member.userId;
+  // No name means no meaningful initials — never derive them from the
+  // opaque LID/phone identifier.
+  const source = member.name ?? "";
+  if (source === "") return "?";
   const parts = source.trim().split(/\s+/).slice(0, 2);
   const letters = parts.map((part) => part.charAt(0)).join("");
   return letters.length === 0 ? "?" : letters.toUpperCase();
@@ -76,7 +86,8 @@ export function MembersTab({ groupId }: { groupId: string }) {
     <div className="space-y-3">
       <p className="text-xs text-slate-500">
         {active.length} active · {left} left the group. Names come from the
-        WhatsApp group metadata maintained by the bot worker.
+        WhatsApp contacts and message push names observed by the bot worker;
+        members without a known name show their phone number when available.
       </p>
       <Card>
         <ul className="divide-y divide-slate-100">
@@ -102,6 +113,7 @@ export function MembersTab({ groupId }: { groupId: string }) {
                   {member.active ? null : <Badge tone="neutral">Left</Badge>}
                 </div>
                 <p className="mt-0.5 truncate text-xs text-slate-500">
+                  <span className="text-slate-400">ID </span>
                   <span className="font-mono">{member.userId}</span>
                   {" · updated "}
                   <time dateTime={member.updatedAt}>

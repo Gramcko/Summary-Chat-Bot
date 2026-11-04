@@ -118,7 +118,7 @@ describe.skipIf(!process.env["DATABASE_URL"])(
       // Test-database hygiene only; the dev database is disposable.
       await pool.query(
         "TRUNCATE TABLE summaries, summary_runs, messages, groups, " +
-          "admin_sessions, admin_credentials, ai_provider_configs, " +
+          "group_members, admin_sessions, admin_credentials, ai_provider_configs, " +
           "whatsapp_connections CASCADE",
       );
     });
@@ -1087,37 +1087,179 @@ describe.skipIf(!process.env["DATABASE_URL"])(
         const store = new PostgresStore(pool);
         const chatId = `${randomUUID()}@g.us`;
         await store.upsertGroupMembers(chatId, [
-          { userId: "2@s.whatsapp.net", name: "Bo", isAdmin: false, active: true },
-          { userId: "1@s.whatsapp.net", name: "Ana", isAdmin: true, active: true },
-          { userId: "3@s.whatsapp.net", name: null, isAdmin: false, active: true },
+          {
+            userId: "2@s.whatsapp.net",
+            name: "Bo",
+            phone: "2@s.whatsapp.net",
+            isAdmin: false,
+            active: true,
+          },
+          {
+            userId: "1@s.whatsapp.net",
+            name: "Ana",
+            phone: "1@s.whatsapp.net",
+            isAdmin: true,
+            active: true,
+          },
+          {
+            userId: "3@lid",
+            name: null,
+            phone: "3@s.whatsapp.net",
+            isAdmin: false,
+            active: true,
+          },
         ]);
         const members = await store.listGroupMembers(chatId);
         expect(members.map((member) => member.userId)).toEqual([
           "1@s.whatsapp.net",
           "2@s.whatsapp.net",
-          "3@s.whatsapp.net", // NULL name sorts LAST (mirrors SQL)
+          "3@lid", // NULL name sorts LAST (mirrors SQL)
         ]);
+        expect(members[2]?.phone).toBe("3@s.whatsapp.net");
 
         // Refresh updates in place (same chat_id + user_id).
         await store.upsertGroupMembers(chatId, [
-          { userId: "2@s.whatsapp.net", name: "Bo (renamed)", isAdmin: true, active: false },
+          {
+            userId: "2@s.whatsapp.net",
+            name: "Bo (renamed)",
+            phone: null,
+            isAdmin: true,
+            active: false,
+          },
         ]);
         const refreshed = await store.listGroupMembers(chatId);
         expect(refreshed).toHaveLength(3);
         const bo = refreshed.find((member) => member.userId === "2@s.whatsapp.net");
         expect(bo?.name).toBe("Bo (renamed)");
+        expect(bo?.phone).toBe("2@s.whatsapp.net"); // COALESCE keeps it
         expect(bo?.isAdmin).toBe(true);
         expect(bo?.active).toBe(false);
 
         // COALESCE name semantics (fix round A, m9): a refresh WITHOUT a
         // display name must not wipe a known one.
         await store.upsertGroupMembers(chatId, [
-          { userId: "2@s.whatsapp.net", name: null, isAdmin: false, active: true },
+          {
+            userId: "2@s.whatsapp.net",
+            name: null,
+            phone: null,
+            isAdmin: false,
+            active: true,
+          },
         ]);
         const coalesced = await store.listGroupMembers(chatId);
         expect(
           coalesced.find((member) => member.userId === "2@s.whatsapp.net")?.name,
         ).toBe("Bo (renamed)");
+      });
+
+      it("aggregates contacts from monitored groups and resolves their messages", async () => {
+        const store = new PostgresStore(pool);
+        const chatA = `${randomUUID()}@g.us`;
+        const chatB = `${randomUUID()}@g.us`;
+        const groupA = randomUUID();
+        const groupB = randomUUID();
+        await store.upsertGroup({
+          id: groupA,
+          chatId: chatA,
+          name: "Monitored A",
+          monitored: true,
+          timezone: "UTC",
+          summaryTime: null,
+          historyImport: null,
+        });
+        await store.upsertGroup({
+          id: groupB,
+          chatId: chatB,
+          name: "Private B",
+          monitored: false,
+          timezone: "UTC",
+          summaryTime: null,
+          historyImport: null,
+        });
+        await store.upsertGroupMembers(chatA, [
+          {
+            userId: "111@lid",
+            name: "Ana",
+            phone: "111@s.whatsapp.net",
+            isAdmin: false,
+            active: true,
+          },
+          {
+            userId: "222@lid",
+            name: "Bob",
+            phone: null,
+            isAdmin: false,
+            active: true,
+          },
+        ]);
+        await store.upsertGroupMembers(chatB, [
+          {
+            userId: "333@lid",
+            name: "Eve",
+            phone: null,
+            isAdmin: false,
+            active: true,
+          },
+        ]);
+
+        const connectionId = randomUUID();
+        await pool.query(
+          "INSERT INTO whatsapp_connections (id, state) VALUES ($1, 'connected')",
+          [connectionId],
+        );
+        const insertMessage = async (
+          chatId: string,
+          senderId: string,
+          sentAt: string,
+        ) => {
+          await pool.query(
+            `INSERT INTO messages
+               (connection_id, chat_id, whatsapp_message_id, sender_id,
+                sender_name, sent_at, body)
+             VALUES ($1, $2, $3, $4, NULL, $5, 'hello')`,
+            [connectionId, chatId, `wa-${randomUUID()}`, senderId, new Date(sentAt)],
+          );
+        };
+        await insertMessage(chatA, "111:4@s.whatsapp.net", "2026-11-01T10:00:00Z");
+        await insertMessage(chatA, "222@lid", "2026-11-01T11:00:00Z");
+        await insertMessage(chatB, "333@lid", "2026-11-01T12:00:00Z");
+
+        const contacts = await store.listContacts();
+        expect(contacts.map((contact) => contact.name)).toEqual(["Ana", "Bob"]);
+        const ana = contacts.find((contact) => contact.name === "Ana");
+        expect(ana?.id).toBe("111@s.whatsapp.net");
+        expect(ana?.groups.map((group) => group.name)).toEqual(["Monitored A"]);
+        expect(ana?.messageCount).toBe(1);
+
+        const detail = await store.getContact("111@s.whatsapp.net");
+        expect(detail?.aliases).toEqual(["111@lid", "111@s.whatsapp.net"]);
+        const page = await store.listContactMessages(detail?.aliases ?? [], {
+          limit: 50,
+        });
+        expect(page).toHaveLength(1);
+        expect(page[0]?.groupName).toBe("Monitored A");
+        expect(page[0]?.senderName).toBe("Ana"); // roster fallback
+        expect(page[0]?.senderId).toBe("111:4@s.whatsapp.net");
+
+        // Admin override wins in the contact list, detail, and messages.
+        const renamed = await store.renameContact(
+          "111@s.whatsapp.net",
+          "Ana Renamed",
+        );
+        expect(renamed?.name).toBe("Ana Renamed");
+        const afterRename = await store.listContacts();
+        expect(
+          afterRename.find((contact) => contact.id === "111@s.whatsapp.net")?.name,
+        ).toBe("Ana Renamed");
+        const renamedMessages = await store.listContactMessages(
+          detail?.aliases ?? [],
+          { limit: 50 },
+        );
+        expect(renamedMessages[0]?.senderName).toBe("Ana Renamed");
+
+        // Unmonitored groups contribute neither contacts nor messages.
+        expect(contacts.some((contact) => contact.name === "Eve")).toBe(false);
+        expect(await store.getContact("333@lid")).toBeUndefined();
       });
 
       it("lists chat messages newest-first with sender names, range, and cursor", async () => {

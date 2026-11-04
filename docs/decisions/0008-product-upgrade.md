@@ -154,3 +154,26 @@ workflow: the backend spawns and supervises the `summary-worker` and
   watchdog.
 - **Fix round B (follows):** the same audit/review hardening on
   bot-worker files (including adopting the parent-PID watchdog).
+- **Roster names fix (2026-11-04):** group metadata was mistakenly
+  assumed to carry display names; it carries only JIDs (verified in
+  Baileys 6.7.24 `extractGroupMetadata`), so every member was stored
+  with `name = null` and the dashboard showed opaque LIDs. The adapter
+  now keeps a contact-name cache from `contacts.upsert` /
+  `contacts.update` and message push names, resolves participants by
+  their LID/PN aliases, and emits `contact-names` so learned names are
+  written to `group_members` (monitored groups only). A nullable
+  `phone` PN-JID fallback (migration 0007) is stored on roster rows so
+  LID-only members have a readable identifier until a name is learned.
+- **Contacts and source messages (2026-11-04):** the dashboard gained a
+  Contacts surface (`GET /api/contacts`, `/api/contacts/:id`,
+  `/api/contacts/:id/messages`) listing active members of monitored
+  groups, the groups they participate in, and their cross-group
+  messages. The run detail screen now has a "Messages used" tab that
+  reads the group's messages for the run's half-open interval. Group
+  messages also fall back to the roster name when the captured push
+  name is missing. Admins can override a contact's display name
+  (`PATCH /api/contacts/:id`, `contact_overrides` table); the override
+  wins over roster names and is never overwritten by automatic syncs.
+  Groups and contacts have client-side search/filter, the sidebar is
+  collapsible to an icon rail, and summary-run status changes raise
+  in-app toast notifications.

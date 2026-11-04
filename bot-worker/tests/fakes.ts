@@ -18,6 +18,7 @@ import type {
   AdapterEvent,
   DiscoveredChat,
   GroupMemberInfo,
+  HistoryCursor,
   HistoryFetchRequest,
   RawInboundMessage,
   WhatsAppAdapter,
@@ -168,15 +169,28 @@ export class FakeDb implements BotDb {
   readonly stateHistory: ConnectionState[] = [];
   readonly groups = new Map<string, FakeStoredGroup>();
   readonly messages: NewMessage[] = [];
+  /** Explicit history anchors per chat (tests that need a cursor). */
+  readonly historyAnchors = new Map<string, HistoryCursor>();
+  /** Global default time zone returned to discovery (null = use config). */
+  defaultTimezone: string | null = null;
   readonly insertCalls: NewMessage[][] = [];
   /** How often insertMessages() touched last_message_at (ADR 0007). */
   lastMessageTouches = 0;
   /** Current linking payload on the connection row (ADR 0008). */
   linking: LinkingPayload | null = null;
-  /** Roster rows by chat: userId -> row (name/is_admin/active). */
+  /** Roster rows by chat: userId -> row (name/phone/is_admin/active). */
   readonly membersByChat = new Map<
     string,
-    Map<string, { userId: string; name: string | null; isAdmin: boolean; active: boolean }>
+    Map<
+      string,
+      {
+        userId: string;
+        name: string | null;
+        phone: string | null;
+        isAdmin: boolean;
+        active: boolean;
+      }
+    >
   >();
   /** Pending admin logout request (ADR 0008). */
   logoutRequestedAt: Date | null = null;
@@ -237,6 +251,26 @@ export class FakeDb implements BotDb {
     }
     if (inserted > 0 && touchLastMessage) this.lastMessageTouches += 1;
     return { inserted, duplicates, droppedUnmonitored };
+  }
+
+  async getDefaultTimezone(): Promise<string | null> {
+    return this.defaultTimezone;
+  }
+
+  async getOldestMessageCursor(
+    chatId: string,
+  ): Promise<HistoryCursor | null> {    const explicit = this.historyAnchors.get(chatId);
+    if (explicit !== undefined) return explicit;
+    const rows = this.messages
+      .filter((message) => message.chatJid === chatId)
+      .sort((a, b) => a.sentAt.getTime() - b.sentAt.getTime());
+    const row = rows[0];
+    if (row === undefined) return null;
+    return {
+      messageId: row.whatsappMessageId,
+      fromMe: false,
+      timestampSec: Math.floor(row.sentAt.getTime() / 1000),
+    };
   }
 
   async upsertDiscoveredChats(
@@ -440,12 +474,14 @@ export class FakeDb implements BotDb {
         roster.set(userId, {
           userId,
           name: member.name,
+          phone: member.phone,
           isAdmin: member.isAdmin,
           active: true,
         });
       } else {
-        // Missing name keeps the stored one (COALESCE in the SQL).
+        // Missing name/phone keeps the stored one (COALESCE in the SQL).
         existing.name = member.name ?? existing.name;
+        existing.phone = member.phone ?? existing.phone;
         existing.isAdmin = member.isAdmin;
         existing.active = true;
       }
@@ -459,6 +495,32 @@ export class FakeDb implements BotDb {
       }
     }
     return { upserted, deactivated };
+  }
+
+  async updateGroupMemberNames(
+    entries: ReadonlyArray<{ jids: string[]; name: string }>,
+  ): Promise<number> {
+    const byJid = new Map<string, string>();
+    for (const entry of entries) {
+      const name = entry.name.trim().slice(0, 300);
+      if (name === "") continue;
+      for (const jid of entry.jids) {
+        if (jid !== "") byJid.set(jid, name);
+      }
+    }
+    let updated = 0;
+    for (const [chatId, roster] of this.membersByChat) {
+      // Monitored boundary (mirrors the SQL join on groups).
+      if (this.groups.get(chatId)?.monitored !== true) continue;
+      for (const member of roster.values()) {
+        const name = byJid.get(member.userId);
+        if (name !== undefined && member.name !== name) {
+          member.name = name;
+          updated += 1;
+        }
+      }
+    }
+    return updated;
   }
 
   async consumeLogoutRequest(): Promise<Date | null> {

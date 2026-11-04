@@ -106,10 +106,12 @@ nothing is restored.
 
 ## Screens
 
-The app shell is a left sidebar (Overview, Groups, Summary runs, Connection,
-Settings) with sign-out at the bottom; on small screens it collapses into a
-focus-trapped drawer. A skip link, `<nav>`/`<main>` landmarks, visible focus
-rings, and `aria-live` async states are part of the shell.
+The app shell is a left sidebar (Overview, Groups, Contacts, Summary runs,
+Connection, Settings) with sign-out at the bottom. On desktop it can collapse
+to an icon-only rail; on small screens it becomes a focus-trapped drawer. A
+skip link, `<nav>`/`<main>` landmarks, visible focus rings, and `aria-live`
+async states are part of the shell. Summary-run status changes and other
+actions raise in-app toast notifications.
 
 - `/setup` — one-time administrator password + recovery codes (shown once).
 - `/login`, `/recover` — session sign-in and single-use recovery code flow.
@@ -119,18 +121,26 @@ rings, and `aria-live` async states are part of the shell.
   linking with an expiry countdown, connection details, and an **End session /
   Unlink** action (`POST /api/connection/logout`, confirmed; polling continues
   until the re-armed pairing payload appears).
-- `/groups` — every captured group, with monitored/import badges; opens the
-  group detail.
+- `/groups` — every captured group, with monitored/import badges, search by
+  name/chat id, and an All / Monitored / Not monitored filter.
 - `/groups/[id]` — tabs: **Summaries** (past summaries per group, link to the
-  run), **Members** (roster with admin/left badges), **Messages** (read-only chat
-  with a half-open from/to filter in the group time zone and “Load older”
-  cursor paging), **Settings** (monitored toggle + history-import flow, time
-  zone, daily cutoff).
-- `/runs` — request a manual summary (optional custom instructions, 0–2000
-  characters, with a counter) and browse run history.
-- `/runs/[id]` — run status, retry, custom instructions, and the generated
-  summary.
-- `/settings` — AI provider configuration (the API key is write-only).
+  run), **Members** (roster with names, phone fallback, admin/left badges),
+  **Messages** (read-only chat with a half-open from/to filter in the group time
+  zone and “Load older” cursor paging), **Settings** (monitored toggle +
+  history-import flow, time zone, daily cutoff).
+- `/contacts` — people who are active members of monitored groups, searchable
+  by name/phone/id and filterable by group; each row shows the groups and
+  message count.
+- `/contacts/[id]` — contact detail with monitored groups, cross-group messages
+  (tagged with the group), and an **Edit name** override.
+- `/runs` — request a manual summary (type-to-filter group picker that starts
+  empty, optional custom instructions, 0–2000 characters with a counter) and
+  browse run history.
+- `/runs/[id]` — run status, retry, custom instructions, and tabs for the
+  generated **Summary** and the **Messages used** (the run's half-open
+  interval).
+- `/settings` — AI provider configuration (the API key is write-only) and the
+  global **Default time zone** used for new groups and the summary form.
 
 ## Notes
 

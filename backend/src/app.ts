@@ -11,6 +11,7 @@ import {
   requireAuth,
 } from "./routes/auth.js";
 import { registerConnectionRoutes } from "./routes/connection.js";
+import { registerContactRoutes } from "./routes/contacts.js";
 import { registerGroupRoutes } from "./routes/groups.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerRunRoutes } from "./routes/runs.js";
@@ -118,6 +119,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     api.addHook("onRequest", requireAuth(options.store));
     registerSessionRoutes(api, options.store);
     registerConnectionRoutes(api, options.store);
+    registerContactRoutes(api, options.store);
     registerGroupRoutes(api, options.store);
     registerRunRoutes(api, options.store, options.enqueue);
     registerSummaryRoutes(api, options.store);

@@ -111,7 +111,7 @@ describe("loadConfig: history-import budgets (ADR 0007)", () => {
     });
     expect(config.historyImport).toEqual({
       pollMs: 5000,
-      batchCount: 100,
+      batchCount: 50,
       maxRounds: 20,
       maxMessages: 2000,
       timeBudgetMs: 120000,
@@ -156,7 +156,7 @@ describe("loadConfig: history-import budgets (ADR 0007)", () => {
         WA_SESSION_ALLOW_INSECURE: "yes",
         [name]: value,
       });
-    expect(withEnv("HISTORY_IMPORT_BATCH_COUNT", "501")).toThrow(/between 1 and 500/);
+    expect(withEnv("HISTORY_IMPORT_BATCH_COUNT", "51")).toThrow(/between 1 and 50/);
     expect(withEnv("HISTORY_IMPORT_MAX_ROUNDS", "101")).toThrow(/between 1 and 100/);
     expect(withEnv("HISTORY_IMPORT_MAX_MESSAGES", "20001")).toThrow(
       /between 1 and 20000/,

@@ -1,9 +1,13 @@
 import type {
   ApiMessagePage,
   ConnectionStatus,
+  ContactDetail,
+  ContactMessagePage,
+  ContactSummary,
   CreateAdminRequest,
   CreateAdminResponse,
   CreateRunRequest,
+  DefaultTimezoneSettings,
   ErrorCode,
   ErrorDetail,
   Group,
@@ -14,6 +18,7 @@ import type {
   ProviderConfigPublic,
   ProviderConfigUpdate,
   RecoverRequest,
+  RenameContactRequest,
   RunListResponse,
   SetupStatus,
   Summary,
@@ -341,6 +346,47 @@ export const api = {
     ).then((result) => result.data);
   },
 
+  /** Contacts observed in monitored groups (PII, authenticated admin). */
+  contacts(): Promise<ContactSummary[]> {
+    return requestRaw<ContactSummary[]>("/contacts").then(
+      (result) => result.data,
+    );
+  },
+
+  /** One contact with aliases and monitored-group memberships. */
+  contact(id: string): Promise<ContactDetail> {
+    return requestRaw<ContactDetail>(
+      `/contacts/${encodeURIComponent(id)}`,
+    ).then((result) => result.data);
+  },
+
+  /** Admin display-name override for a contact. */
+  renameContact(
+    id: string,
+    body: RenameContactRequest,
+  ): Promise<ContactDetail> {
+    return requestRaw<ContactDetail>(
+      `/contacts/${encodeURIComponent(id)}`,
+      { method: "PATCH", body },
+    ).then((result) => result.data);
+  },
+
+  /** Messages sent by a contact across monitored groups, newest first. */
+  contactMessages(
+    id: string,
+    query: GroupMessagesQuery = {},
+  ): Promise<ContactMessagePage> {
+    const params = new URLSearchParams();
+    if (query.from !== undefined) params.set("from", query.from);
+    if (query.to !== undefined) params.set("to", query.to);
+    if (query.limit !== undefined) params.set("limit", String(query.limit));
+    if (query.cursor !== undefined) params.set("cursor", query.cursor);
+    const search = params.toString();
+    return requestRaw<ContactMessagePage>(
+      `/contacts/${encodeURIComponent(id)}/messages${search === "" ? "" : `?${search}`}`,
+    ).then((result) => result.data);
+  },
+
   updateGroup(id: string, body: UpdateGroupRequest): Promise<Group> {
     return requestRaw<Group>(`/groups/${encodeURIComponent(id)}`, {
       method: "PATCH",
@@ -432,6 +478,22 @@ export const api = {
 
   updateProvider(body: ProviderConfigUpdate): Promise<ProviderConfigPublic> {
     return requestRaw<ProviderConfigPublic>("/settings/ai-provider", {
+      method: "PUT",
+      body,
+    }).then((result) => result.data);
+  },
+
+  /** Global default IANA zone for new groups / the summary form. */
+  defaultTimezone(): Promise<DefaultTimezoneSettings> {
+    return requestRaw<DefaultTimezoneSettings>(
+      "/settings/default-timezone",
+    ).then((result) => result.data);
+  },
+
+  updateDefaultTimezone(
+    body: DefaultTimezoneSettings,
+  ): Promise<DefaultTimezoneSettings> {
+    return requestRaw<DefaultTimezoneSettings>("/settings/default-timezone", {
       method: "PUT",
       body,
     }).then((result) => result.data);

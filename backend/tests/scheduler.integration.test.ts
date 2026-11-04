@@ -88,7 +88,7 @@ describe.skipIf(!shouldRun)(
     beforeEach(async () => {
       await pool.query(
         "TRUNCATE TABLE summaries, summary_runs, messages, groups, " +
-          "admin_sessions, admin_credentials, ai_provider_configs, " +
+          "group_members, admin_sessions, admin_credentials, ai_provider_configs, " +
           "whatsapp_connections CASCADE",
       );
       enqueuer = new RecordingEnqueuer();

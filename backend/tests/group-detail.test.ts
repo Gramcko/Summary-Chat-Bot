@@ -72,9 +72,27 @@ describe("GET /api/groups/:id/members", () => {
   it("lists the roster and 404s for unknown groups", async () => {
     const { app, store, groupId, session } = await detailApp();
     await store.upsertGroupMembers(CHAT_ID, [
-      { userId: "2@s.whatsapp.net", name: "Bo", isAdmin: false, active: true },
-      { userId: "1@s.whatsapp.net", name: "Ana", isAdmin: true, active: true },
-      { userId: "3@s.whatsapp.net", name: null, isAdmin: false, active: false },
+      {
+        userId: "2@s.whatsapp.net",
+        name: "Bo",
+        phone: "2@s.whatsapp.net",
+        isAdmin: false,
+        active: true,
+      },
+      {
+        userId: "1@s.whatsapp.net",
+        name: "Ana",
+        phone: "1@s.whatsapp.net",
+        isAdmin: true,
+        active: true,
+      },
+      {
+        userId: "3@s.whatsapp.net",
+        name: null,
+        phone: "3@s.whatsapp.net",
+        isAdmin: false,
+        active: false,
+      },
     ]);
 
     const res = await app.inject({
@@ -92,7 +110,9 @@ describe("GET /api/groups/:id/members", () => {
       "3@s.whatsapp.net",
     ]);
     expect(members[0]?.isAdmin).toBe(true);
+    expect(members[0]?.phone).toBe("1@s.whatsapp.net");
     expect(members[2]?.name).toBeNull();
+    expect(members[2]?.phone).toBe("3@s.whatsapp.net");
     expect(members[2]?.active).toBe(false);
 
     const missing = await app.inject({
@@ -140,7 +160,13 @@ describe("GET /api/groups/:id/members", () => {
     // The roster EXISTS in the store — the privacy gate is the API
     // boundary: an unmonitored group never serves one.
     await store.upsertGroupMembers(chatId, [
-      { userId: "1@s.whatsapp.net", name: "Ana", isAdmin: true, active: true },
+      {
+        userId: "1@s.whatsapp.net",
+        name: "Ana",
+        phone: "1@s.whatsapp.net",
+        isAdmin: true,
+        active: true,
+      },
     ]);
 
     const res = await app.inject({
@@ -221,6 +247,35 @@ describe("GET /api/groups/:id/messages (chat view, ADR 0008)", () => {
     const page2Body = ApiMessagePage.parse(page2.json());
     expect(page2Body.items.map((item) => item.body)).toEqual(["first"]);
     expect(page2Body.nextCursor).toBeNull();
+  });
+
+  it("falls back to the roster name when the message has no sender name", async () => {
+    const { app, store, groupId, session } = await detailApp();
+    await store.upsertGroupMembers(CHAT_ID, [
+      {
+        userId: "123456789@s.whatsapp.net",
+        name: "Ana From Roster",
+        phone: null,
+        isAdmin: false,
+        active: true,
+      },
+    ]);
+    store.seedMessages([
+      message({
+        id: "00000000-0000-4000-8000-000000000010",
+        senderId: "123456789:4@s.whatsapp.net", // device suffix
+        senderName: null,
+      }),
+    ]);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/groups/${groupId}/messages`,
+      headers: { cookie: session },
+    });
+    expect(res.statusCode).toBe(200);
+    const page = ApiMessagePage.parse(res.json());
+    expect(page.items[0]?.senderName).toBe("Ana From Roster");
   });
 
   it("emits nextCursor only when another page truly exists (exact multiples)", async () => {

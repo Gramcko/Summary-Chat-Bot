@@ -3,6 +3,9 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+.opencode/
+.agents/
+opencode.json
 
 # Next.js build output (dashboard)
 .next/

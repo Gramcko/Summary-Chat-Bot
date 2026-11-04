@@ -190,8 +190,21 @@ describe("group discovery (privacy-first opt-in)", () => {
     await h.service.stop();
   });
 
-  it("NEVER clobbers admin preferences on rename or re-discovery (regression)", async () => {
-    const h = harness();
+  it("prefers the app_settings default time zone over the env fallback", async () => {
+    const h = harness({ defaultTimezone: "Europe/Berlin" });
+    h.db.defaultTimezone = "Asia/Tokyo";
+    h.adapter.fetchChatsResults = [
+      { chatJid: GROUP_A, name: "Team", members: [] },
+    ];
+    await h.service.start();
+    h.adapter.emit({ type: "open" });
+    await h.service.idle();
+
+    expect(h.db.groups.get(GROUP_A)?.timezone).toBe("Asia/Tokyo");
+    await h.service.stop();
+  });
+
+  it("NEVER clobbers admin preferences on rename or re-discovery (regression)", async () => {    const h = harness();
     h.adapter.fetchChatsResults = [{ chatJid: GROUP_A, name: "Team", members: [] }];
     await h.service.start();
     h.adapter.emit({ type: "open" });
@@ -654,8 +667,13 @@ describe("linking state publication (ADR 0008)", () => {
 });
 
 describe("group members sync (ADR 0008)", () => {
-  const ALICE = { userId: "111@s.whatsapp.net", name: "Alice", isAdmin: true };
-  const BOB = { userId: "222@lid", name: null, isAdmin: false };
+  const ALICE = {
+    userId: "111@s.whatsapp.net",
+    name: "Alice",
+    phone: "111@s.whatsapp.net",
+    isAdmin: true,
+  };
+  const BOB = { userId: "222@lid", name: null, phone: null, isAdmin: false };
 
   /** Rosters sync ONLY for monitored groups (H-1 privacy boundary). */
   function seedMonitored(h: Harness, chatJid = GROUP_A): void {
@@ -795,7 +813,7 @@ describe("group members sync (ADR 0008)", () => {
     await h.service.start();
     // The participant event refreshes with a nameless snapshot.
     h.adapter.rosterResults.set(GROUP_A, [
-      { userId: ALICE.userId, name: null, isAdmin: false },
+      { userId: ALICE.userId, name: null, phone: null, isAdmin: false },
     ]);
     h.adapter.emit({
       type: "participants",
@@ -851,6 +869,28 @@ describe("group members sync (ADR 0008)", () => {
     expect(findEvents(h.logs, "roster_sync_failed")).toHaveLength(1);
     await h.service.stop();
   });
+
+  it("persists contact names learned after discovery (monitored only)", async () => {
+    const h = harness();
+    seedMonitored(h, GROUP_A);
+    h.adapter.fetchChatsResults = [
+      { chatJid: GROUP_A, name: "Team", members: [BOB] },
+    ];
+    await h.service.start();
+    h.adapter.emit({ type: "open" });
+    await h.service.idle();
+
+    h.adapter.emit({
+      type: "contact-names",
+      contacts: [{ jids: [BOB.userId], name: "Bob" }],
+    });
+    await h.service.idle();
+
+    expect(h.db.membersByChat.get(GROUP_A)?.get(BOB.userId)?.name).toBe("Bob");
+    // Names are PII: the logs must not carry them.
+    expect(logsContain(h.logs, "Bob")).toBe(false);
+    await h.service.stop();
+  });
 });
 
 describe("sender names at ingestion (ADR 0008)", () => {
@@ -864,6 +904,23 @@ describe("sender names at ingestion (ADR 0008)", () => {
       timezone: "UTC",
       summaryTime: null,
     });
+    // The same sender is already on the roster without a name; the
+    // message push name must also land there (roster name resolution).
+    h.db.membersByChat.set(
+      GROUP_A,
+      new Map([
+        [
+          "sender@s.whatsapp.net",
+          {
+            userId: "sender@s.whatsapp.net",
+            name: null,
+            phone: null,
+            isAdmin: false,
+            active: true,
+          },
+        ],
+      ]),
+    );
     h.adapter.emitMessages(
       rawMessage({ messageId: "M1", chatJid: GROUP_A, senderName: "Alice" }),
       rawMessage({ messageId: "M2", chatJid: GROUP_A, senderName: null }),
@@ -871,6 +928,9 @@ describe("sender names at ingestion (ADR 0008)", () => {
     await h.service.idle();
 
     expect(h.db.messages.map((row) => row.senderName)).toEqual(["Alice", null]);
+    expect(
+      h.db.membersByChat.get(GROUP_A)?.get("sender@s.whatsapp.net")?.name,
+    ).toBe("Alice");
     // Names are PII: the logs must not carry them.
     expect(logsContain(h.logs, "Alice")).toBe(false);
     await h.service.stop();

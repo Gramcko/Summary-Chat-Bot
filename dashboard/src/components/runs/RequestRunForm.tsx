@@ -6,7 +6,9 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Alert } from "@/components/ui/Alert";
 import { Button } from "@/components/ui/Button";
 import { Card, CardBody, CardHeader } from "@/components/ui/Card";
-import { SelectField, TextAreaField, TextField } from "@/components/ui/Field";
+import { TextAreaField, TextField } from "@/components/ui/Field";
+import { GroupCombobox } from "@/components/runs/GroupCombobox";
+import { useNotifications } from "@/components/notifications/NotificationProvider";
 import { IanaTimeZoneOptions, TIME_ZONE_LIST_ID } from "@/components/TimeZones";
 import { api, toApiError, type ApiError } from "@/lib/api";
 import { mapFieldErrors } from "@/lib/form-errors";
@@ -25,6 +27,8 @@ import {
 
 interface RequestRunFormProps {
   groups: readonly Group[];
+  /** Global default IANA zone used until a group is selected. */
+  defaultTimezone: string;
   onCreated: (run: SummaryRun, created: boolean) => void;
 }
 
@@ -33,9 +37,14 @@ interface SubmitResult {
   created: boolean;
 }
 
-export function RequestRunForm({ groups, onCreated }: RequestRunFormProps) {
+export function RequestRunForm({
+  groups,
+  defaultTimezone,
+  onCreated,
+}: RequestRunFormProps) {
+  const { notify } = useNotifications();
   const [groupId, setGroupId] = useState("");
-  const [timezone, setTimezone] = useState("");
+  const [timezone, setTimezone] = useState(defaultTimezone);
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [instructions, setInstructions] = useState("");
@@ -45,7 +54,7 @@ export function RequestRunForm({ groups, onCreated }: RequestRunFormProps) {
   const [result, setResult] = useState<SubmitResult | null>(null);
   const lastPrefilledGroup = useRef<string | null>(null);
 
-  const selectedGroupId = groupId === "" ? (groups[0]?.id ?? "") : groupId;
+  const selectedGroupId = groupId;
 
   // Prefill the time zone and a default window when the selected group changes.
   useEffect(() => {
@@ -121,6 +130,14 @@ export function RequestRunForm({ groups, onCreated }: RequestRunFormProps) {
       const response = await api.createRun(body);
       setResult(response);
       onCreated(response.run, response.created);
+      notify({
+        title: response.created ? "Summary requested" : "Summary already requested",
+        description: response.created
+          ? "The run is queued. You will be notified when it completes."
+          : "An identical run already exists for this period.",
+        tone: response.created ? "success" : "info",
+        href: `/runs/${response.run.id}`,
+      });
     } catch (cause) {
       const error = toApiError(cause);
       const mapped = mapFieldErrors(error.details);
@@ -138,15 +155,15 @@ export function RequestRunForm({ groups, onCreated }: RequestRunFormProps) {
       }
       setFieldErrors(relevant);
       if (!hasErrors(relevant)) setFailure(error);
+      notify({
+        title: "Could not request summary",
+        description: error.message,
+        tone: "error",
+      });
     } finally {
       setSubmitting(false);
     }
   }
-
-  const groupOptions = groups.map((group) => ({
-    value: group.id,
-    label: group.name,
-  }));
 
   return (
     <Card>
@@ -157,19 +174,16 @@ export function RequestRunForm({ groups, onCreated }: RequestRunFormProps) {
       <CardBody className="space-y-4">
         <IanaTimeZoneOptions />
         <form noValidate onSubmit={handleSubmit} className="space-y-4">
-          <SelectField
-            id="run-group"
-            label="Group"
+          <GroupCombobox
+            groups={groups}
             value={selectedGroupId}
             onChange={(value) => {
               setGroupId(value);
               setResult(null);
               setFieldErrors({});
             }}
-            options={groupOptions}
-            required
-            error={fieldErrors.groupId}
             disabled={submitting}
+            error={fieldErrors.groupId}
           />
 
           <TextField

@@ -98,6 +98,7 @@ describe("GroupMember (roster snapshot, ADR 0008)", () => {
   const MEMBER = {
     userId: "123456789@s.whatsapp.net",
     name: "Ana",
+    phone: "123456789@s.whatsapp.net",
     isAdmin: true,
     active: true,
     updatedAt: "2026-11-01T10:00:00Z",
@@ -119,5 +120,24 @@ describe("GroupMember (roster snapshot, ADR 0008)", () => {
     expect(GroupMember.safeParse({ ...MEMBER, active: undefined }).success).toBe(
       false,
     );
+  });
+
+  it("carries phone as a nullable fallback identifier (PII, admin-only)", () => {
+    // Required-but-nullable like every system field: present in the
+    // parsed output, null for LID-only members (no PN known).
+    expect(GroupMember.parse({ ...MEMBER, phone: null }).phone).toBeNull();
+    expect(GroupMember.parse(MEMBER).phone).toBe("123456789@s.whatsapp.net");
+    // Missing entirely is not allowed (like `name` and `active`).
+    const { phone: _phone, ...withoutPhone } = MEMBER;
+    expect(GroupMember.safeParse(withoutPhone).success).toBe(false);
+  });
+
+  it("caps phone at 100 characters", () => {
+    expect(
+      GroupMember.safeParse({ ...MEMBER, phone: "x".repeat(100) }).success,
+    ).toBe(true);
+    expect(
+      GroupMember.safeParse({ ...MEMBER, phone: "x".repeat(101) }).success,
+    ).toBe(false);
   });
 });

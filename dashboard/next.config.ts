@@ -38,6 +38,8 @@ const allowedDevOrigins = (process.env.NEXT_ALLOWED_DEV_ORIGINS ?? "")
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  // The user-facing dashboard should not show Next.js's dev indicator.
+  devIndicators: false,
   allowedDevOrigins,
   async rewrites() {
     return [

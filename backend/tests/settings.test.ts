@@ -112,3 +112,43 @@ describe("AI provider settings", () => {
     expect(ApiError.parse(res.json()).error.code).toBe("validation_error");
   });
 });
+
+describe("default time zone settings", () => {
+  it("defaults to UTC and accepts a valid IANA zone", async () => {
+    const { app, session } = await authedApp();
+    const initial = await app.inject({
+      method: "GET",
+      url: "/api/settings/default-timezone",
+      headers: { cookie: session },
+    });
+    expect(initial.statusCode).toBe(200);
+    expect(initial.json()).toEqual({ timezone: "UTC" });
+
+    const put = await app.inject({
+      method: "PUT",
+      url: "/api/settings/default-timezone",
+      headers: { cookie: session },
+      payload: { timezone: "America/Caracas" },
+    });
+    expect(put.statusCode).toBe(200);
+    expect(put.json()).toEqual({ timezone: "America/Caracas" });
+
+    const updated = await app.inject({
+      method: "GET",
+      url: "/api/settings/default-timezone",
+      headers: { cookie: session },
+    });
+    expect(updated.json()).toEqual({ timezone: "America/Caracas" });
+  });
+
+  it("rejects an unknown zone", async () => {
+    const { app, session } = await authedApp();
+    const res = await app.inject({
+      method: "PUT",
+      url: "/api/settings/default-timezone",
+      headers: { cookie: session },
+      payload: { timezone: "Mars/Olympus" },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+});

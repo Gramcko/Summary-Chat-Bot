@@ -2,6 +2,7 @@
 
 import type { Group } from "@summarly/contracts";
 import { useRef, useState, type FormEvent } from "react";
+import { useNotifications } from "@/components/notifications/NotificationProvider";
 import { Alert } from "@/components/ui/Alert";
 import { Badge } from "@/components/ui/Badges";
 import { Button } from "@/components/ui/Button";
@@ -39,6 +40,7 @@ export function GroupSettingsCard({
   onSaved,
   showHeader = true,
 }: GroupSettingsCardProps) {
+  const { notify } = useNotifications();
   const baseId = `group-${group.id}`;
   const [timezone, setTimezone] = useState(group.timezone);
   const [summaryTime, setSummaryTime] = useState<string | null>(group.summaryTime);
@@ -133,11 +135,26 @@ export function GroupSettingsCard({
           ? "History import requested."
           : "A history import is already in progress.",
       );
+      notify({
+        title: result.accepted
+          ? "History import requested"
+          : "History import already running",
+        description: result.accepted
+          ? "The bot worker will import older messages when WhatsApp provides them."
+          : "An import is already pending or running for this group.",
+        tone: result.accepted ? "success" : "info",
+      });
     } catch (cause) {
+      const error = toApiError(cause);
       setActionError({
         title: "History import request failed",
-        message: toApiError(cause).message,
+        message: error.message,
         retryImport: true,
+      });
+      notify({
+        title: "History import request failed",
+        description: error.message,
+        tone: "error",
       });
     } finally {
       setImportBusy(false);

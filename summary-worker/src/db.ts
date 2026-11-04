@@ -235,10 +235,23 @@ export class PostgresWorkerDb implements WorkerDb {
       // bearing JID (sender_id) never reaches the AI provider —
       // attribution happens through sourceRefs (message ids) instead.
       // A captured message without a push name becomes "unknown".
-      `SELECT m.id, COALESCE(m.sender_name, 'unknown') AS sender,
+      `SELECT m.id, COALESCE(m.sender_name, gm.name, 'unknown') AS sender,
               m.sent_at, m.body
        FROM messages m
        JOIN groups g ON g.chat_id = m.chat_id
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(o.name, member.name) AS name
+         FROM group_members member
+         LEFT JOIN contact_overrides o
+           ON o.contact_id = COALESCE(member.phone, member.user_id)
+         WHERE member.chat_id = m.chat_id
+           AND (
+             member.user_id = regexp_replace(m.sender_id, ':.*@', '@')
+             OR member.phone = regexp_replace(m.sender_id, ':.*@', '@')
+           )
+         ORDER BY (member.user_id = regexp_replace(m.sender_id, ':.*@', '@')) DESC
+         LIMIT 1
+       ) gm ON true
        WHERE g.id = $1 AND m.sent_at >= $2 AND m.sent_at < $3
        ORDER BY m.sent_at ASC, m.id ASC
        LIMIT $4`,

@@ -4,6 +4,9 @@ import {
   type ApiMessage,
   type ConnectionLinking,
   type ConnectionStatus,
+  type ContactDetail,
+  type ContactMessage,
+  type ContactSummary,
   type Group,
   type GroupMember,
   type GroupSummary,
@@ -43,6 +46,8 @@ export interface CreateRunInput {
 export interface GroupMemberInput {
   userId: string;
   name: string | null;
+  /** PN JID fallback when known (null for LID-only members). */
+  phone: string | null;
   isAdmin: boolean;
   active: boolean;
 }
@@ -225,6 +230,33 @@ export interface Store {
     options: ListMessagesOptions,
   ): Promise<ApiMessage[]>;
   /**
+   * Contacts derived from MONITORED groups: people who are currently
+   * active members, aggregated by canonical identity (PN JID when
+   * known, else LID). Includes the groups they belong to and their
+   * message volume. PII — authenticated admin API only.
+   */
+  listContacts(): Promise<ContactSummary[]>;
+  /** One contact by canonical id, or undefined. Includes its aliases. */
+  getContact(contactId: string): Promise<ContactDetail | undefined>;
+  /**
+   * Sets an admin display-name override for a contact (wins over roster
+   * names and survives automatic refreshes). Returns the updated contact,
+   * or undefined when the contact is not on a monitored roster.
+   */
+  renameContact(
+    contactId: string,
+    name: string,
+  ): Promise<ContactDetail | undefined>;
+  /**
+   * Messages sent by a contact across monitored groups, newest first.
+   * `aliases` are the contact's JID forms (LID/PN); device suffixes on
+   * stored sender ids are normalized before matching.
+   */
+  listContactMessages(
+    aliases: readonly string[],
+    options: ListMessagesOptions,
+  ): Promise<ContactMessage[]>;
+  /**
    * Past summaries of a GROUP (summary runs join by group id — a group
    * without a discovered chat can still have scheduled runs), newest
    * first, each with the run interval.
@@ -268,6 +300,11 @@ export interface Store {
   /** apiKey is server-side only; routes mask it before responding. */
   getProviderConfig(): Promise<ProviderRecord | null>;
   setProviderConfig(record: ProviderRecord): Promise<ProviderRecord>;
+
+  // ---- Global settings ----
+  /** IANA zone used for new groups and the summary form's initial value. */
+  getDefaultTimezone(): Promise<string>;
+  setDefaultTimezone(timezone: string): Promise<string>;
 
   // ---- WhatsApp connection status (non-secret) ----
   getConnectionStatus(): Promise<ConnectionStatus>;
@@ -314,6 +351,7 @@ export class InMemoryStore implements Store {
   private readonly summaries = new Map<string, Summary>();
   private readonly summariesByRunId = new Map<string, string>();
   private provider: ProviderRecord | null = null;
+  private defaultTimezone = "UTC";
   private connection: ConnectionStatus = {
     state: "unavailable",
     since: nowIso(),
@@ -323,6 +361,8 @@ export class InMemoryStore implements Store {
   private logoutRequestedAt: string | null = null;
   private readonly members = new Map<string, Map<string, GroupMember>>();
   private readonly messageLog: ApiMessage[] = [];
+  /** Admin display-name overrides keyed by canonical contact id. */
+  private readonly contactOverrides = new Map<string, string>();
 
   async getAdmin(): Promise<AdminRecord | null> {
     return this.admin;
@@ -469,6 +509,7 @@ export class InMemoryStore implements Store {
         // carries only JIDs) must never wipe a name learned from a
         // message pushName.
         name: member.name ?? existing?.name ?? null,
+        phone: member.phone ?? existing?.phone ?? null,
         isAdmin: member.isAdmin,
         active: member.active,
         updatedAt: nowIso(),
@@ -536,7 +577,214 @@ export class InMemoryStore implements Store {
         // canonical lowercase uuids (localeCompare would disagree).
         (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
     );
-    return matching.slice(0, options.limit);
+    const roster = this.members.get(chatId);
+    const normalize = (jid: string): string => jid.replace(/:.*@/, "@");
+    // Roster-name fallback (mirrors the SQL LEFT JOIN): messages captured
+    // before a name was learned still display the member's current name.
+    // An admin contact override wins over both.
+    return matching.slice(0, options.limit).map((message) => {
+      if (roster === undefined) return message;
+      const sender = normalize(message.senderId);
+      const member =
+        roster.get(sender) ??
+        [...roster.values()].find(
+          (candidate) => candidate.phone !== null && candidate.phone === sender,
+        );
+      const key = member === undefined ? undefined : (member.phone ?? member.userId);
+      const override = key === undefined ? undefined : this.contactOverrides.get(key);
+      const name = override ?? member?.name ?? message.senderName;
+      return name === message.senderName ? message : { ...message, senderName: name };
+    });
+  }
+
+  /**
+   * Aggregated contacts derived from active members of monitored
+   * groups. Kept in one helper so the list and detail endpoints cannot
+   * disagree about identity, groups, or message counts.
+   */
+  private contactIndex(): Map<
+    string,
+    {
+      id: string;
+      name: string | null;
+      phone: string | null;
+      aliases: Set<string>;
+      groups: Map<string, { id: string; name: string }>;
+      messageCount: number;
+      lastMessageAt: string | null;
+    }
+  > {
+    const groupByChat = new Map(
+      [...this.groups.values()]
+        .filter((group) => group.monitored && group.chatId !== null)
+        .map((group) => [group.chatId as string, group]),
+    );
+    const byKey = new Map<
+      string,
+      {
+        id: string;
+        name: string | null;
+        phone: string | null;
+        aliases: Set<string>;
+        groups: Map<string, { id: string; name: string }>;
+        messageCount: number;
+        lastMessageAt: string | null;
+      }
+    >();
+    for (const [chatId, roster] of this.members) {
+      const group = groupByChat.get(chatId);
+      if (group === undefined) continue;
+      for (const member of roster.values()) {
+        if (!member.active) continue;
+        const key = member.phone ?? member.userId;
+        const entry = byKey.get(key) ?? {
+          id: key,
+          name: null,
+          phone: null,
+          aliases: new Set<string>(),
+          groups: new Map<string, { id: string; name: string }>(),
+          messageCount: 0,
+          lastMessageAt: null,
+        };
+        const override = this.contactOverrides.get(key);
+        if (override !== undefined) entry.name = override;
+        else if (member.name !== null) entry.name = member.name;
+        if (member.phone !== null) entry.phone = member.phone;
+        entry.aliases.add(member.userId);
+        if (member.phone !== null) entry.aliases.add(member.phone);
+        entry.groups.set(group.id, { id: group.id, name: group.name });
+        byKey.set(key, entry);
+      }
+    }
+    for (const message of this.messageLog) {
+      if (message.chatId === undefined) continue;
+      if (!groupByChat.has(message.chatId)) continue;
+      const sender = message.senderId.replace(/:.*@/, "@");
+      for (const entry of byKey.values()) {
+        if (!entry.aliases.has(sender)) continue;
+        entry.messageCount += 1;
+        if (
+          entry.lastMessageAt === null ||
+          Date.parse(message.sentAt) > Date.parse(entry.lastMessageAt)
+        ) {
+          entry.lastMessageAt = message.sentAt;
+        }
+        break;
+      }
+    }
+    return byKey;
+  }
+
+  async listContacts(): Promise<ContactSummary[]> {
+    return [...this.contactIndex().values()]
+      .map((entry) => ({
+        id: entry.id,
+        name: entry.name,
+        phone: entry.phone,
+        groups: [...entry.groups.values()].sort((a, b) =>
+          a.name.localeCompare(b.name),
+        ),
+        messageCount: entry.messageCount,
+        lastMessageAt: entry.lastMessageAt,
+      }))
+      .sort((a, b) => {
+        if (a.name === null && b.name !== null) return 1;
+        if (a.name !== null && b.name === null) return -1;
+        if (a.name !== null && b.name !== null && a.name !== b.name) {
+          return a.name.localeCompare(b.name);
+        }
+        return a.id.localeCompare(b.id);
+      });
+  }
+
+  async getContact(contactId: string): Promise<ContactDetail | undefined> {
+    const entry = this.contactIndex().get(contactId);
+    if (entry === undefined) return undefined;
+    return {
+      id: entry.id,
+      name: entry.name,
+      phone: entry.phone,
+      groups: [...entry.groups.values()].sort((a, b) =>
+        a.name.localeCompare(b.name),
+      ),
+      messageCount: entry.messageCount,
+      lastMessageAt: entry.lastMessageAt,
+      aliases: [...entry.aliases].sort(),
+    };
+  }
+
+  async renameContact(
+    contactId: string,
+    name: string,
+  ): Promise<ContactDetail | undefined> {
+    const contact = await this.getContact(contactId);
+    if (contact === undefined) return undefined;
+    this.contactOverrides.set(contactId, name.trim().slice(0, 300));
+    return this.getContact(contactId);
+  }
+
+  async listContactMessages(
+    aliases: readonly string[],
+    options: ListMessagesOptions,
+  ): Promise<ContactMessage[]> {
+    const from = options.from === undefined ? -Infinity : Date.parse(options.from);
+    const to = options.to === undefined ? Infinity : Date.parse(options.to);
+    const cursor =
+      options.cursor === undefined
+        ? undefined
+        : decodeMessageCursor(options.cursor);
+    if (options.cursor !== undefined && cursor === undefined) {
+      throw new Error("invalid message cursor");
+    }
+    const cursorSentAtMs =
+      cursor === undefined ? Infinity : Date.parse(cursor.sentAt);
+    const groupByChat = new Map(
+      [...this.groups.values()]
+        .filter((group) => group.monitored && group.chatId !== null)
+        .map((group) => [group.chatId as string, group]),
+    );
+    const normalizedAliases = new Set(
+      aliases.map((alias) => alias.replace(/:.*@/, "@")),
+    );
+    const matching = this.messageLog.filter((message) => {
+      if (message.chatId === undefined) return false;
+      const group = groupByChat.get(message.chatId);
+      if (group === undefined) return false;
+      if (!normalizedAliases.has(message.senderId.replace(/:.*@/, "@"))) {
+        return false;
+      }
+      const sentAt = Date.parse(message.sentAt);
+      return (
+        sentAt >= from &&
+        sentAt < to &&
+        (cursor === undefined ||
+          sentAt < cursorSentAtMs ||
+          (sentAt === cursorSentAtMs && message.id < cursor.id))
+      );
+    });
+    matching.sort(
+      (a, b) =>
+        Date.parse(b.sentAt) - Date.parse(a.sentAt) ||
+        (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+    );
+    return matching.slice(0, options.limit).map((message) => {
+      const group = groupByChat.get(message.chatId as string);
+      const roster = this.members.get(message.chatId as string);
+      const sender = message.senderId.replace(/:.*@/, "@");
+      const member =
+        roster?.get(sender) ??
+        [...(roster?.values() ?? [])].find(
+          (candidate) => candidate.phone !== null && candidate.phone === sender,
+        );
+      const key = member === undefined ? undefined : (member.phone ?? member.userId);
+      const override = key === undefined ? undefined : this.contactOverrides.get(key);
+      return {
+        ...message,
+        senderName: override ?? member?.name ?? message.senderName,
+        groupId: group?.id ?? "",
+        groupName: group?.name ?? "",
+      };
+    });
   }
 
   async listGroupSummaries(
@@ -643,6 +891,15 @@ export class InMemoryStore implements Store {
   async setProviderConfig(record: ProviderRecord): Promise<ProviderRecord> {
     this.provider = record;
     return record;
+  }
+
+  async getDefaultTimezone(): Promise<string> {
+    return this.defaultTimezone;
+  }
+
+  async setDefaultTimezone(timezone: string): Promise<string> {
+    this.defaultTimezone = timezone;
+    return timezone;
   }
 
   async getConnectionStatus(): Promise<ConnectionStatus> {

@@ -1,6 +1,7 @@
 ---
 description: Teaches a junior developer to understand code, concepts, debugging, and design decisions without taking over implementation.
 mode: primary
+model: opencode-go/deepseek-v4.1-flash
 permissions:
   - action: edit
     resource: "*"

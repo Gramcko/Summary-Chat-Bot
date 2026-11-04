@@ -7,6 +7,9 @@ import {
   SummaryRun,
   type ApiMessage,
   type ConnectionLinking,
+  type ContactDetail,
+  type ContactMessage,
+  type ContactSummary,
   type GroupMember,
 } from "@summarly/contracts";
 import { decryptSecret, encryptSecret } from "./crypto.js";
@@ -102,10 +105,79 @@ type ConnectionRow = QueryResultRow & {
 type MemberRow = QueryResultRow & {
   user_id: string;
   name: string | null;
+  phone: string | null;
   is_admin: boolean;
   active: boolean;
   updated_at: Date;
 };
+
+type ContactRow = QueryResultRow & {
+  contact_key: string;
+  name: string | null;
+  phone: string | null;
+  groups: Array<{ id: string; name: string }>;
+  user_ids: string[];
+  phones: string[] | null;
+  message_count: number;
+  last_message_at: Date | null;
+};
+
+type ContactMessageRow = MessageRow & {
+  group_id: string;
+  group_name: string;
+};
+
+/**
+ * Shared contact aggregation (list + detail). A contact's canonical key
+ * is the PN JID when known, else the LID; aliases are every JID form
+ * seen on the roster. Message stats join aliases to stored sender ids
+ * after stripping device suffixes, and only count monitored groups.
+ */
+const CONTACTS_CTE = `
+WITH member_rows AS (
+  SELECT gm.chat_id,
+         gm.user_id,
+         gm.name,
+         gm.phone,
+         gm.updated_at,
+         COALESCE(gm.phone, gm.user_id) AS contact_key,
+         g.id AS group_id,
+         g.name AS group_name
+  FROM group_members gm
+  JOIN groups g ON g.chat_id = gm.chat_id AND g.monitored = true
+  WHERE gm.active = true
+),
+contacts AS (
+  SELECT mr.contact_key,
+         COALESCE(
+           o.name,
+           (array_agg(mr.name ORDER BY mr.updated_at DESC)
+              FILTER (WHERE mr.name IS NOT NULL))[1]
+         ) AS name,
+         max(mr.phone) AS phone,
+         jsonb_agg(DISTINCT jsonb_build_object('id', mr.group_id, 'name', mr.group_name)) AS groups,
+         array_agg(DISTINCT mr.user_id) AS user_ids,
+         array_agg(DISTINCT mr.phone) FILTER (WHERE mr.phone IS NOT NULL) AS phones
+  FROM member_rows mr
+  LEFT JOIN contact_overrides o ON o.contact_id = mr.contact_key
+  GROUP BY mr.contact_key, o.name
+),
+aliases AS (
+  SELECT contact_key,
+         unnest(user_ids || COALESCE(phones, ARRAY[]::text[])) AS alias
+  FROM contacts
+),
+message_stats AS (
+  SELECT a.contact_key,
+         count(*)::int AS message_count,
+         max(m.sent_at) AS last_message_at
+  FROM aliases a
+  JOIN messages m
+    ON regexp_replace(m.sender_id, ':.*@', '@') = a.alias
+  JOIN groups g ON g.chat_id = m.chat_id AND g.monitored = true
+  GROUP BY a.contact_key
+)
+`;
 
 type MessageRow = QueryResultRow & {
   id: string;
@@ -667,6 +739,25 @@ export class PostgresStore implements Store {
     return record;
   }
 
+  async getDefaultTimezone(): Promise<string> {
+    const result = await this.pool.query<{ default_timezone: string }>(
+      "SELECT default_timezone FROM app_settings WHERE id = 1",
+    );
+    return result.rows[0]?.default_timezone ?? "UTC";
+  }
+
+  async setDefaultTimezone(timezone: string): Promise<string> {
+    await this.pool.query(
+      `INSERT INTO app_settings (id, default_timezone, updated_at)
+       VALUES (1, $1, now())
+       ON CONFLICT (id) DO UPDATE SET
+         default_timezone = EXCLUDED.default_timezone,
+         updated_at = now()`,
+      [timezone],
+    );
+    return timezone;
+  }
+
   // ---- WhatsApp connection status ----
 
   async getConnectionStatus(): Promise<ConnectionStatus> {
@@ -784,20 +875,29 @@ export class PostgresStore implements Store {
     const values: string[] = [];
     const params: unknown[] = [chatId];
     members.forEach((member, index) => {
-      const base = index * 4 + 2;
-      values.push(`($1, $${base}, $${base + 1}, $${base + 2}, $${base + 3}, now())`);
-      params.push(member.userId, member.name, member.isAdmin, member.active);
+      const base = index * 5 + 2;
+      values.push(
+        `($1, $${base}, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, now())`,
+      );
+      params.push(
+        member.userId,
+        member.name,
+        member.phone,
+        member.isAdmin,
+        member.active,
+      );
     });
     // Roster refresh semantics (fix round A, m9): a refresh without a
     // display name (Baileys group metadata carries only JIDs) must
     // never wipe a name learned from a message pushName — hence
-    // COALESCE on name. This is the REFERENCE writer the bot-worker's
-    // roster capture must match (COALESCE parity).
+    // COALESCE on name (and phone). This is the REFERENCE writer the
+    // bot-worker's roster capture must match (COALESCE parity).
     await this.pool.query(
-      `INSERT INTO group_members (chat_id, user_id, name, is_admin, active, updated_at)
+      `INSERT INTO group_members (chat_id, user_id, name, phone, is_admin, active, updated_at)
        VALUES ${values.join(", ")}
        ON CONFLICT (chat_id, user_id) DO UPDATE SET
          name = COALESCE(EXCLUDED.name, group_members.name),
+         phone = COALESCE(EXCLUDED.phone, group_members.phone),
          is_admin = EXCLUDED.is_admin,
          active = EXCLUDED.active,
          updated_at = now()`,
@@ -807,7 +907,7 @@ export class PostgresStore implements Store {
 
   async listGroupMembers(chatId: string): Promise<GroupMember[]> {
     const result = await this.pool.query<MemberRow>(
-      `SELECT user_id, name, is_admin, active, updated_at
+      `SELECT user_id, name, phone, is_admin, active, updated_at
        FROM group_members
        WHERE chat_id = $1
        ORDER BY is_admin DESC, name ASC NULLS LAST, user_id ASC`,
@@ -816,6 +916,7 @@ export class PostgresStore implements Store {
     return result.rows.map((row) => ({
       userId: row.user_id,
       name: row.name,
+      phone: row.phone,
       isAdmin: row.is_admin,
       active: row.active,
       updatedAt: row.updated_at.toISOString(),
@@ -846,14 +947,29 @@ export class PostgresStore implements Store {
     // (date_trunc('milliseconds', sent_at), id) < (...) — and widen the
     // (chat_id, sent_at) index accordingly.
     const result = await this.pool.query<MessageRow>(
-      `SELECT id, sent_at, sender_id, sender_name, body, message_type
-       FROM messages
-       WHERE chat_id = $1
-         AND ($2::timestamptz IS NULL OR sent_at >= $2)
-         AND ($3::timestamptz IS NULL OR sent_at < $3)
+      `SELECT m.id, m.sent_at, m.sender_id,
+              COALESCE(m.sender_name, gm.name) AS sender_name,
+              m.body, m.message_type
+       FROM messages m
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(o.name, member.name) AS name
+         FROM group_members member
+         LEFT JOIN contact_overrides o
+           ON o.contact_id = COALESCE(member.phone, member.user_id)
+         WHERE member.chat_id = m.chat_id
+           AND (
+             member.user_id = regexp_replace(m.sender_id, ':.*@', '@')
+             OR member.phone = regexp_replace(m.sender_id, ':.*@', '@')
+           )
+         ORDER BY (member.user_id = regexp_replace(m.sender_id, ':.*@', '@')) DESC
+         LIMIT 1
+       ) gm ON true
+       WHERE m.chat_id = $1
+         AND ($2::timestamptz IS NULL OR m.sent_at >= $2)
+         AND ($3::timestamptz IS NULL OR m.sent_at < $3)
          AND ($4::timestamptz IS NULL OR
-              (sent_at, id) < ($4::timestamptz, $5::uuid))
-       ORDER BY sent_at DESC, id DESC
+              (m.sent_at, m.id) < ($4::timestamptz, $5::uuid))
+       ORDER BY m.sent_at DESC, m.id DESC
        LIMIT $6`,
       [
         chatId,
@@ -884,6 +1000,133 @@ export class PostgresStore implements Store {
       body: row.body,
       messageType: row.message_type,
     })) as ApiMessage[];
+  }
+
+  async listContacts(): Promise<ContactSummary[]> {
+    const result = await this.pool.query<ContactRow>(
+      `${CONTACTS_CTE}
+       SELECT c.contact_key, c.name, c.phone, c.groups,
+              c.user_ids, c.phones,
+              COALESCE(ms.message_count, 0) AS message_count,
+              ms.last_message_at
+       FROM contacts c
+       LEFT JOIN message_stats ms ON ms.contact_key = c.contact_key
+       ORDER BY c.name ASC NULLS LAST, c.contact_key ASC`,
+    );
+    return result.rows.map((row) => this.toContactSummary(row));
+  }
+
+  async getContact(contactId: string): Promise<ContactDetail | undefined> {
+    const result = await this.pool.query<ContactRow>(
+      `${CONTACTS_CTE}
+       SELECT c.contact_key, c.name, c.phone, c.groups,
+              c.user_ids, c.phones,
+              COALESCE(ms.message_count, 0) AS message_count,
+              ms.last_message_at
+       FROM contacts c
+       LEFT JOIN message_stats ms ON ms.contact_key = c.contact_key
+       WHERE c.contact_key = $1`,
+      [contactId],
+    );
+    const row = result.rows[0];
+    if (row === undefined) return undefined;
+    return {
+      ...this.toContactSummary(row),
+      aliases: [...new Set([...row.user_ids, ...(row.phones ?? [])])].sort(),
+    };
+  }
+
+  async renameContact(
+    contactId: string,
+    name: string,
+  ): Promise<ContactDetail | undefined> {
+    const contact = await this.getContact(contactId);
+    if (contact === undefined) return undefined;
+    await this.pool.query(
+      `INSERT INTO contact_overrides (contact_id, name, updated_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (contact_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         updated_at = now()`,
+      [contactId, name.trim().slice(0, 300)],
+    );
+    return this.getContact(contactId);
+  }
+
+  async listContactMessages(
+    aliases: readonly string[],
+    options: ListMessagesOptions,
+  ): Promise<ContactMessage[]> {
+    const cursor =
+      options.cursor === undefined
+        ? undefined
+        : decodeMessageCursor(options.cursor);
+    if (options.cursor !== undefined && cursor === undefined) {
+      throw new Error("invalid message cursor");
+    }
+    const result = await this.pool.query<ContactMessageRow>(
+      `SELECT m.id, m.sent_at, m.sender_id,
+              COALESCE(m.sender_name, gm.name) AS sender_name,
+              m.body, m.message_type,
+              g.id AS group_id, g.name AS group_name
+       FROM messages m
+       JOIN groups g ON g.chat_id = m.chat_id AND g.monitored = true
+       JOIN unnest($1::text[]) AS a(alias)
+         ON a.alias = regexp_replace(m.sender_id, ':.*@', '@')
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(o.name, member.name) AS name
+         FROM group_members member
+         LEFT JOIN contact_overrides o
+           ON o.contact_id = COALESCE(member.phone, member.user_id)
+         WHERE member.chat_id = m.chat_id
+           AND (
+             member.user_id = regexp_replace(m.sender_id, ':.*@', '@')
+             OR member.phone = regexp_replace(m.sender_id, ':.*@', '@')
+           )
+         ORDER BY (member.user_id = regexp_replace(m.sender_id, ':.*@', '@')) DESC
+         LIMIT 1
+       ) gm ON true
+       WHERE ($2::timestamptz IS NULL OR m.sent_at >= $2)
+         AND ($3::timestamptz IS NULL OR m.sent_at < $3)
+         AND ($4::timestamptz IS NULL OR
+              (m.sent_at, m.id) < ($4::timestamptz, $5::uuid))
+       ORDER BY m.sent_at DESC, m.id DESC
+       LIMIT $6`,
+      [
+        aliases,
+        options.from === undefined ? null : new Date(options.from),
+        options.to === undefined ? null : new Date(options.to),
+        cursor === undefined ? null : new Date(cursor.sentAt),
+        cursor === undefined ? null : cursor.id,
+        options.limit,
+      ],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      sentAt: row.sent_at.toISOString(),
+      senderId: row.sender_id ?? "unknown",
+      senderName: row.sender_name,
+      body: row.body,
+      messageType: row.message_type,
+      groupId: row.group_id,
+      groupName: row.group_name,
+    })) as ContactMessage[];
+  }
+
+  private toContactSummary(row: ContactRow): ContactSummary {
+    return {
+      id: row.contact_key,
+      name: row.name,
+      phone: row.phone,
+      groups: [...(row.groups ?? [])].sort((a, b) =>
+        a.name.localeCompare(b.name),
+      ),
+      messageCount: row.message_count,
+      lastMessageAt:
+        row.last_message_at === null
+          ? null
+          : row.last_message_at.toISOString(),
+    };
   }
 
   async listGroupSummaries(

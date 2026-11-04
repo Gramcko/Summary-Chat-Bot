@@ -13,12 +13,15 @@ import makeWASocket, {
   type WASocket,
 } from "@whiskeysockets/baileys";
 import { errorReason } from "../lib/errors.js";
+import { isPhoneJid, normalizeJidAlias } from "../lib/jid.js";
 import type { Logger } from "../lib/log.js";
 import { safeChatRef } from "../lib/privacy.js";
 import type {
   AdapterEvent,
+  ContactNameUpdate,
   DiscoveredChat,
   GroupMemberInfo,
+  HistoryFailureReason,
   HistoryFetchRequest,
   ParticipantsAction,
   RawContentKind,
@@ -87,6 +90,49 @@ function createSilentLogger(): BaileysLogger {
 /** Error reason for logs: code or truncated message, never file paths. */
 function stringOrNull(value: unknown): string | null {
   return typeof value === "string" && value !== "" ? value : null;
+}
+
+/** Name fields a WhatsApp contact may carry (any subset). */
+interface ContactFields {
+  notify?: string;
+  name?: string;
+  verifiedName?: string;
+}
+
+/** Best display name from the available contact fields (contract cap). */
+function bestContactName(fields: ContactFields): string | null {
+  const candidate = fields.notify ?? fields.name ?? fields.verifiedName;
+  return candidate === undefined ? null : candidate.slice(0, 300);
+}
+
+/** Extracts the non-empty name fields of a contact-like object. */
+function contactFields(contact: {
+  name?: string | null;
+  notify?: string | null;
+  verifiedName?: string | null;
+}): ContactFields {
+  const fields: ContactFields = {};
+  const notify = stringOrNull(contact.notify);
+  const name = stringOrNull(contact.name);
+  const verifiedName = stringOrNull(contact.verifiedName);
+  if (notify !== null) fields.notify = notify;
+  if (name !== null) fields.name = name;
+  if (verifiedName !== null) fields.verifiedName = verifiedName;
+  return fields;
+}
+
+/** All normalized JID aliases a contact object exposes. */
+function contactAliases(contact: {
+  id?: string | null;
+  jid?: string | null;
+  lid?: string | null;
+}): string[] {
+  const aliases = new Set<string>();
+  for (const jid of [contact.id, contact.jid, contact.lid]) {
+    const alias = normalizeJidAlias(jid);
+    if (alias !== null) aliases.add(alias);
+  }
+  return [...aliases];
 }
 
 /** Accepts protobufjs Long values and plain numbers (unix seconds). */
@@ -361,31 +407,50 @@ export function classifyClose(statusCode: number | undefined): {
 
 /**
  * Maps one GroupMetadata participants list to roster entries (ADR
- * 0008). Names prefer the participant's own push name (`notify`), then
- * the locally saved name, then the verified business name; missing
- * names stay null (a sync must never fail because of a name). Admin =
- * the `admin` role field or the legacy `isAdmin` flag.
+ * 0008). WhatsApp group metadata carries only JIDs (verified against
+ * the installed 6.7.24 `extractGroupMetadata`), so names normally come
+ * from the `resolveName` callback (contacts / push names learned by the
+ * adapter). Any name fields present on the participant itself still win.
+ * Missing names stay null (a sync must never fail because of a name).
+ * Admin = the `admin` role field or the legacy `isAdmin` flag. `phone`
+ * is the PN JID when the participant exposes one (LID-only members have
+ * null).
  */
 export function mapGroupParticipants(
   participants: ReadonlyArray<{
     id?: string | null;
+    jid?: string | null;
+    lid?: string | null;
     name?: string | null;
     notify?: string | null;
     verifiedName?: string | null;
     admin?: string | null;
     isAdmin?: boolean;
   }>,
+  resolveName?: (participant: {
+    id?: string | null;
+    jid?: string | null;
+    lid?: string | null;
+  }) => string | null,
 ): GroupMemberInfo[] {
   const members: GroupMemberInfo[] = [];
   for (const participant of participants) {
     const userId = stringOrNull(participant.id);
     if (userId === null) continue;
+    const phoneJid = isPhoneJid(participant.id)
+      ? participant.id
+      : isPhoneJid(participant.jid)
+        ? participant.jid
+        : null;
     members.push({
       userId,
       name:
         stringOrNull(participant.notify) ??
         stringOrNull(participant.name) ??
-        stringOrNull(participant.verifiedName),
+        stringOrNull(participant.verifiedName) ??
+        resolveName?.(participant) ??
+        null,
+      phone: phoneJid === null ? null : normalizeJidAlias(phoneJid),
       isAdmin:
         participant.admin === "admin" ||
         participant.admin === "superadmin" ||
@@ -420,9 +485,14 @@ function disconnectStatusCode(error: unknown): number | undefined {
  * ever link starts processing self traffic immediately.
  */
 export function isIgnoredIncomingJid(
-  jid: string,
+  jid: string | null | undefined,
   selfUsers: ReadonlySet<string>,
 ): boolean {
+  // Baileys passes `node.attrs.from` for receipts/offline nodes, which can
+  // be missing on malformed or protocol-only stanzas. Treating that as
+  // "ignore" is safe; throwing here used to abort the whole offline-node
+  // batch (including on-demand history responses).
+  if (typeof jid !== "string" || jid === "") return true;
   if (jid.endsWith("@g.us")) return false;
   const user = jid.split(/[:@]/)[0] ?? jid;
   return !selfUsers.has(user);
@@ -480,6 +550,55 @@ export function normalizeParticipantsAction(
 }
 
 /**
+ * Maps the phone's on-demand history response code to a safe failure
+ * reason. `0` (REQUEST_SUCCESS) is not a failure — the history payload
+ * arrives separately. Unknown/absent codes also return null.
+ */
+export function historyFailureFromResponseCode(
+  code: unknown,
+): HistoryFailureReason | null {
+  switch (code) {
+    case 5: // ERROR_HOSTED_DEVICE_NOT_CONNECTED
+      return "history_phone_offline";
+    case 2: // DECLINED_SHARING_HISTORY
+      return "history_declined";
+    case 1: // REQUEST_TIME_EXPIRED
+      return "history_expired";
+    case 3: // GENERIC_ERROR
+    case 4: // ERROR_REQUEST_ON_NON_SMB_PRIMARY
+    case 6: // ERROR_HOSTED_DEVICE_LOGIN_TIME_NOT_SET
+      return "history_unavailable";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Extracts a failed on-demand history response from an incoming PDO
+ * response message (verified against the 6.7.24 proto:
+ * `peerDataOperationRequestResponseMessage.peerDataOperationResult[].
+ * fullHistorySyncOnDemandRequestResponse.responseCode`). Baileys itself
+ * only handles placeholder resends, so without this a failed request
+ * looks like a 30-second timeout. Returns null for success/other PDOs.
+ */
+export function mapHistoryResponseFailure(message: WAMessage): {
+  requestId: string | null;
+  reason: HistoryFailureReason;
+} | null {
+  const response =
+    message.message?.protocolMessage?.peerDataOperationRequestResponseMessage;
+  if (response === null || response === undefined) return null;
+  const requestId = stringOrNull(response.stanzaId);
+  for (const result of response.peerDataOperationResult ?? []) {
+    const history = result.fullHistorySyncOnDemandRequestResponse;
+    if (history === null || history === undefined) continue;
+    const reason = historyFailureFromResponseCode(history.responseCode);
+    if (reason !== null) return { requestId, reason };
+  }
+  return null;
+}
+
+/**
  * The `messaging-history.set` payload as delivered by Baileys
  * (Types/Events.d.ts, verified against the installed 6.7.24 sources):
  * `{ chats, contacts, messages, isLatest?, progress?, syncType?,
@@ -487,6 +606,14 @@ export function normalizeParticipantsAction(
  */
 export interface HistorySetPayload {
   messages: WAMessage[];
+  contacts?: Array<{
+    id?: string | null;
+    jid?: string | null;
+    lid?: string | null;
+    name?: string | null;
+    notify?: string | null;
+    verifiedName?: string | null;
+  }>;
   progress?: number | null;
   syncType?: number | undefined;
   peerDataRequestSessionId?: string | null;
@@ -549,6 +676,14 @@ export class BaileysAdapter implements WhatsAppAdapter {
    * save runs after the previous one completes.
    */
   private saveChain: Promise<void> = Promise.resolve();
+  /**
+   * Display-name cache keyed by normalized JID alias (ADR 0008). Group
+   * metadata never carries names, so they are learned from WhatsApp
+   * contact events and message push names. Values are PII and never
+   * logged. Cleared on connect so a re-linked account cannot inherit
+   * another account's names.
+   */
+  private readonly contacts = new Map<string, ContactFields>();
 
   constructor(private readonly options: BaileysAdapterOptions) {}
 
@@ -581,6 +716,10 @@ export class BaileysAdapter implements WhatsAppAdapter {
     this.pairingRequested = false;
     this.pairingRequestedAt = null;
     this.pairingCodeFailed = false;
+    // Never inherit display names across a re-link: the next account's
+    // contact stream repopulates the cache (persisted names stay in
+    // group_members and are kept by COALESCE).
+    this.contacts.clear();
     const silentLogger = createSilentLogger();
 
     // The session directory is protected storage; fs failures are
@@ -631,9 +770,21 @@ export class BaileysAdapter implements WhatsAppAdapter {
       // processed or fetchMessageHistory results would be dropped
       // before delivery (Baileys gates processing on this predicate in
       // Socket/chats.js; PROCESSABLE_HISTORY_TYPES includes ON_DEMAND).
+      // Some phones answer an on-demand request with RECENT/FULL and
+      // echo OUR peer-data session id; allow those ONLY while the id is
+      // an outstanding request (mapHistorySet still drops other chats).
       syncFullHistory: false,
-      shouldSyncHistoryMessage: (historyMsg) =>
-        historyMsg.syncType === proto.HistorySync.HistorySyncType.ON_DEMAND,
+      shouldSyncHistoryMessage: (historyMsg) => {
+        if (
+          historyMsg.syncType === proto.HistorySync.HistorySyncType.ON_DEMAND
+        ) {
+          return true;
+        }
+        const sessionId = stringOrNull(historyMsg.peerDataRequestSessionId);
+        return (
+          sessionId !== null && this.pendingHistoryRequestIds.has(sessionId)
+        );
+      },
       // No decryption of non-group, non-self JIDs (DMs, newsletters,
       // status broadcasts, ...).
       shouldIgnoreJid: (jid) => isIgnoredIncomingJid(jid, readSelfUsers()),
@@ -671,6 +822,12 @@ export class BaileysAdapter implements WhatsAppAdapter {
     this.socket.ev.on("group-participants.update", (update) => {
       this.onParticipantsUpdate(update);
     });
+    this.socket.ev.on("contacts.upsert", (contacts) => {
+      this.onContactsChanged(contacts);
+    });
+    this.socket.ev.on("contacts.update", (contacts) => {
+      this.onContactsChanged(contacts);
+    });
     this.socket.ev.on("messaging-history.set", (set) => {
       this.onHistorySet(set);
     });
@@ -696,6 +853,26 @@ export class BaileysAdapter implements WhatsAppAdapter {
   async fetchChats(): Promise<DiscoveredChat[]> {
     const socket = this.socket;
     if (socket === null) throw new Error("not connected");
+    // Saved-contact names live in the app-state `critical_unblock_low`
+    // collection (verified in 6.7.24 Utils/chat-utils.js contactAction).
+    // Bulk history sync is disabled, so Baileys' initial app-state sync
+    // never runs; resync JUST that collection so the roster can resolve
+    // saved names. Best-effort: a failure only means fewer names.
+    //
+    // `resyncAppState` is a buffered function: it activates the event
+    // buffer and normally relies on the history-sync state machine to
+    // flush it. We triggered it manually, so flush it ourselves unless
+    // something else was already buffering (then that owner flushes).
+    const wasBuffering = socket.ev.isBuffering();
+    try {
+      await socket.resyncAppState(["critical_unblock_low"], true);
+    } catch (error) {
+      this.options.log("warn", "contact_sync_failed", {
+        reason: errorReason(error),
+      });
+    } finally {
+      if (!wasBuffering) socket.ev.flush();
+    }
     // groupFetchAllParticipating returns full GroupMetadata per chat —
     // including the participants roster (verified in the installed
     // 6.7.24 types: GroupMetadata.participants: GroupParticipant[]).
@@ -704,7 +881,10 @@ export class BaileysAdapter implements WhatsAppAdapter {
     for (const [jid, metadata] of Object.entries(participating)) {
       if (!jid.endsWith("@g.us")) continue;
       const name = stringOrNull(metadata?.subject) ?? jid;
-      const members = mapGroupParticipants(metadata?.participants ?? []);
+      const members = mapGroupParticipants(
+        metadata?.participants ?? [],
+        (participant) => this.resolveContactName(participant),
+      );
       chats.push({ chatJid: jid, name, members });
     }
     return chats;
@@ -721,7 +901,10 @@ export class BaileysAdapter implements WhatsAppAdapter {
     if (socket === null) return [];
     try {
       const metadata = await socket.groupMetadata(chatJid);
-      return mapGroupParticipants(metadata?.participants ?? []);
+      return mapGroupParticipants(
+        metadata?.participants ?? [],
+        (participant) => this.resolveContactName(participant),
+      );
     } catch (error) {
       this.options.log("warn", "roster_fetch_failed", {
         chatRef: safeChatRef(chatJid),
@@ -761,10 +944,13 @@ export class BaileysAdapter implements WhatsAppAdapter {
       id: cursor?.messageId ?? "",
     };
     const oldestTimestampMs = cursor !== null ? cursor.timestampSec * 1000 : 0;
+    // WhatsApp accepts at most 50 messages per on-demand query (Baileys
+    // README); larger counts are silently ignored.
+    const count = Math.min(Math.max(1, Math.trunc(request.count)), 50);
     this.pendingHistoryChats.add(request.chatJid);
     try {
       const requestId = await socket.fetchMessageHistory(
-        request.count,
+        count,
         oldestKey,
         oldestTimestampMs,
       );
@@ -820,6 +1006,9 @@ export class BaileysAdapter implements WhatsAppAdapter {
 
   private onHistorySet(set: HistorySetPayload): void {
     if (this.stopping) return;
+    // Contact names travel with history payloads; cache them even when
+    // the batch contains no messages for an outstanding request.
+    this.onContactsChanged(set.contacts ?? []);
     // Nothing requested: history arriving from bulk sync must never be
     // surfaced (privacy). This also covers stale batches after an
     // import completed (the chat was released).
@@ -839,8 +1028,98 @@ export class BaileysAdapter implements WhatsAppAdapter {
       });
     }
     for (const event of mapHistorySet(set, this.pendingHistoryChats)) {
+      for (const message of event.messages) {
+        this.rememberContact({ id: message.senderJid, notify: message.senderName });
+      }
       this.emit(event);
     }
+  }
+
+  /**
+   * Merges name fields from a contact event into the alias cache and
+   * emits the resulting names so the service can persist them on the
+   * roster. Names are PII: this method never logs them.
+   */
+  private onContactsChanged(
+    contacts: ReadonlyArray<{
+      id?: string | null;
+      jid?: string | null;
+      lid?: string | null;
+      name?: string | null;
+      notify?: string | null;
+      verifiedName?: string | null;
+    }>,
+  ): void {
+    if (this.stopping || contacts.length === 0) return;
+    const updates: ContactNameUpdate[] = [];
+    for (const contact of contacts) {
+      const update = this.rememberContact(contact);
+      if (update !== null) updates.push(update);
+    }
+    if (updates.length > 0) {
+      this.emit({ type: "contact-names", contacts: updates });
+    }
+  }
+
+  /**
+   * Stores a contact's name fields under every alias it exposes and
+   * returns the best resulting name, or null when the contact carries
+   * no name. Later partial updates merge with earlier fields, so a
+   * push-name update never erases a saved contact name.
+   */
+  private rememberContact(contact: {
+    id?: string | null;
+    jid?: string | null;
+    lid?: string | null;
+    name?: string | null;
+    notify?: string | null;
+    verifiedName?: string | null;
+  }): ContactNameUpdate | null {
+    const fields = contactFields(contact);
+    if (
+      fields.notify === undefined &&
+      fields.name === undefined &&
+      fields.verifiedName === undefined
+    ) {
+      return null;
+    }
+    const aliases = contactAliases(contact);
+    if (aliases.length === 0) return null;
+    let best: string | null = null;
+    let changed = false;
+    for (const alias of aliases) {
+      const previous = this.contacts.get(alias);
+      const merged: ContactFields = { ...previous, ...fields };
+      const previousName = previous === undefined ? null : bestContactName(previous);
+      const mergedName = bestContactName(merged);
+      if (mergedName !== previousName) changed = true;
+      this.contacts.set(alias, merged);
+      best = mergedName ?? best;
+    }
+    // Re-emit only when something changed: Baileys repeats the same
+    // push name on every message, and each emit is a DB write.
+    return best === null || !changed ? null : { jids: aliases, name: best };
+  }
+
+  /**
+   * Resolves a participant's display name from the contact cache using
+   * any of its JID aliases (participant id, PN jid, lid). Null when no
+   * name has been observed yet.
+   */
+  private resolveContactName(participant: {
+    id?: string | null;
+    jid?: string | null;
+    lid?: string | null;
+  }): string | null {
+    for (const jid of [participant.id, participant.jid, participant.lid]) {
+      const alias = normalizeJidAlias(jid);
+      if (alias === null) continue;
+      const fields = this.contacts.get(alias);
+      if (fields === undefined) continue;
+      const name = bestContactName(fields);
+      if (name !== null) return name;
+    }
+    return null;
   }
 
   // ------------------------------------------------------------------
@@ -921,6 +1200,35 @@ export class BaileysAdapter implements WhatsAppAdapter {
     // already captured, and history sync is disabled anyway.
     const messages: RawInboundMessage[] = [];
     for (const message of upsert.messages) {
+      // A failed on-demand history response is a PDO response message;
+      // Baileys ignores its result code, so surface it here instead of
+      // letting the import burn the full round timeout.
+      const historyFailure = mapHistoryResponseFailure(message);
+      if (historyFailure !== null) {
+        const chatJid =
+          (historyFailure.requestId === null
+            ? undefined
+            : this.pendingHistoryRequestIds.get(historyFailure.requestId)) ??
+          (this.pendingHistoryChats.size === 1
+            ? [...this.pendingHistoryChats][0]
+            : undefined);
+        if (chatJid !== undefined) {
+          this.emit({
+            type: "history-error",
+            chatJid,
+            reason: historyFailure.reason,
+          });
+        }
+      }
+      // Cache the sender's push name even if the message itself is
+      // skipped (reaction/system): it is the main name source for
+      // unsaved contacts in LID-addressed groups.
+      if (message.key?.fromMe !== true) {
+        this.rememberContact({
+          id: stringOrNull(message.key?.participant) ?? stringOrNull(message.key?.remoteJid),
+          notify: message.pushName,
+        });
+      }
       const mapped = mapWAMessage(message);
       if (mapped !== null) messages.push(mapped);
     }

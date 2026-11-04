@@ -1,7 +1,7 @@
 ---
 description: Implements backend APIs, business logic, persistence and asynchronous processing.
 mode: subagent
-model: opencode-go/mimo-v2.6-pro
+model: opencode-go/deepseek-v4.1-flash
 permissions:
   - { action: "edit", resource: "*", effect: "allow" }
   - { action: "shell", resource: "*", effect: "allow" }

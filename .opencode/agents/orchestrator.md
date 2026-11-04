@@ -1,7 +1,7 @@
 ---
 description: Coordinates implementation, testing, integration and reviews for Summarly Chat Bot.
 mode: primary
-model: opencode-go/mimo-v2.6-pro
+model: opencode-go/deepseek-v4.1-flash
 permissions:
   - { action: "edit", resource: "*", effect: "deny" }
   - { action: "shell", resource: "*", effect: "deny" }
